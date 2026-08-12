@@ -233,6 +233,20 @@ describe("renderFindingHTML", () => {
 
     expect(renderFindingHTML(risky)).toContain("&lt;b&gt;");
   });
+
+  it("prefixes the path with the project, since each finding is read on its own", () => {
+    expect(renderFindingHTML(finding, "mir-back")).toContain("mir-back/app/Jobs/Import.php:88");
+  });
+
+  it("leaves the path alone when no project is given", () => {
+    expect(renderFindingHTML(finding)).toContain("app/Jobs/Import.php:88");
+  });
+
+  it("does not repeat the project when the path already starts with it", () => {
+    const [dep] = parseFindings("FINDING|low|mir-back/src/composer.json|dep-safe|12 обновлений");
+
+    expect(renderFindingHTML(dep, "mir-back")).not.toContain("mir-back/mir-back");
+  });
 });
 
 describe("fixTopicName", () => {

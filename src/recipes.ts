@@ -165,8 +165,12 @@ function truncate(text: string, limit: number): string {
 }
 
 /** One finding as its own Telegram message, so it can carry its own buttons. */
-export function renderFindingHTML(finding: Finding): string {
-  const location = finding.line === undefined ? finding.file : `${finding.file}:${finding.line}`;
+export function renderFindingHTML(finding: Finding, project?: string): string {
+  // Each finding is its own message, so the path has to say which repository it
+  // belongs to on its own; the batch header scrolls away.
+  const file =
+    project && !finding.file.startsWith(`${project}/`) ? `${project}/${finding.file}` : finding.file;
+  const location = finding.line === undefined ? file : `${file}:${finding.line}`;
   return [
     `${SEVERITY_MARK[finding.severity]} <b>${finding.severity}</b> · <code>${escapeHTML(location)}</code> · ${escapeHTML(finding.category)}`,
     escapeHTML(truncate(finding.description, MAX_DESCRIPTION_LENGTH)),

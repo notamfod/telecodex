@@ -222,10 +222,14 @@ async function deliverFindings(recipe: Recipe, runId: number, triage: Triage): P
     triage.suppressed.length > 0 ? `заглушено: ${triage.suppressed.length}` : "",
   ].filter(Boolean);
 
-  await sendMessage(recipe, `\u{1F50D} <b>${recipe.id}</b> \u00B7 ${notes.join(" \u00B7 ")}`);
+  const project = path.basename(recipe.cwd);
+  await sendMessage(
+    recipe,
+    `\u{1F50D} <b>${recipe.id}</b> \u00B7 ${project} \u00B7 ${notes.join(" \u00B7 ")}`,
+  );
 
   for (const [index, finding] of triage.fresh.entries()) {
-    await sendMessage(recipe, renderFindingHTML(finding), {
+    await sendMessage(recipe, renderFindingHTML(finding, project), {
       inline_keyboard: [
         [
           { text: "\u{1F527} Тред-фикс", callback_data: `rfix:${runId}:${index}` },

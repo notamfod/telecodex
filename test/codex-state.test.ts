@@ -9,6 +9,8 @@ type ThreadFixture = {
   created_at: number;
   updated_at: number;
   first_user_message: string;
+  source?: string;
+  preview?: string;
   archived?: number;
 };
 
@@ -113,6 +115,8 @@ function runAllQuery(sql: string, threads: ThreadFixture[], args: unknown[]) {
     const limit = typeof args[0] === "number" ? args[0] : 20;
     return threads
       .filter((thread) => thread.archived !== 1)
+      .filter((thread) => !sql.includes("source = 'vscode'") || thread.source === "vscode")
+      .filter((thread) => !sql.includes("preview <> ''") || Boolean(thread.preview))
       .sort((left, right) => right.updated_at - left.updated_at)
       .slice(0, limit);
   }
@@ -212,6 +216,70 @@ describe("codex-state", () => {
         createdAt: new Date(1_700_000_000 * 1000),
         updatedAt: new Date(1_700_000_100 * 1000),
         firstUserMessage: "older",
+      },
+    ]);
+  });
+
+  it("listUserThreads returns only visible top-level vscode chats", async () => {
+    const state = await loadCodexState({
+      files: ["state_main.sqlite"],
+      threads: [
+        {
+          id: "visible-vscode",
+          title: "Visible chat",
+          cwd: "/workspace",
+          model: "gpt-5.6-sol",
+          created_at: 10,
+          updated_at: 40,
+          first_user_message: "visible",
+          source: "vscode",
+          preview: "Visible chat",
+        },
+        {
+          id: "hidden-vscode",
+          title: "Hidden chat",
+          cwd: "/workspace",
+          model: "gpt-5.6-sol",
+          created_at: 10,
+          updated_at: 30,
+          first_user_message: "hidden",
+          source: "vscode",
+          preview: "",
+        },
+        {
+          id: "exec-thread",
+          title: "Automation",
+          cwd: "/workspace",
+          model: "gpt-5.6-sol",
+          created_at: 10,
+          updated_at: 20,
+          first_user_message: "exec",
+          source: "exec",
+          preview: "Automation",
+        },
+        {
+          id: "subagent-thread",
+          title: "",
+          cwd: "/workspace",
+          model: "gpt-5.6-sol",
+          created_at: 10,
+          updated_at: 10,
+          first_user_message: "subagent",
+          source: '{"subagent":{}}',
+          preview: "Subagent",
+        },
+      ],
+    });
+
+    expect(state.listUserThreads(100)).toEqual([
+      {
+        id: "visible-vscode",
+        title: "Visible chat",
+        cwd: "/workspace",
+        model: "gpt-5.6-sol",
+        createdAt: new Date(10_000),
+        updatedAt: new Date(40_000),
+        firstUserMessage: "visible",
       },
     ]);
   });

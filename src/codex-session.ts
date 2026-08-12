@@ -1,14 +1,13 @@
-import {
-  Codex,
-  type ApprovalMode,
-  type Input,
-  type ModelReasoningEffort,
-  type SandboxMode,
-  type Thread,
-  type ThreadEvent,
-  type UserInput,
-} from "@openai/codex-sdk";
+import os from "node:os";
+import path from "node:path";
 
+import { AppServerClient } from "./app-server-client.js";
+import {
+  AppServerTurnManager,
+  type AppServerRequestClient,
+  type AppServerTurnCallbacks,
+  type AppServerUserInput,
+} from "./app-server-turn-manager.js";
 import type { TeleCodexConfig } from "./config.js";
 import {
   getThread,
@@ -21,22 +20,14 @@ import {
 import {
   findLaunchProfile,
   formatLaunchProfileBehavior,
+  type CodexApprovalPolicy,
   type CodexLaunchProfile,
+  type CodexSandboxMode,
 } from "./codex-launch.js";
 
-export interface CodexSessionCallbacks {
-  onTextDelta: (delta: string) => void;
-  onToolStart: (toolName: string, toolCallId: string) => void;
-  onToolUpdate: (toolCallId: string, partialResult: string) => void;
-  onToolEnd: (toolCallId: string, isError: boolean) => void;
-  onAgentEnd: () => void;
-  onTodoUpdate?: (items: Array<{ text: string; completed: boolean }>) => void;
-  onTurnComplete?: (usage: {
-    inputTokens: number;
-    cachedInputTokens: number;
-    outputTokens: number;
-  }) => void;
-}
+export type CodexReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+
+export interface CodexSessionCallbacks extends AppServerTurnCallbacks {}
 
 export interface CodexSessionInfo {
   threadId: string | null;
@@ -53,11 +44,7 @@ export interface CodexSessionInfo {
   nextLaunchProfileLabel?: string;
   nextLaunchProfileBehavior?: string;
   nextUnsafeLaunch?: boolean;
-  sessionTokens?: {
-    input: number;
-    cached: number;
-    output: number;
-  };
+  sessionTokens?: { input: number; cached: number; output: number };
 }
 
 export interface CreateOptions {
@@ -69,90 +56,103 @@ export interface CreateOptions {
   resumeThreadId?: string;
 }
 
-export type CodexPromptInput = string | { text?: string; imagePaths?: string[]; stagedFileInstructions?: string };
+export interface CodexSessionDependencies {
+  client: AppServerRequestClient & { close?: () => void };
+  turnManager: Pick<AppServerTurnManager, "runTurn"> &
+    Partial<Pick<AppServerTurnManager, "cancelTurn" | "dispose" | "trackThread" | "recoverTurn">>;
+}
+
+export type CodexPromptInput = string | {
+  text?: string;
+  imagePaths?: string[];
+  stagedFileInstructions?: string;
+};
+
+interface ThreadResponse {
+  thread: { id: string; status: { type: "notLoaded" | "idle" | "systemError" | "active" } };
+  cwd?: string;
+  model?: string;
+  approvalPolicy?: CodexApprovalPolicy;
+  sandbox?: { type?: string };
+  reasoningEffort?: CodexReasoningEffort | null;
+}
 
 export class CodexSessionService {
-  private codex: Codex | null = null;
-  private thread: Thread | null = null;
   private currentWorkspace: string;
-  private abortController: AbortController | null = null;
   private currentThreadId: string | null = null;
   private currentModel: string | undefined;
-  private currentReasoningEffort: ModelReasoningEffort | undefined;
+  private currentReasoningEffort: CodexReasoningEffort | undefined;
   private currentLaunchProfile: CodexLaunchProfile;
   private activeThreadLaunchProfile: CodexLaunchProfile | null = null;
-  private sessionTokens = { input: 0, cached: 0, output: 0 };
+  private processing = false;
+  private activeCallbacks: CodexSessionCallbacks | null = null;
+  private readonly sessionTokens = { input: 0, cached: 0, output: 0 };
 
-  private constructor(private readonly config: TeleCodexConfig) {
+  private constructor(
+    private readonly config: TeleCodexConfig,
+    private readonly dependencies: CodexSessionDependencies,
+  ) {
     this.currentWorkspace = config.workspace;
     this.currentLaunchProfile = getLaunchProfile(config, config.defaultLaunchProfileId);
   }
 
-  static async create(config: TeleCodexConfig, options?: CreateOptions): Promise<CodexSessionService> {
-    const service = new CodexSessionService(config);
+  static async create(
+    config: TeleCodexConfig,
+    options?: CreateOptions,
+    dependencies?: CodexSessionDependencies,
+  ): Promise<CodexSessionService> {
+    const service = new CodexSessionService(
+      config,
+      dependencies ?? createCodexSessionDependencies(config.telegramMaxActiveTopics),
+    );
     service.currentWorkspace = options?.workspace ?? config.workspace;
     service.currentModel = options?.model ?? config.codexModel;
-    service.currentReasoningEffort = options?.reasoningEffort as ModelReasoningEffort | undefined;
+    service.currentReasoningEffort = options?.reasoningEffort as CodexReasoningEffort | undefined;
     service.currentLaunchProfile = getLaunchProfile(
       config,
       options?.launchProfileId ?? config.defaultLaunchProfileId,
     );
-    service.resetCodexClient();
 
     if (options?.resumeThreadId) {
       await service.resumeThread(options.resumeThreadId);
-      return service;
+    } else if (!options?.deferThreadStart) {
+      await service.newThread(service.currentWorkspace, service.currentModel);
     }
-
-    if (options?.deferThreadStart) {
-      return service;
-    }
-
-    await service.newThread(service.currentWorkspace, service.currentModel);
     return service;
   }
 
   getInfo(): CodexSessionInfo {
-    const effectiveLaunchProfile = this.activeThreadLaunchProfile ?? this.currentLaunchProfile;
+    const effectiveProfile = this.activeThreadLaunchProfile ?? this.currentLaunchProfile;
     const info: CodexSessionInfo = {
-      threadId: this.thread?.id ?? this.currentThreadId,
+      threadId: this.currentThreadId,
       workspace: this.currentWorkspace,
       model: this.currentModel ?? this.config.codexModel,
-      launchProfileId: effectiveLaunchProfile.id,
-      launchProfileLabel: effectiveLaunchProfile.label,
-      launchProfileBehavior: formatLaunchProfileBehavior(effectiveLaunchProfile),
-      sandboxMode: effectiveLaunchProfile.sandboxMode,
-      approvalPolicy: effectiveLaunchProfile.approvalPolicy,
-      unsafeLaunch: effectiveLaunchProfile.unsafe,
+      launchProfileId: effectiveProfile.id,
+      launchProfileLabel: effectiveProfile.label,
+      launchProfileBehavior: formatLaunchProfileBehavior(effectiveProfile),
+      sandboxMode: effectiveProfile.sandboxMode,
+      approvalPolicy: effectiveProfile.approvalPolicy,
+      unsafeLaunch: effectiveProfile.unsafe,
     };
-
-    if (this.currentReasoningEffort) {
-      info.reasoningEffort = this.currentReasoningEffort;
-    }
-
-    if (
-      this.activeThreadLaunchProfile &&
-      this.activeThreadLaunchProfile.id !== this.currentLaunchProfile.id
-    ) {
+    if (this.currentReasoningEffort) info.reasoningEffort = this.currentReasoningEffort;
+    if (this.activeThreadLaunchProfile && this.activeThreadLaunchProfile.id !== this.currentLaunchProfile.id) {
       info.nextLaunchProfileId = this.currentLaunchProfile.id;
       info.nextLaunchProfileLabel = this.currentLaunchProfile.label;
       info.nextLaunchProfileBehavior = formatLaunchProfileBehavior(this.currentLaunchProfile);
       info.nextUnsafeLaunch = this.currentLaunchProfile.unsafe;
     }
-
-    if (this.sessionTokens.input > 0 || this.sessionTokens.cached > 0 || this.sessionTokens.output > 0) {
+    if (this.sessionTokens.input || this.sessionTokens.cached || this.sessionTokens.output) {
       info.sessionTokens = { ...this.sessionTokens };
     }
-
     return info;
   }
 
   isProcessing(): boolean {
-    return this.abortController !== null;
+    return this.processing;
   }
 
   hasActiveThread(): boolean {
-    return this.thread !== null;
+    return this.currentThreadId !== null;
   }
 
   getCurrentWorkspace(): string {
@@ -160,181 +160,100 @@ export class CodexSessionService {
   }
 
   async prompt(input: CodexPromptInput, callbacks: CodexSessionCallbacks): Promise<void> {
-    if (!this.thread) {
-      throw new Error("Codex thread is not initialized");
-    }
+    if (!this.currentThreadId) throw new Error("Codex thread is not initialized");
+    if (this.processing) throw new Error("A Codex turn is already in progress");
 
-    if (this.abortController) {
-      throw new Error("A Codex turn is already in progress");
-    }
-
-    const controller = new AbortController();
-    this.abortController = controller;
-    let lastAgentText = "";
-
-    // Track cumulative aggregated_output per command item to compute deltas.
-    const lastCommandOutput = new Map<string, string>();
+    this.processing = true;
+    const trackedCallbacks = this.createTrackedCallbacks(callbacks);
+    this.activeCallbacks = trackedCallbacks;
+    const profile = this.activeThreadLaunchProfile ?? this.currentLaunchProfile;
 
     try {
-      const { events } = await this.thread.runStreamed(this.buildSdkInput(input), { signal: controller.signal });
-
-      for await (const event of events) {
-        this.handleThreadEvent(event);
-
-        switch (event.type) {
-          case "item.started":
-          case "item.updated": {
-            const item = event.item;
-            if (item.type === "agent_message") {
-              const delta = computeTextDelta(lastAgentText, item.text);
-              if (delta) {
-                lastAgentText = item.text;
-                callbacks.onTextDelta(delta);
-              } else {
-                lastAgentText = item.text;
-              }
-            } else if (item.type === "command_execution") {
-              if (event.type === "item.started") {
-                // Record baseline so the first item.updated delta is computed correctly.
-                lastCommandOutput.set(item.id, item.aggregated_output);
-                callbacks.onToolStart(item.command, item.id);
-              } else {
-                // aggregated_output grows monotonically; pass only the new portion.
-                const prev = lastCommandOutput.get(item.id) ?? "";
-                const delta = computeTextDelta(prev, item.aggregated_output);
-                lastCommandOutput.set(item.id, item.aggregated_output);
-                if (delta) {
-                  callbacks.onToolUpdate(item.id, delta);
-                }
-              }
-            } else if (item.type === "web_search") {
-              if (event.type === "item.started") {
-                const label = truncate(item.query, 60);
-                callbacks.onToolStart(`🔍 ${label}`, item.id);
-                callbacks.onToolUpdate(item.id, item.query);
-              }
-            } else if (item.type === "todo_list") {
-              callbacks.onTodoUpdate?.(item.items);
-            }
-            break;
-          }
-          case "item.completed": {
-            const item = event.item;
-            if (item.type === "agent_message") {
-              const delta = computeTextDelta(lastAgentText, item.text);
-              if (delta) {
-                callbacks.onTextDelta(delta);
-              }
-              lastAgentText = item.text;
-            } else if (item.type === "command_execution") {
-              // Pass any output that arrived only in the completion event (e.g. fast
-              // commands that never fired item.updated).
-              const prev = lastCommandOutput.get(item.id) ?? "";
-              const delta = computeTextDelta(prev, item.aggregated_output);
-              if (delta) {
-                callbacks.onToolUpdate(item.id, delta);
-              }
-              callbacks.onToolEnd(item.id, item.status === "failed");
-            } else if (item.type === "file_change") {
-              const toolId = item.id;
-              const summary = item.changes.map((change) => `${change.kind} ${change.path}`).join(", ");
-              callbacks.onToolStart("file_change", toolId);
-              callbacks.onToolUpdate(toolId, summary);
-              callbacks.onToolEnd(toolId, item.status === "failed");
-            } else if (item.type === "mcp_tool_call") {
-              callbacks.onToolStart(`mcp:${item.server}/${item.tool}`, item.id);
-              if (item.error) {
-                callbacks.onToolUpdate(item.id, item.error.message);
-              }
-              callbacks.onToolEnd(item.id, item.status === "failed");
-            } else if (item.type === "web_search") {
-              callbacks.onToolEnd(item.id, false);
-            } else if (item.type === "error") {
-              callbacks.onToolStart("⚠️ error", item.id);
-              callbacks.onToolUpdate(item.id, item.message);
-              callbacks.onToolEnd(item.id, true);
-            } else if (item.type === "todo_list") {
-              callbacks.onTodoUpdate?.(item.items);
-            }
-            break;
-          }
-          case "turn.completed": {
-            // Accumulate and deliver usage BEFORE onAgentEnd so that
-            // finalizeResponse() can read lastTurnUsage when building the
-            // final message text.
-            const u = event.usage;
-            this.sessionTokens.input += u.input_tokens;
-            this.sessionTokens.cached += u.cached_input_tokens;
-            this.sessionTokens.output += u.output_tokens;
-            callbacks.onTurnComplete?.({
-              inputTokens: u.input_tokens,
-              cachedInputTokens: u.cached_input_tokens,
-              outputTokens: u.output_tokens,
-            });
-            callbacks.onAgentEnd();
-            break;
-          }
-          case "turn.failed":
-            throw new Error(event.error.message);
-          case "error":
-            throw new Error(event.message);
-          default:
-            break;
-        }
-      }
+      await this.dependencies.turnManager.runTurn({
+        threadId: this.currentThreadId,
+        input: buildAppServerInput(input),
+        cwd: this.currentWorkspace,
+        model: this.currentModel,
+        reasoningEffort: this.currentReasoningEffort,
+        approvalPolicy: profile.approvalPolicy,
+        sandbox: profile.sandboxMode,
+        callbacks: trackedCallbacks,
+      });
     } finally {
-      if (this.abortController === controller) {
-        this.abortController = null;
-      }
+      this.processing = false;
+      this.activeCallbacks = null;
+    }
+  }
+
+  async recoverPrompt(turnId: string, callbacks: CodexSessionCallbacks): Promise<void> {
+    if (!this.currentThreadId) throw new Error("Codex thread is not initialized");
+    if (this.processing) throw new Error("A Codex turn is already in progress");
+    if (!this.dependencies.turnManager.recoverTurn) {
+      throw new Error("Codex turn recovery is not available");
+    }
+
+    this.processing = true;
+    const trackedCallbacks = this.createTrackedCallbacks(callbacks);
+    this.activeCallbacks = trackedCallbacks;
+    const profile = this.activeThreadLaunchProfile ?? this.currentLaunchProfile;
+    try {
+      await this.dependencies.turnManager.recoverTurn({
+        threadId: this.currentThreadId,
+        input: [],
+        cwd: this.currentWorkspace,
+        model: this.currentModel,
+        reasoningEffort: this.currentReasoningEffort,
+        approvalPolicy: profile.approvalPolicy,
+        sandbox: profile.sandboxMode,
+        callbacks: trackedCallbacks,
+      }, turnId);
+    } finally {
+      this.processing = false;
+      this.activeCallbacks = null;
     }
   }
 
   async abort(): Promise<void> {
-    this.abortController?.abort();
+    if (this.currentThreadId && this.activeCallbacks && this.dependencies.turnManager.cancelTurn) {
+      await this.dependencies.turnManager.cancelTurn(this.currentThreadId, this.activeCallbacks);
+    }
   }
 
   async newThread(workspace?: string, model?: string): Promise<CodexSessionInfo> {
     this.ensureIdle("start a new thread");
-
     const effectiveWorkspace = workspace ?? this.currentWorkspace;
     const effectiveModel = model ?? this.currentModel;
-    this.thread = this.getCodex().startThread(this.buildThreadOptions(effectiveWorkspace, effectiveModel));
-    this.activeThreadLaunchProfile = this.currentLaunchProfile;
+    await this.dependencies.client.connect();
+    const response = await this.dependencies.client.request<ThreadResponse>("thread/start", {
+      cwd: effectiveWorkspace,
+      model: effectiveModel,
+      approvalPolicy: this.currentLaunchProfile.approvalPolicy,
+      sandbox: this.currentLaunchProfile.sandboxMode,
+      serviceName: "telecodex",
+      ...(this.currentReasoningEffort ? { config: { model_reasoning_effort: this.currentReasoningEffort } } : {}),
+    });
     this.currentWorkspace = effectiveWorkspace;
-    this.currentThreadId = this.thread.id ?? null;
-    if (model) {
-      this.currentModel = model;
-    }
+    if (model) this.currentModel = model;
+    this.applyThreadResponse(response, this.currentLaunchProfile);
     return this.getInfo();
   }
 
   async resumeThread(threadId: string): Promise<CodexSessionInfo> {
     this.ensureIdle("resume a thread");
-
-    this.thread = this.getCodex().resumeThread(
+    await this.dependencies.client.connect();
+    const response = await this.dependencies.client.request<ThreadResponse>("thread/resume", {
       threadId,
-      this.buildThreadOptions(this.currentWorkspace, this.currentModel),
-    );
-    this.activeThreadLaunchProfile = this.currentLaunchProfile;
-    this.currentThreadId = threadId;
+    });
+    this.applyThreadResponse(response, this.currentLaunchProfile);
     return this.getInfo();
   }
 
   async switchSession(threadId: string): Promise<CodexSessionInfo> {
     this.ensureIdle("switch session");
-
     const record = getThread(threadId);
-    const workspace = record?.cwd ?? this.currentWorkspace;
-    const model = record?.model || undefined;
-
-    this.thread = this.getCodex().resumeThread(threadId, this.buildThreadOptions(workspace, model));
-    this.activeThreadLaunchProfile = this.currentLaunchProfile;
-    this.currentWorkspace = workspace;
-    this.currentThreadId = threadId;
-    if (model) {
-      this.currentModel = model;
-    }
-    return this.getInfo();
+    if (record?.cwd) this.currentWorkspace = record.cwd;
+    if (record?.model) this.currentModel = record.model;
+    return this.resumeThread(threadId);
   }
 
   listAllSessions(limit?: number): CodexThreadRecord[] {
@@ -354,13 +273,12 @@ export class CodexSessionService {
     return slug;
   }
 
-  setReasoningEffort(effort: ModelReasoningEffort): void {
+  setReasoningEffort(effort: CodexReasoningEffort): void {
     this.currentReasoningEffort = effort;
   }
 
   setLaunchProfile(profileId: string): CodexLaunchProfile {
     this.currentLaunchProfile = getLaunchProfile(this.config, profileId);
-    this.resetCodexClient();
     return this.currentLaunchProfile;
   }
 
@@ -370,139 +288,85 @@ export class CodexSessionService {
 
   handback(): { threadId: string | null; workspace: string } {
     const info = { threadId: this.currentThreadId, workspace: this.currentWorkspace };
-    this.abortController?.abort();
-    this.abortController = null;
-    this.thread = null;
+    void this.abort();
     this.currentThreadId = null;
     this.activeThreadLaunchProfile = null;
     return info;
   }
 
   dispose(): void {
-    this.abortController?.abort();
-    this.abortController = null;
-    this.thread = null;
+    void this.abort();
     this.currentThreadId = null;
     this.activeThreadLaunchProfile = null;
   }
 
-  private buildSdkInput(input: CodexPromptInput): Input {
-    if (typeof input === "string") {
-      return input;
-    }
-
-    const parts: UserInput[] = [];
-    const textParts: string[] = [];
-
-    if (input.stagedFileInstructions) {
-      textParts.push(input.stagedFileInstructions);
-    }
-    if (input.text) {
-      textParts.push(input.text);
-    }
-    if (textParts.length > 0) {
-      parts.push({ type: "text", text: textParts.join("\n\n") });
-    }
-
-    for (const imagePath of input.imagePaths ?? []) {
-      parts.push({ type: "local_image", path: imagePath });
-    }
-
-    if (parts.length === 0) {
-      return "";
-    }
-    if (parts.length === 1 && parts[0]?.type === "text") {
-      return parts[0].text;
-    }
-    return parts;
+  private applyThreadResponse(response: ThreadResponse, baseProfile: CodexLaunchProfile): void {
+    this.currentThreadId = response.thread.id;
+    this.dependencies.turnManager.trackThread?.(response.thread.id, response.thread.status.type);
+    if (response.cwd) this.currentWorkspace = response.cwd;
+    if (response.model) this.currentModel = response.model;
+    if (response.reasoningEffort) this.currentReasoningEffort = response.reasoningEffort;
+    this.activeThreadLaunchProfile = profileFromResponse(baseProfile, response);
   }
 
-  private buildThreadOptions(workspace: string, model?: string): {
-    model?: string;
-    sandboxMode: SandboxMode;
-    workingDirectory: string;
-    approvalPolicy: ApprovalMode;
-    skipGitRepoCheck: true;
-    modelReasoningEffort?: ModelReasoningEffort;
-  } {
-    const effectiveModel = model ?? this.currentModel ?? this.config.codexModel;
-    const options = {
-      model: effectiveModel,
-      sandboxMode: this.currentLaunchProfile.sandboxMode,
-      workingDirectory: workspace,
-      approvalPolicy: this.currentLaunchProfile.approvalPolicy,
-      skipGitRepoCheck: true as const,
+  private createTrackedCallbacks(callbacks: CodexSessionCallbacks): CodexSessionCallbacks {
+    return {
+      ...callbacks,
+      onTurnComplete: (usage) => {
+        this.sessionTokens.input += usage.inputTokens;
+        this.sessionTokens.cached += usage.cachedInputTokens;
+        this.sessionTokens.output += usage.outputTokens;
+        callbacks.onTurnComplete?.(usage);
+      },
     };
-
-    if (this.currentReasoningEffort) {
-      return {
-        ...options,
-        modelReasoningEffort: this.currentReasoningEffort,
-      };
-    }
-
-    return options;
   }
 
   private ensureIdle(action: string): void {
-    if (this.abortController) {
-      throw new Error(`Cannot ${action} while a turn is in progress`);
-    }
+    if (this.processing) throw new Error(`Cannot ${action} while a turn is in progress`);
   }
+}
 
-  private handleThreadEvent(event: ThreadEvent): void {
-    if (event.type === "thread.started") {
-      this.currentThreadId = event.thread_id;
-    }
-  }
-
-  private getCodex(): Codex {
-    if (!this.codex) {
-      this.resetCodexClient();
-    }
-
-    return this.codex!;
-  }
-
-  private resetCodexClient(): void {
-    this.codex = new Codex({
-      apiKey: this.config.codexApiKey,
-      config: {
-        approval_policy: this.currentLaunchProfile.approvalPolicy,
-      },
-      env: buildCodexEnv(this.config.codexApiKey),
-    });
-  }
+export function createCodexSessionDependencies(maxActiveTopics = 4): CodexSessionDependencies {
+  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+  const client = new AppServerClient(
+    path.join(codexHome, "app-server-control", "app-server-control.sock"),
+  );
+  return { client, turnManager: new AppServerTurnManager(client, maxActiveTopics) };
 }
 
 function getLaunchProfile(config: TeleCodexConfig, profileId: string): CodexLaunchProfile {
   const profile = findLaunchProfile(config.launchProfiles, profileId);
-  if (!profile) {
-    throw new Error(`Unknown launch profile: ${profileId}`);
-  }
+  if (!profile) throw new Error(`Unknown launch profile: ${profileId}`);
   return profile;
 }
 
-function buildCodexEnv(apiKey?: string): Record<string, string> {
-  const env: Record<string, string> = {};
-
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) {
-      env[key] = value;
-    }
+function buildAppServerInput(input: CodexPromptInput): AppServerUserInput[] {
+  if (typeof input === "string") {
+    return [{ type: "text", text: input, text_elements: [] }];
   }
-
-  if (apiKey) {
-    env.CODEX_API_KEY = apiKey;
+  const result: AppServerUserInput[] = [];
+  const text = [input.stagedFileInstructions, input.text].filter(Boolean).join("\n\n");
+  if (text) result.push({ type: "text", text, text_elements: [] });
+  for (const imagePath of input.imagePaths ?? []) {
+    result.push({ type: "localImage", path: imagePath });
   }
-
-  return env;
+  return result;
 }
 
-function computeTextDelta(previousText: string, nextText: string): string {
-  return nextText.startsWith(previousText) ? nextText.slice(previousText.length) : nextText;
+function profileFromResponse(base: CodexLaunchProfile, response: ThreadResponse): CodexLaunchProfile {
+  const sandboxMode = mapSandboxMode(response.sandbox?.type) ?? base.sandboxMode;
+  const approvalPolicy = response.approvalPolicy ?? base.approvalPolicy;
+  return {
+    ...base,
+    sandboxMode,
+    approvalPolicy,
+    unsafe: sandboxMode === "danger-full-access",
+  };
 }
 
-function truncate(text: string, maxLength: number): string {
-  return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
+function mapSandboxMode(type: string | undefined): CodexSandboxMode | undefined {
+  if (type === "dangerFullAccess") return "danger-full-access";
+  if (type === "readOnly") return "read-only";
+  if (type === "workspaceWrite") return "workspace-write";
+  return undefined;
 }

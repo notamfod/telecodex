@@ -51,6 +51,8 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    |---|---|---|
    | `TELEGRAM_BOT_TOKEN` | ✅ | Bot token from @BotFather |
    | `TELEGRAM_ALLOWED_USER_IDS` | ✅ | Comma-separated Telegram user IDs |
+   | `TELEGRAM_FORUM_CHAT_ID` | — | Forum supergroup ID; enables automatic topic creation for visible Codex chats |
+   | `TOPIC_SYNC_INTERVAL_SECONDS` | — | Topic reconciliation interval, at least 5 seconds (default `30`) |
    | `CODEX_API_KEY` | — | API key for Codex (alternative to ChatGPT login) |
    | `CODEX_MODEL` | — | Default model, e.g. `gpt-5.4`, `o3` |
    | `CODEX_SANDBOX_MODE` | — | `read-only`, `workspace-write` *(default)*, `danger-full-access` |
@@ -61,7 +63,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `TOOL_VERBOSITY` | — | `all`, `summary` *(default)*, `errors-only`, `none` |
    | `SHOW_TURN_TOKEN_USAGE` | — | Show the per-turn `in/cached/out` footer in final replies (`false` by default) |
    | `MAX_FILE_SIZE` | — | Max upload size in bytes (default `20971520` = 20 MB) |
-   | `ENABLE_TELEGRAM_LOGIN` | — | Allow `/login` and `/logout` from Telegram (`true` by default) |
+   | `ENABLE_TELEGRAM_LOGIN` | — | Allow `/login` and `/logout` from Telegram (`false` by default) |
    | `ENABLE_TELEGRAM_REACTIONS` | — | Enable Telegram emoji reactions like 👀 / 👍 (`false` by default) |
    | `OPENAI_API_KEY` | — | Enables OpenAI Whisper voice transcription fallback |
 
@@ -157,6 +159,8 @@ The `SessionRegistry` maps context keys to `CodexSessionService` instances:
 Session metadata (thread ID, workspace, launch profile, model, effort) is persisted to `.telecodex/contexts.json` and restored on restart so threads survive bot reboots.
 
 Each context has independent busy-state tracking, so a running prompt in one topic doesn't block another.
+
+When `TELEGRAM_FORUM_CHAT_ID` is configured, TeleCodex periodically creates one forum topic for every visible top-level Codex chat (`source = vscode`). CLI automation runs and subagent threads are ignored. The persisted context binding also acts as a tombstone: deleting a Telegram topic does not delete its Codex thread and does not cause the topic to be recreated automatically.
 
 ## Handoff: Telegram → CLI
 
@@ -257,9 +261,9 @@ That playbook covers:
 - Default sandbox mode is `workspace-write` — Codex can read and write within the working directory
 - Use `danger-full-access` only if you fully trust the user and the host environment
 - The built-in `Full Access` profile and any extra `danger-full-access` launch profiles are opt-in via `ENABLE_UNSAFE_LAUNCH_PROFILES=true`
-- Default approval policy is `never` — suited for headless/automated use
+- Default approval policy is `never` - suited for headless use; the sandbox still blocks actions outside its boundary
 - `/launch_profiles` only selects from validated configured profiles; Telegram users cannot submit arbitrary sandbox or approval values
 - `CODEX_API_KEY` (agent auth) and `OPENAI_API_KEY` (voice transcription) are separate credentials
-- `/login` and `/logout` can be disabled by setting `ENABLE_TELEGRAM_LOGIN=false`
+- `/login` and `/logout` are disabled by default; set `ENABLE_TELEGRAM_LOGIN=true` to enable them
 - Files uploaded via Telegram are sanitized (name, size, type) before staging in the workspace
 - All Markdown output is sanitized before being sent as Telegram HTML

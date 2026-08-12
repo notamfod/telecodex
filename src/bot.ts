@@ -1,10 +1,10 @@
+import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { autoRetry } from "@grammyjs/auto-retry";
-import type { ModelReasoningEffort } from "@openai/codex-sdk";
 import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 
 import {
@@ -23,29 +23,85 @@ import {
 } from "./bot-ui.js";
 import {
   type CodexPromptInput,
+  type CodexReasoningEffort,
   type CodexSessionCallbacks,
   type CodexSessionInfo,
   type CodexSessionService,
 } from "./codex-session.js";
-import { checkAuthStatus, clearAuthCache, startLogin, startLogout } from "./codex-auth.js";
+import { checkAuthStatus, startLogin, startLogout } from "./codex-auth.js";
 import {
   findLaunchProfile,
   formatLaunchProfileBehavior,
   formatLaunchProfileLabel,
 } from "./codex-launch.js";
-import { getThread } from "./codex-state.js";
+import { getThread, listUserThreads } from "./codex-state.js";
+import { buildTopicName } from "./topic-sync.js";
+import {
+  GitLabClient,
+  buildDoneComment,
+  buildReviewPrompt,
+  linkedMergeRequests,
+  mergeRequestButtons,
+  mergeRequestTopicName,
+  renderDraftHTML,
+  renderMergeRequestCardHTML,
+  type MergeRequestSummary,
+} from "./gitlab.js";
+import {
+  BurstBuffer,
+  DEFAULT_TICKET_TEMPLATE,
+  InboxStore,
+  buildTicketPrompt,
+  describeSource,
+  extractTicketKey,
+  hasAttachment,
+  groupBurst,
+  ticketHeading,
+  ticketTopicName,
+  type Ticket,
+} from "./inbox.js";
+import {
+  findBoundTopic,
+  groupThreadsByProject,
+  projectButtons,
+  renderProjectHTML,
+  renderProjectsHTML,
+  sessionButtons,
+  topicUrl,
+  type ProjectGroup,
+} from "./projects.js";
 import type { TeleCodexConfig, ToolVerbosity } from "./config.js";
-import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
+import {
+  contextKeyFromCtx,
+  contextKeyFromMessage,
+  isTopicContextKey,
+  parseContextKey,
+  type TelegramContextKey,
+} from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
-import { escapeHTML, formatTelegramHTML } from "./format.js";
+import { escapeHTML, splitTelegramMarkdown } from "./format.js";
+import {
+  RECIPE_MUTES_PATH,
+  RECIPE_STATE_PATH,
+  RecipeMutes,
+  readPendingRun,
+} from "./recipe-store.js";
+import { buildFixPrompt, fingerprintFinding, fixTopicName } from "./recipes.js";
 import { SessionRegistry } from "./session-registry.js";
+import {
+  TelegramJobStore,
+  type PersistentTelegramJob,
+} from "./telegram-job-store.js";
+import { TurnProgressPresenter } from "./turn-progress.js";
+import {
+  finalChunkThreadKeyboard,
+  parseCodexThreadCallback,
+} from "./thread-links.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
-const EDIT_DEBOUNCE_MS = 1500;
 const TYPING_INTERVAL_MS = 4500;
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
-const STREAMING_PREVIEW_LIMIT = 3800;
 const FORMATTED_CHUNK_TARGET = 3000;
 const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024;
 const KEYBOARD_PAGE_SIZE = 6;
@@ -80,6 +136,23 @@ type RenderedChunk = RenderedText & {
   sourceText: string;
 };
 
+/** Inbox tickets always run in this sandbox, whatever the host default is. */
+const INBOX_LAUNCH_PROFILE_ID = "readonly";
+
+interface InboxItem {
+  contextKey: TelegramContextKey;
+  chatId: number;
+  messageId: number;
+  mediaGroupId?: string;
+  hasAttachment: boolean;
+  text: string;
+  message: Parameters<typeof describeSource>[0];
+}
+
+export interface TeleCodexBot extends Bot<Context> {
+  recoverPendingJobs(): Promise<void>;
+}
+
 function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): InlineKeyboard {
   const totalPages = Math.max(1, Math.ceil(items.length / KEYBOARD_PAGE_SIZE));
   const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
@@ -107,14 +180,30 @@ function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): 
   return keyboard;
 }
 
-export function createBot(config: TeleCodexConfig, registry: SessionRegistry): Bot<Context> {
-  const bot = new Bot<Context>(config.telegramBotToken);
+export function createBot(config: TeleCodexConfig, registry: SessionRegistry): TeleCodexBot {
+  const bot = new Bot<Context>(config.telegramBotToken) as TeleCodexBot;
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
+  const jobStore = new TelegramJobStore(path.join(config.workspace, ".telecodex", "jobs.json"));
 
   const contextBusy = new Map<
     TelegramContextKey,
     { processing: boolean; switching: boolean; transcribing: boolean }
   >();
+  const inbox = new InboxStore(path.join(config.workspace, ".telecodex", "inbox.json"));
+  const gitlab =
+    config.gitlabUrl && config.gitlabToken
+      ? new GitLabClient(config.gitlabUrl, config.gitlabToken)
+      : undefined;
+  const pendingMergeRequests = new Map<string, MergeRequestSummary>();
+  const pendingMergeRequestButtons = new Map<TelegramContextKey, KeyboardItem[]>();
+  /** Drafted GitLab comments awaiting a tap; a restart just expires them. */
+  const pendingDoneDrafts = new Map<number, { key: string; body: string }>();
+  let nextDoneDraftId = 1;
+  const pendingBatches = new Map<string, InboxItem[][]>();
+  let nextBatchId = 1;
+  const pendingProjectPicks = new Map<TelegramContextKey, string[]>();
+  const pendingProjectButtons = new Map<TelegramContextKey, KeyboardItem[]>();
+  const pendingProjectSessionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingSessionPicks = new Map<TelegramContextKey, string[]>();
   const pendingWorkspacePicks = new Map<TelegramContextKey, string[]>();
   const pendingSessionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
@@ -125,6 +214,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
+  const promptTails = new Map<TelegramContextKey, Promise<void>>();
+  const activeJobIds = new Map<TelegramContextKey, string>();
 
   registry.onRemove((key) => {
     contextBusy.delete(key);
@@ -132,6 +223,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingLaunchButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
     lastPromptInput.delete(key);
+    promptTails.delete(key);
+    activeJobIds.delete(key);
   });
 
   const getBusyState = (
@@ -212,12 +305,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
   };
 
-  const sendBusyReply = async (ctx: Context): Promise<void> => {
-    await safeReply(ctx, escapeHTML("Still working on previous message..."), {
-      fallbackText: "Still working on previous message...",
-    });
-  };
-
   const setReaction = async (ctx: Context, emoji: "👀" | "👍" | "❤" | "🔥" | "👏"): Promise<void> => {
     if (!config.enableTelegramReactions) {
       return;
@@ -269,20 +356,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   };
 
-  const handleUserPrompt = async (
+  const executeUserPrompt = async (
     ctx: Context,
     contextKey: TelegramContextKey,
     chatId: TelegramChatId,
     session: CodexSessionService,
     userInput: CodexPromptInput,
+    persistentJob: PersistentTelegramJob,
   ): Promise<void> => {
+    if (jobStore.get(persistentJob.id)?.state === "aborted") return;
     const parsed = parseContextKey(contextKey);
     const messageThreadId = parsed.messageThreadId;
-
-    if (isBusy(contextKey)) {
-      await sendBusyReply(ctx);
-      return;
-    }
 
     const busyState = getBusyState(contextKey);
     busyState.processing = true;
@@ -292,47 +376,54 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const toolStates = new Map<string, ToolState>();
     const toolCounts = new Map<string, number>();
     let accumulatedText = "";
-    let responseMessageId: number | undefined;
-    let responseMessagePromise: Promise<void> | undefined;
-    let lastRenderedText = "";
-    let lastEditAt = 0;
-    let flushTimer: NodeJS.Timeout | undefined;
-    let isFlushing = false;
-    let flushPending = false;
+    let fallbackAccumulatedText = "";
+    let currentAgentPhase: string | undefined;
     let finalized = false;
-    let planMessageId: number | undefined;
-    let lastRenderedPlan = "";
-    let planMessageSending = false;
     let lastTurnUsage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | undefined;
+    const generatedImages: Array<{ path?: string; base64?: string }> = [];
+    let codexCompleted = false;
 
-    const typingInterval = setInterval(() => {
-      void bot.api
-        .sendChatAction(chatId, "typing", {
-          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-        })
-        .catch(() => {});
-    }, TYPING_INTERVAL_MS);
-    void bot.api
-      .sendChatAction(chatId, "typing", {
+    const progress = new TurnProgressPresenter({
+      heartbeatMs: config.telegramProgressHeartbeatMs,
+      send: async (message) => {
+        const sent = await sendTextMessage(bot.api, chatId, message.html, {
+          parseMode: "HTML",
+          fallbackText: message.plain,
+          replyMarkup: abortKeyboard,
+          messageThreadId,
+        });
+        return sent.message_id;
+      },
+      edit: async (messageId, message, heartbeat) => {
+        await safeEditMessage(bot, chatId, messageId, message.html, {
+          parseMode: "HTML",
+          fallbackText: message.plain,
+          replyMarkup: heartbeat ? abortKeyboard : new InlineKeyboard(),
+        });
+      },
+    });
+
+    let typingInterval: NodeJS.Timeout | undefined;
+
+    const sendTyping = (): void => {
+      void bot.api.sendChatAction(chatId, "typing", {
         ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-      })
-      .catch(() => {});
+      }).catch(() => {});
+    };
+
+    const startTyping = (): void => {
+      if (typingInterval) return;
+      sendTyping();
+      typingInterval = setInterval(sendTyping, TYPING_INTERVAL_MS);
+    };
 
     const stopTyping = (): void => {
+      if (!typingInterval) return;
       clearInterval(typingInterval);
+      typingInterval = undefined;
     };
 
-    const clearFlushTimer = (): void => {
-      if (flushTimer) {
-        clearTimeout(flushTimer);
-        flushTimer = undefined;
-      }
-    };
-
-    const renderPreview = (): RenderedChunk => {
-      const previewText = buildStreamingPreview(accumulatedText);
-      return renderMarkdownChunkWithinLimit(previewText);
-    };
+    startTyping();
 
     const buildFinalResponseText = (text: string): string => {
       const trimmedText = text.trim();
@@ -356,134 +447,28 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return trimmedText;
     };
 
-    const ensureResponseMessage = async (): Promise<void> => {
-      if (responseMessageId) {
-        return;
-      }
-      if (responseMessagePromise) {
-        await responseMessagePromise;
-        return;
-      }
-
-      responseMessagePromise = (async () => {
-        stopTyping();
-        const preview = renderPreview();
-        const message = await sendTextMessage(bot.api, chatId, preview.text, {
-          parseMode: preview.parseMode,
-          fallbackText: preview.fallbackText,
-          replyMarkup: abortKeyboard,
-          messageThreadId,
-        });
-        responseMessageId = message.message_id;
-        lastRenderedText = preview.text;
-        lastEditAt = Date.now();
-      })();
-
-      try {
-        await responseMessagePromise;
-      } finally {
-        responseMessagePromise = undefined;
-      }
-    };
-
-    const flushResponse = async (force = false): Promise<void> => {
-      if (!accumulatedText) {
-        return;
-      }
-      if (!responseMessageId) {
-        await ensureResponseMessage();
-        return;
-      }
-      if (isFlushing) {
-        flushPending = true;
-        return;
-      }
-
-      const now = Date.now();
-      if (!force && now - lastEditAt < EDIT_DEBOUNCE_MS) {
-        return;
-      }
-
-      const nextText = renderPreview();
-      if (nextText.text === lastRenderedText) {
-        return;
-      }
-
-      isFlushing = true;
-      try {
-        await safeEditMessage(bot, chatId, responseMessageId, nextText.text, {
-          parseMode: nextText.parseMode,
-          fallbackText: nextText.fallbackText,
-          replyMarkup: abortKeyboard,
-        });
-        lastRenderedText = nextText.text;
-        lastEditAt = Date.now();
-      } finally {
-        isFlushing = false;
-        if (flushPending) {
-          flushPending = false;
-          scheduleFlush();
-        }
-      }
-    };
-
-    const scheduleFlush = (): void => {
-      if (flushTimer || finalized) {
-        return;
-      }
-
-      const delay = Math.max(0, EDIT_DEBOUNCE_MS - (Date.now() - lastEditAt));
-      flushTimer = setTimeout(() => {
-        flushTimer = undefined;
-        void flushResponse().catch((error) => {
-          console.error("Failed to update Telegram response message", error);
-        });
-      }, delay);
-    };
-
-    const removeAbortKeyboard = async (): Promise<void> => {
-      if (!responseMessageId) {
-        return;
-      }
-
-      try {
-        await bot.api.editMessageReplyMarkup(chatId, responseMessageId, {
-          reply_markup: new InlineKeyboard(),
-        });
-      } catch (error) {
-        if (!isMessageNotModifiedError(error)) {
-          console.error("Failed to clear Abort button", error);
-        }
-      }
-    };
-
-    const deliverRenderedChunks = async (chunks: RenderedChunk[]): Promise<void> => {
+    const deliverRenderedChunks = async (
+      chunks: RenderedChunk[],
+      threadActionMarkdown = "",
+    ): Promise<void> => {
       if (chunks.length === 0) {
         return;
       }
 
-      const [firstChunk, ...remainingChunks] = chunks;
-      if (responseMessageId) {
-        await safeEditMessage(bot, chatId, responseMessageId, firstChunk.text, {
-          parseMode: firstChunk.parseMode,
-          fallbackText: firstChunk.fallbackText,
-        });
-        await removeAbortKeyboard();
-      } else {
-        const message = await sendTextMessage(bot.api, chatId, firstChunk.text, {
-          parseMode: firstChunk.parseMode,
-          fallbackText: firstChunk.fallbackText,
-          messageThreadId,
-        });
-        responseMessageId = message.message_id;
-      }
-
-      for (const chunk of remainingChunks) {
+      for (const [index, chunk] of chunks.entries()) {
+        const partKey = `final:${index}`;
+        if (jobStore.hasPart(persistentJob.id, partKey)) continue;
         await sendTextMessage(bot.api, chatId, chunk.text, {
           parseMode: chunk.parseMode,
           fallbackText: chunk.fallbackText,
+          replyMarkup: finalChunkThreadKeyboard(
+            threadActionMarkdown,
+            index,
+            chunks.length,
+          ),
           messageThreadId,
         });
+        jobStore.markPartSent(persistentJob.id, partKey);
       }
     };
 
@@ -494,49 +479,80 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       finalized = true;
 
       stopTyping();
-      clearFlushTimer();
-      if (responseMessagePromise) {
-        try {
-          await responseMessagePromise;
-        } catch {
-          // If the initial send failed, we will fall back to sending the final response below.
-        }
-      }
 
       const finalText = buildFinalResponseText(accumulatedText);
       if (!finalText) {
-        const html = "<b>✅ Done</b>";
-        const plainText = "✅ Done";
-
-        if (responseMessageId) {
-          await safeEditMessage(bot, chatId, responseMessageId, html, { fallbackText: plainText });
-          await removeAbortKeyboard();
-        } else {
-          await safeReply(ctx, html, { fallbackText: plainText });
-        }
+        await deliverRenderedChunks(splitMarkdownForTelegram("**✅ Done**"));
         return;
       }
 
-      await deliverRenderedChunks(splitMarkdownForTelegram(finalText));
+      await deliverRenderedChunks(splitMarkdownForTelegram(finalText), finalText);
+    };
+
+    const deliverGeneratedImages = async (): Promise<void> => {
+      for (const [index, image] of generatedImages.entries()) {
+        const partKey = `image:${index}`;
+        if (jobStore.hasPart(persistentJob.id, partKey)) continue;
+        let imagePath = image.path;
+        let temporary = false;
+        if (!imagePath && image.base64) {
+          imagePath = path.join(tmpdir(), `telecodex-generated-${randomUUID()}.png`);
+          await writeFile(imagePath, Buffer.from(image.base64, "base64"));
+          temporary = true;
+        }
+        if (!imagePath) continue;
+
+        try {
+          await bot.api.sendPhoto(chatId, new InputFile(imagePath), {
+            ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+          });
+          jobStore.markPartSent(persistentJob.id, partKey);
+        } catch (photoError) {
+          try {
+            await bot.api.sendDocument(chatId, new InputFile(imagePath, path.basename(imagePath)), {
+              ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+            });
+            jobStore.markPartSent(persistentJob.id, partKey);
+          } catch (documentError) {
+            console.error("Failed to send generated image", { photoError, documentError });
+          }
+        } finally {
+          if (temporary) await unlink(imagePath).catch(() => {});
+        }
+      }
     };
 
     const callbacks: CodexSessionCallbacks = {
+      onQueued: (status) => {
+        stopTyping();
+        const text = status.reason === "global-limit"
+          ? `🕓 Очередь №${status.position} · активно ${status.active}/${status.limit}`
+          : `⏳ Сессия занята в Codex · очередь №${status.position}`;
+        void sendTextMessage(bot.api, chatId, escapeHTML(text), {
+          fallbackText: text,
+          messageThreadId,
+        }).catch((error) => {
+          console.error("Failed to send queue status", error);
+        });
+      },
+      onStarted: (turnId) => {
+        jobStore.update(persistentJob.id, { state: "active", turnId });
+        startTyping();
+      },
+      onAgentMessageStart: ({ phase }) => {
+        currentAgentPhase = phase;
+        if (fallbackAccumulatedText) fallbackAccumulatedText += "\n\n";
+        if (phase === "final_answer" && accumulatedText) accumulatedText += "\n\n";
+      },
+      onAgentMessageEnd: () => {
+        currentAgentPhase = undefined;
+      },
       onTextDelta: (delta: string) => {
-        accumulatedText += delta;
-        if (!responseMessageId) {
-          void ensureResponseMessage()
-            .then(() => {
-              scheduleFlush();
-            })
-            .catch((error) => {
-              console.error("Failed to send initial Telegram response message", error);
-            });
-          return;
-        }
-
-        scheduleFlush();
+        fallbackAccumulatedText += delta;
+        if (currentAgentPhase === "final_answer") accumulatedText += delta;
       },
       onToolStart: (toolName: string, toolCallId: string) => {
+        progress.toolStarted();
         if (toolVerbosity === "summary") {
           toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
           return;
@@ -625,48 +641,23 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         });
       },
       onTodoUpdate: (items) => {
-        if (toolVerbosity === "none") {
-          return;
-        }
-
-        const rendered = renderTodoList(items);
-        if (rendered === lastRenderedPlan) {
-          return;
-        }
-
-        lastRenderedPlan = rendered;
-        if (!planMessageId) {
-          if (planMessageSending) return;
-          planMessageSending = true;
-          void sendTextMessage(bot.api, chatId, rendered, { parseMode: "HTML", messageThreadId })
-            .then((msg) => {
-              planMessageId = msg.message_id;
-            })
-            .catch((err) => {
-              console.error("Failed to send plan message", err);
-            })
-            .finally(() => {
-              planMessageSending = false;
-            });
-        } else {
-          void safeEditMessage(bot, chatId, planMessageId, rendered, { parseMode: "HTML" }).catch((err) => {
-            console.error("Failed to update plan message", err);
-          });
-        }
+        void progress.updatePlan(items).catch((error) => {
+          console.error("Failed to update progress checkpoint", error);
+        });
       },
       onTurnComplete: (usage) => {
         lastTurnUsage = usage;
       },
-      onAgentEnd: () => {
-        void finalizeResponse().catch((error) => {
-          console.error("Failed to finalize Telegram response message", error);
-        });
+      onGeneratedImage: (image) => {
+        generatedImages.push(image);
       },
+      onAgentEnd: () => {},
     };
 
     try {
       const authStatus = await checkAuthStatus(config.codexApiKey);
       if (!authStatus.authenticated) {
+        jobStore.update(persistentJob.id, { state: "failed" });
         await safeReply(
           ctx,
           [
@@ -690,23 +681,38 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
 
       if (!(await ensureActiveThread(ctx, contextKey, session))) {
+        jobStore.update(persistentJob.id, { state: "failed" });
         return;
       }
 
-      await session.prompt(userInput, callbacks);
+      jobStore.update(persistentJob.id, { threadId: session.getInfo().threadId });
+      await progress.start();
+      const latestJob = jobStore.get(persistentJob.id)!;
+      if (
+        latestJob.turnId &&
+        (latestJob.state === "active" || latestJob.state === "delivering")
+      ) {
+        await session.recoverPrompt(latestJob.turnId, callbacks);
+      } else {
+        await session.prompt(userInput, callbacks);
+      }
+      codexCompleted = true;
+      jobStore.update(persistentJob.id, { state: "delivering" });
       updateSessionMetadata(contextKey, session);
+      if (!accumulatedText.trim()) accumulatedText = fallbackAccumulatedText;
+      await progress.complete();
       await finalizeResponse();
+      await deliverGeneratedImages();
+      jobStore.update(persistentJob.id, { state: "completed" });
     } catch (error) {
       stopTyping();
-      clearFlushTimer();
-      if (responseMessagePromise) {
-        try {
-          await responseMessagePromise;
-        } catch {
-          // Ignore; we will send an error message below.
-        }
+      if (!accumulatedText.trim()) accumulatedText = fallbackAccumulatedText;
+      await progress.fail(friendlyErrorText(error)).catch((progressError) => {
+        console.error("Failed to mark progress checkpoint as failed", progressError);
+      });
+      if (jobStore.get(persistentJob.id)?.state !== "aborted") {
+        jobStore.update(persistentJob.id, { state: codexCompleted ? "delivering" : "failed" });
       }
-
       if (finalized) {
         console.error("Codex prompt error after finalization:", formatError(error));
       } else {
@@ -715,16 +721,51 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         const combinedText = buildFinalResponseText(renderPromptFailure(accumulatedText, error));
         const chunks = splitMarkdownForTelegram(combinedText);
         try {
-          await deliverRenderedChunks(chunks);
+          await deliverRenderedChunks(chunks, combinedText);
         } catch (telegramError) {
           console.error("Failed to send error message to Telegram:", telegramError);
         }
       }
     } finally {
       stopTyping();
-      clearFlushTimer();
       busyState.processing = false;
     }
+  };
+
+  const handleUserPrompt = (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    session: CodexSessionService,
+    userInput: CodexPromptInput,
+    recoveredJob?: PersistentTelegramJob,
+  ): Promise<void> => {
+    const parsed = parseContextKey(contextKey);
+    const persistentJob = recoveredJob ?? jobStore.create({
+      contextKey,
+      chatId: parsed.chatId,
+      messageThreadId: parsed.messageThreadId,
+      threadId: session.getInfo().threadId,
+      input: userInput,
+    });
+    const previous = promptTails.get(contextKey) ?? Promise.resolve();
+    const current = previous
+      .catch(() => undefined)
+      .then(async () => {
+        activeJobIds.set(contextKey, persistentJob.id);
+        try {
+          await executeUserPrompt(ctx, contextKey, chatId, session, userInput, persistentJob);
+        } finally {
+          if (activeJobIds.get(contextKey) === persistentJob.id) activeJobIds.delete(contextKey);
+        }
+      });
+    const tail = current
+      .catch(() => undefined)
+      .finally(() => {
+        if (promptTails.get(contextKey) === tail) promptTails.delete(contextKey);
+      });
+    promptTails.set(contextKey, tail);
+    return current;
   };
 
   const deliverArtifacts = async (
@@ -764,6 +805,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   };
 
   bot.use(async (ctx, next) => {
+    if (isTopicLifecycleMessage(ctx.message)) {
+      return;
+    }
+
     const fromId = ctx.from?.id;
     if (!fromId || !config.telegramAllowedUserIdSet.has(fromId)) {
       if (ctx.callbackQuery) {
@@ -1028,8 +1073,20 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const { session } = contextSession;
+    const { contextKey, session } = contextSession;
     try {
+      const queuedJob = jobStore.listRecoverable()
+        .filter((job) => job.contextKey === contextKey)
+        .at(-1);
+      if (queuedJob && activeJobIds.get(contextKey) !== queuedJob.id) {
+        jobStore.update(queuedJob.id, { state: "aborted" });
+        await safeReply(ctx, escapeHTML("Aborted queued operation"), {
+          fallbackText: "Aborted queued operation",
+        });
+        return;
+      }
+      const activeJobId = activeJobIds.get(contextKey);
+      if (activeJobId) jobStore.update(activeJobId, { state: "aborted" });
       await session.abort();
       await safeReply(ctx, escapeHTML("Aborted current operation"), {
         fallbackText: "Aborted current operation",
@@ -1050,11 +1107,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const { contextKey, session } = contextSession;
     const chatId = ctx.chat?.id;
     if (!chatId) {
-      return;
-    }
-
-    if (isBusy(contextKey)) {
-      await sendBusyReply(ctx);
       return;
     }
 
@@ -1388,6 +1440,700 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
   });
 
+  // Threads come from the Codex database, so a session stays reachable even
+  // after someone deletes the forum topic that used to be bound to it.
+  const PROJECT_THREAD_LIMIT = 100;
+
+  const projectSessionsKeyboard = (
+    contextKey: TelegramContextKey,
+    group: ProjectGroup,
+  ): InlineKeyboard => {
+    const buttons = sessionButtons(group);
+    pendingProjectSessionButtons.set(contextKey, buttons);
+    return paginateKeyboard(buttons, 0, "projsess").row().text("← Projects", "proj_back");
+  };
+
+  const projectsKeyboard = (
+    contextKey: TelegramContextKey,
+    groups: ProjectGroup[],
+  ): InlineKeyboard | undefined => {
+    if (groups.length === 0) {
+      return undefined;
+    }
+    const buttons = projectButtons(groups);
+    pendingProjectPicks.set(contextKey, groups.map((group) => group.workspace));
+    pendingProjectButtons.set(contextKey, buttons);
+    return paginateKeyboard(buttons, 0, "proj");
+  };
+
+  bot.command("projects", async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+
+    const groups = groupThreadsByProject(listUserThreads(PROJECT_THREAD_LIMIT));
+    const filter = (ctx.message?.text ?? "")
+      .replace(/^\/projects(?:@\w+)?\s*/, "")
+      .trim()
+      .toLocaleLowerCase("en-US");
+
+    if (filter) {
+      const group = groups.find(
+        (candidate) => candidate.name.toLocaleLowerCase("en-US") === filter,
+      );
+      if (!group) {
+        const known = groups.map((candidate) => candidate.name).join(", ") || "none";
+        const text = `No project "${filter}". Known projects: ${known}`;
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+        return;
+      }
+
+      await safeReply(ctx, renderProjectHTML(group), {
+        replyMarkup: projectSessionsKeyboard(contextKey, group),
+      });
+      return;
+    }
+
+    await safeReply(ctx, renderProjectsHTML(groups), {
+      replyMarkup: projectsKeyboard(contextKey, groups),
+    });
+  });
+
+  bot.callbackQuery(/^proj_(\d+)$/, async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const index = Number.parseInt(ctx.match?.[1] ?? "", 10);
+
+    if (!contextKey || !chatId || !messageId || Number.isNaN(index)) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    const workspace = pendingProjectPicks.get(contextKey)?.[index];
+    if (workspace === undefined) {
+      await ctx.answerCallbackQuery({ text: "Expired, run /projects again" });
+      return;
+    }
+
+    const group = groupThreadsByProject(listUserThreads(PROJECT_THREAD_LIMIT)).find(
+      (candidate) => candidate.workspace === workspace,
+    );
+    if (!group) {
+      await ctx.answerCallbackQuery({ text: "This project has no sessions any more" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+    await safeEditMessage(bot, chatId, messageId, renderProjectHTML(group), {
+      replyMarkup: projectSessionsKeyboard(contextKey, group),
+    });
+  });
+
+  bot.callbackQuery("proj_back", async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+
+    if (!contextKey || !chatId || !messageId) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+    const groups = groupThreadsByProject(listUserThreads(PROJECT_THREAD_LIMIT));
+    await safeEditMessage(bot, chatId, messageId, renderProjectsHTML(groups), {
+      replyMarkup: projectsKeyboard(contextKey, groups),
+    });
+  });
+
+  const INBOX_QUIET_MS = 2_000;
+  const INBOX_TOPIC_PAUSE_MS = 3_000;
+
+  const inboxUsage = [
+    "Использование:",
+    "/inbox on [путь] — сделать этот топик инбоксом",
+    "/inbox off — выключить",
+    "/inbox status — показать настройки",
+  ].join("\n");
+
+  bot.command("inbox", async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+
+    const args = (ctx.message?.text ?? "").replace(/^\/inbox(?:@\w+)?\s*/, "").trim();
+    const [action, ...rest] = args.split(/\s+/);
+    const settings = inbox.get(contextKey);
+
+    if (action === "off") {
+      const text = inbox.disable(contextKey)
+        ? "Инбокс выключен, сообщения снова идут в сессию этого топика."
+        : "Этот топик и так не инбокс.";
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+
+    if (action === "on") {
+      const workspace = rest.join(" ").trim() || registry.listContexts().find(
+        (entry) => entry.contextKey === contextKey,
+      )?.workspace || config.workspace;
+      inbox.enable(contextKey, {
+        workspace,
+        launchProfileId: INBOX_LAUNCH_PROFILE_ID,
+        template: settings?.template ?? DEFAULT_TICKET_TEMPLATE,
+        iconCustomEmojiId: settings?.iconCustomEmojiId,
+      });
+      const html = [
+        "<b>Инбокс включён.</b>",
+        `Проект: <code>${escapeHTML(workspace)}</code>`,
+        `Профиль запуска тикетов: <code>${escapeHTML(INBOX_LAUNCH_PROFILE_ID)}</code>`,
+        "",
+        "Пересылай сюда обращения — на каждое заведу отдельный топик.",
+      ].join("\n");
+      await safeReply(ctx, html, { fallbackText: "Инбокс включён." });
+      return;
+    }
+
+    if (action === "status" || action === "") {
+      if (!settings) {
+        const text = `Этот топик не инбокс.\n\n${inboxUsage}`;
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+        return;
+      }
+      const html = [
+        "<b>Инбокс включён.</b>",
+        `Проект: <code>${escapeHTML(settings.workspace)}</code>`,
+        `Профиль: <code>${escapeHTML(settings.launchProfileId ?? "по умолчанию")}</code>`,
+      ].join("\n");
+      await safeReply(ctx, html, { fallbackText: "Инбокс включён." });
+      return;
+    }
+
+    await safeReply(ctx, escapeHTML(inboxUsage), { fallbackText: inboxUsage });
+  });
+
+  const ticketTextOf = (group: InboxItem[]): string =>
+    group
+      .map((item) => item.text)
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+
+  /** Only attachments are worth forwarding; the card already quotes the text. */
+  const forwardAttachments = async (
+    group: InboxItem[],
+    messageThreadId: number,
+    ticketId: number,
+  ): Promise<void> => {
+    const [first] = group;
+    for (const item of group.filter((entry) => entry.hasAttachment)) {
+      try {
+        await bot.api.forwardMessage(first.chatId, first.chatId, item.messageId, {
+          message_thread_id: messageThreadId,
+        });
+      } catch (error) {
+        console.warn(
+          `Failed to forward message ${item.messageId} into ticket #${ticketId}:`,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+  };
+
+  const appendToTicket = async (
+    ticket: Ticket,
+    group: InboxItem[],
+    text: string,
+    source: string,
+  ): Promise<void> => {
+    const [first] = group;
+    const card = [
+      `\u2795 <b>Дополнение к ${escapeHTML(ticketHeading(ticket))}</b>`,
+      `Источник: ${escapeHTML(source)}`,
+      "",
+      escapeHTML(text || "(без текста, см. пересланные сообщения ниже)"),
+    ].join("\n");
+
+    await sendTextMessage(bot.api, first.chatId, card, {
+      messageThreadId: ticket.workTopicId,
+      fallbackText: `Дополнение к ${ticketHeading(ticket)}. Источник: ${source}`,
+    });
+
+    await forwardAttachments(group, ticket.workTopicId, ticket.id);
+
+    const url = topicUrl(first.chatId, ticket.workTopicId);
+    await sendTextMessage(
+      bot.api,
+      first.chatId,
+      `Уже заведён <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a> — добавил туда.`,
+      {
+        messageThreadId: parseContextKey(first.contextKey).messageThreadId,
+        fallbackText: `${ticketHeading(ticket)}: ${url}`,
+      },
+    );
+  };
+
+  const createTicket = async (group: InboxItem[]): Promise<void> => {
+    const [first] = group;
+    if (!first) {
+      return;
+    }
+    const settings = inbox.get(first.contextKey);
+    if (!settings) {
+      return;
+    }
+
+    const text = ticketTextOf(group);
+    const source = describeSource(first.message);
+    const externalKey = extractTicketKey(text);
+
+    // A repeat forward about the same issue belongs in the topic that already
+    // tracks it, unless that topic has since been deleted.
+    const existing = externalKey
+      ? inbox.findTicketByKey(first.contextKey, externalKey)
+      : undefined;
+    if (existing?.workTopicId && (await topicIsAlive(first.chatId, existing.workTopicId))) {
+      await appendToTicket(existing, group, text, source);
+      return;
+    }
+
+    const ticket = inbox.createTicket({
+      inboxContextKey: first.contextKey,
+      externalKey,
+      workTopicId: 0,
+      workspace: settings.workspace,
+      launchProfileId: settings.launchProfileId,
+      prompt: buildTicketPrompt(settings.template, { source, message: text }),
+      source,
+    });
+
+    const topic = await bot.api.createForumTopic(
+      first.chatId,
+      ticketTopicName(ticket.id, text),
+      settings.iconCustomEmojiId
+        ? { icon_custom_emoji_id: settings.iconCustomEmojiId }
+        : undefined,
+    );
+    inbox.attachTopic(ticket.id, topic.message_thread_id);
+    registry.setContextDefaults(
+      contextKeyFromMessage(first.chatId, topic.message_thread_id),
+      { workspace: settings.workspace, launchProfileId: settings.launchProfileId },
+    );
+
+    const card = [
+      `🎫 <b>${escapeHTML(ticketHeading(ticket))}</b>`,
+      `Источник: ${escapeHTML(source)}`,
+      `Проект: <code>${escapeHTML(settings.workspace)}</code>`,
+      "",
+      escapeHTML(text || "(без текста, см. пересланные сообщения ниже)"),
+    ].join("\n");
+
+    await sendTextMessage(bot.api, first.chatId, card, {
+      messageThreadId: topic.message_thread_id,
+      fallbackText: `${ticketHeading(ticket)}. Источник: ${source}`,
+      replyMarkup: new InlineKeyboard().text("▶️ Запустить разбор", `ticket_start:${ticket.id}`),
+    });
+
+    await forwardAttachments(group, topic.message_thread_id, ticket.id);
+
+    const url = topicUrl(first.chatId, topic.message_thread_id);
+    await sendTextMessage(
+      bot.api,
+      first.chatId,
+      `Заведён тикет <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a>.`,
+      {
+        messageThreadId: parseContextKey(first.contextKey).messageThreadId,
+        fallbackText: `${ticketHeading(ticket)}: ${url}`,
+      },
+    );
+  };
+
+  const createTicketsSequentially = async (groups: InboxItem[][]): Promise<void> => {
+    for (const [index, group] of groups.entries()) {
+      if (index > 0) {
+        // Telegram rate-limits topic creation hard; pace them.
+        await new Promise((resolve) => setTimeout(resolve, INBOX_TOPIC_PAUSE_MS));
+      }
+      try {
+        await createTicket(group);
+      } catch (error) {
+        console.error(
+          "Failed to create ticket:",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+  };
+
+  const askHowToSplit = async (groups: InboxItem[][]): Promise<void> => {
+    const first = groups[0]?.[0];
+    if (!first) {
+      return;
+    }
+    const batchId = String(nextBatchId++);
+    pendingBatches.set(batchId, groups);
+
+    const keyboard = new InlineKeyboard()
+      .text("Одним тикетом", `inbox_batch:${batchId}:one`)
+      .row()
+      .text(`По отдельности (${groups.length})`, `inbox_batch:${batchId}:each`)
+      .row()
+      .text("Отмена", `inbox_batch:${batchId}:cancel`);
+
+    const text = `Переслано сообщений: ${groups.length}. Как их разобрать?`;
+    await sendTextMessage(bot.api, first.chatId, escapeHTML(text), {
+      messageThreadId: parseContextKey(first.contextKey).messageThreadId,
+      fallbackText: text,
+      replyMarkup: keyboard,
+    });
+  };
+
+  const inboxBuffer = new BurstBuffer<InboxItem>(INBOX_QUIET_MS, (items) => {
+    const groups = groupBurst(items);
+    const run = groups.length === 1 ? createTicket(groups[0]) : askHowToSplit(groups);
+    void run.catch((error) => {
+      console.error(
+        "Inbox burst failed:",
+        error instanceof Error ? error.message : String(error),
+      );
+    });
+  });
+
+  bot.callbackQuery(/^inbox_batch:(\d+):(one|each|cancel)$/, async (ctx) => {
+    const batchId = ctx.match?.[1];
+    const choice = ctx.match?.[2];
+    const groups = batchId ? pendingBatches.get(batchId) : undefined;
+    if (!groups) {
+      await ctx.answerCallbackQuery({ text: "Устарело, перешли сообщения заново" });
+      return;
+    }
+    pendingBatches.delete(batchId!);
+
+    if (choice === "cancel") {
+      await ctx.answerCallbackQuery({ text: "Отменено" });
+      await ctx.editMessageText("Отменено, тикеты не заводились.");
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Завожу тикеты..." });
+    const batches = choice === "one" ? [groups.flat()] : groups;
+    await ctx.editMessageText(
+      choice === "one" ? "Завожу один тикет..." : `Завожу тикетов: ${batches.length}...`,
+    );
+    await createTicketsSequentially(batches);
+  });
+
+  bot.callbackQuery(/^ticket_start:(\d+)$/, async (ctx) => {
+    const ticketId = Number.parseInt(ctx.match?.[1] ?? "", 10);
+    const ticket = Number.isNaN(ticketId) ? undefined : inbox.getTicket(ticketId);
+    if (!ticket) {
+      await ctx.answerCallbackQuery({ text: "Тикет не найден" });
+      return;
+    }
+    if (ticket.startedAt) {
+      await ctx.answerCallbackQuery({ text: "Разбор уже запускали" });
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx);
+    if (!contextSession) {
+      return;
+    }
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      await ctx.answerCallbackQuery({ text: "Дождись окончания текущего прогона" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Запускаю разбор..." });
+    inbox.markStarted(ticket.id);
+    try {
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+    } catch {
+      // The card may already have lost its keyboard; nothing to undo.
+    }
+    await handleUserPrompt(ctx, contextKey, ctx.chat!.id, session, ticket.prompt);
+  });
+
+  const recipeMutes = new RecipeMutes(RECIPE_MUTES_PATH);
+
+  /** Findings the scheduled recipes delivered; index is the position in that batch. */
+  const findingFromCallback = (match: string | RegExpMatchArray | undefined) => {
+    const groups = typeof match === "string" ? undefined : match;
+    const run = readPendingRun(RECIPE_STATE_PATH, Number.parseInt(groups?.[1] ?? "", 10));
+    const finding = run?.findings[Number.parseInt(groups?.[2] ?? "", 10)];
+    return run && finding ? { run, finding } : undefined;
+  };
+
+  bot.callbackQuery(/^rmute:(\d+):(\d+)$/, async (ctx) => {
+    const found = findingFromCallback(ctx.match ?? undefined);
+    if (!found) {
+      await ctx.answerCallbackQuery({ text: "Находка больше не доступна" });
+      return;
+    }
+
+    recipeMutes.add(fingerprintFinding(found.finding));
+    await ctx.answerCallbackQuery({ text: "Заглушено, больше не покажу" });
+    try {
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+    } catch {
+      // The message may already have lost its keyboard; nothing to undo.
+    }
+  });
+
+  bot.callbackQuery(/^rfix:(\d+):(\d+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const contextKey = contextKeyFromCtx(ctx);
+    const found = findingFromCallback(ctx.match ?? undefined);
+    if (!chatId || !contextKey || !found) {
+      await ctx.answerCallbackQuery({ text: "Находка больше не доступна" });
+      return;
+    }
+    const { run, finding } = found;
+
+    await ctx.answerCallbackQuery({ text: "Создаю тред..." });
+
+    // A fix thread is just a ticket, so the start button and session defaults
+    // are the ones the inbox already uses.
+    const ticket = inbox.createTicket({
+      inboxContextKey: contextKey,
+      workTopicId: 0,
+      workspace: run.cwd,
+      launchProfileId: "review",
+      prompt: buildFixPrompt(run.recipe, finding),
+      source: `рецепт ${run.recipe}`,
+    });
+
+    const topic = await bot.api.createForumTopic(chatId, fixTopicName(finding));
+    inbox.attachTopic(ticket.id, topic.message_thread_id);
+    registry.setContextDefaults(contextKeyFromMessage(chatId, topic.message_thread_id), {
+      workspace: run.cwd,
+      launchProfileId: "review",
+    });
+
+    const card = [
+      `\u{1F527} <b>Тред-фикс</b> \u00B7 ${escapeHTML(run.recipe)}`,
+      `Проект: <code>${escapeHTML(run.cwd)}</code>`,
+      "",
+      escapeHTML(finding.description),
+    ].join("\n");
+
+    await sendTextMessage(bot.api, chatId, card, {
+      messageThreadId: topic.message_thread_id,
+      fallbackText: finding.description,
+      replyMarkup: new InlineKeyboard().text("\u25B6\uFE0F Запустить разбор", `ticket_start:${ticket.id}`),
+    });
+
+    const url = topicUrl(chatId, topic.message_thread_id);
+    await safeReply(ctx, `Тред заведён: <a href="${url}">${escapeHTML(fixTopicName(finding))}</a>`, {
+      fallbackText: url,
+    });
+  });
+
+  /** Big enough for a real review, small enough not to blow up the turn. */
+  const MR_DIFF_LIMIT = 60_000;
+
+  const repoWorkspace = (project: string): string => {
+    const root = config.gitlabWorkspaceRoot;
+    if (!root) {
+      return config.workspace;
+    }
+    const candidate = path.join(root, project);
+    return existsSync(candidate) ? candidate : root;
+  };
+
+  const gitlabMissingNotice = "GitLab не настроен: нужны GITLAB_URL, GITLAB_TOKEN и GITLAB_GROUP_ID в .env";
+
+  bot.command("done", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      return;
+    }
+    if (!gitlab || !config.gitlabGroupId) {
+      await safeReply(ctx, escapeHTML(gitlabMissingNotice), { fallbackText: gitlabMissingNotice });
+      return;
+    }
+
+    const topicId = ctx.message?.message_thread_id;
+    const args = String(ctx.match ?? "").trim();
+    const argKey = extractTicketKey(args);
+    const key = (topicId ? inbox.findTicketByTopic(topicId)?.externalKey : undefined) ?? argKey;
+
+    if (!key) {
+      const text =
+        "Не понял, о каком тикете речь. Запусти в топике тикета или укажи ключ: /done MIR-1234 что сделано";
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+
+    // When the key came from the arguments, it is not part of the comment text.
+    const comment =
+      argKey && args.toUpperCase().startsWith(argKey) ? args.slice(argKey.length).trim() : args;
+
+    try {
+      const open = await gitlab.listOpenMergeRequests(config.gitlabGroupId);
+      const linked = linkedMergeRequests(open, key);
+
+      if (linked.length === 0) {
+        const text = `Открытых merge request с ${key} не нашёл.`;
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+        return;
+      }
+
+      const body = buildDoneComment(key, comment);
+      for (const mr of linked.slice(0, 5)) {
+        const draftId = nextDoneDraftId;
+        nextDoneDraftId += 1;
+        pendingDoneDrafts.set(draftId, { key, body });
+
+        await sendTextMessage(bot.api, chatId, renderDraftHTML(mr, body), {
+          messageThreadId: topicId,
+          fallbackText: body,
+          replyMarkup: new InlineKeyboard()
+            .text("\u{1F4E4} Отправить", `donesend:${draftId}:${mr.projectId}:${mr.iid}`)
+            .text("\u2716\uFE0F Отмена", `donecancel:${draftId}`),
+        });
+      }
+    } catch (error) {
+      const text = `GitLab не ответил: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+    }
+  });
+
+  bot.callbackQuery(/^donecancel:(\d+)$/, async (ctx) => {
+    const groups = typeof ctx.match === "string" ? undefined : ctx.match;
+    pendingDoneDrafts.delete(Number.parseInt(groups?.[1] ?? "", 10));
+    await ctx.answerCallbackQuery({ text: "Отменено" });
+    try {
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+    } catch {
+      // The draft may already have lost its keyboard.
+    }
+  });
+
+  bot.callbackQuery(/^donesend:(\d+):(\d+):(\d+)$/, async (ctx) => {
+    const groups = typeof ctx.match === "string" ? undefined : ctx.match;
+    const draftId = Number.parseInt(groups?.[1] ?? "", 10);
+    const draft = pendingDoneDrafts.get(draftId);
+    if (!draft || !gitlab) {
+      await ctx.answerCallbackQuery({ text: "Черновик устарел, набери /done заново" });
+      return;
+    }
+
+    const projectId = Number.parseInt(groups?.[2] ?? "", 10);
+    const iid = Number.parseInt(groups?.[3] ?? "", 10);
+    await ctx.answerCallbackQuery({ text: "Отправляю..." });
+
+    try {
+      await gitlab.createMergeRequestNote(projectId, iid, draft.body);
+      pendingDoneDrafts.delete(draftId);
+      try {
+        await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+      } catch {
+        // Nothing to undo if the keyboard is already gone.
+      }
+      const text = `Комментарий отправлен в !${iid}.`;
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+    } catch (error) {
+      const text = `Не отправилось: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+    }
+  });
+
+  bot.command("mr", async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+    if (!gitlab || !config.gitlabGroupId) {
+      const text = "GitLab не настроен: нужны GITLAB_URL, GITLAB_TOKEN и GITLAB_GROUP_ID в .env";
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+
+    try {
+      const mrs = await gitlab.listOpenMergeRequests(config.gitlabGroupId);
+      if (mrs.length === 0) {
+        await safeReply(ctx, escapeHTML("Открытых merge request нет."), {
+          fallbackText: "Открытых merge request нет.",
+        });
+        return;
+      }
+
+      for (const mr of mrs) {
+        pendingMergeRequests.set(`${mr.projectId}:${mr.iid}`, mr);
+      }
+      const buttons = mergeRequestButtons(mrs);
+      pendingMergeRequestButtons.set(contextKey, buttons);
+
+      await safeReply(
+        ctx,
+        `<b>Открытые merge request</b> (${mrs.length})\nТап — заведу топик и запущу ревью по диффу.`,
+        {
+          fallbackText: `Открытые merge request (${mrs.length})`,
+          replyMarkup: paginateKeyboard(buttons, 0, "mrpage"),
+        },
+      );
+    } catch (error) {
+      const text = `Не смог получить список: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+    }
+  });
+
+  bot.callbackQuery(/^mr:(\d+):(\d+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const key = `${ctx.match?.[1]}:${ctx.match?.[2]}`;
+    const mr = pendingMergeRequests.get(key);
+
+    if (!chatId || !gitlab) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    if (!mr) {
+      await ctx.answerCallbackQuery({ text: "Устарело, вызови /mr заново" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Тяну дифф..." });
+    try {
+      const changes = await gitlab.fetchChanges(mr.projectId, mr.iid);
+      const topic = await bot.api.createForumTopic(chatId, mergeRequestTopicName(mr));
+      const workContextKey = contextKeyFromMessage(chatId, topic.message_thread_id);
+      const workspace = repoWorkspace(mr.project);
+      registry.setContextDefaults(workContextKey, {
+        workspace,
+        launchProfileId: INBOX_LAUNCH_PROFILE_ID,
+      });
+
+      await sendTextMessage(bot.api, chatId, renderMergeRequestCardHTML(mr, changes), {
+        messageThreadId: topic.message_thread_id,
+        fallbackText: `!${mr.iid} ${mr.project}: ${mr.title}`,
+      });
+
+      const url = topicUrl(chatId, topic.message_thread_id);
+      await safeReply(ctx, `Ревью <a href="${url}">!${mr.iid} ${escapeHTML(mr.project)}</a> запущено.`, {
+        fallbackText: `Ревью !${mr.iid}: ${url}`,
+      });
+
+      // The prompt goes to the new topic's context, so all output lands there.
+      const session = await registry.getOrCreate(workContextKey, { deferThreadStart: true });
+      await handleUserPrompt(
+        ctx,
+        workContextKey,
+        chatId,
+        session,
+        buildReviewPrompt(mr, changes, MR_DIFF_LIMIT),
+      );
+    } catch (error) {
+      await safeReply(ctx, `<b>Не вышло:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Не вышло: ${friendlyErrorText(error)}`,
+      });
+    }
+  });
+
   bot.command("model", async (ctx) => {
     const chatId = ctx.chat?.id;
     if (!chatId) {
@@ -1445,7 +2191,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const { contextKey, session } = contextSession;
-    const efforts: ModelReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
+    const efforts: CodexReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
     const current = session.getInfo().reasoningEffort;
     const effortButtons = efforts.map((effort) => ({
       label: effort === current ? `${effort} ✓` : effort,
@@ -1466,6 +2212,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     await ctx.answerCallbackQuery();
   });
   handlePageCallback(/^sess_page_(\d+)$/, "sess", pendingSessionButtons, "Expired, run /sessions again");
+  handlePageCallback(/^proj_page_(\d+)$/, "proj", pendingProjectButtons, "Expired, run /projects again");
+  handlePageCallback(/^mrpage_page_(\d+)$/, "mrpage", pendingMergeRequestButtons, "Устарело, вызови /mr заново");
+  handlePageCallback(/^projsess_page_(\d+)$/, "projsess", pendingProjectSessionButtons, "Expired, run /projects again");
   handlePageCallback(/^ws_page_(\d+)$/, "ws", pendingWorkspaceButtons, "Expired, run /new again");
   handlePageCallback(
     /^launch_page_(\d+)$/,
@@ -1491,6 +2240,119 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     await ctx.answerCallbackQuery({ text: "Aborting..." });
     await session.abort();
+  });
+
+  /** Continues a thread in whatever context the tap came from. */
+  const attachThreadHere = async (ctx: Context, threadId: string): Promise<void> => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) return;
+
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Opening task..." });
+    const busyState = getBusyState(contextKey);
+    busyState.switching = true;
+    try {
+      const info = await session.switchSession(threadId);
+      updateSessionMetadata(contextKey, session);
+      const plain = `Attached to task.\n\n${renderSessionInfoPlain(info)}`;
+      const html = `<b>Attached to task.</b>\n\n${renderSessionInfoHTML(info)}`;
+      await safeReply(ctx, html, { fallbackText: plain });
+    } catch (error) {
+      const plain = `Failed: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: plain,
+      });
+    } finally {
+      busyState.switching = false;
+    }
+  };
+
+  /**
+   * A live topic answers TOPIC_NOT_MODIFIED to a redundant reopen; only a
+   * deleted one reports TOPIC_ID_INVALID. Telegram sends no update when a topic
+   * is deleted, so this is the only way to notice a stale binding.
+   */
+  const topicIsAlive = async (chatId: number, messageThreadId: number): Promise<boolean> => {
+    try {
+      await bot.api.reopenForumTopic(chatId, messageThreadId);
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return !/TOPIC_ID_INVALID/i.test(message);
+    }
+  };
+
+  bot.callbackQuery(/^codex_thread:/, async (ctx) => {
+    const threadId = parseCodexThreadCallback(ctx.callbackQuery.data);
+    if (!threadId) {
+      await ctx.answerCallbackQuery({ text: "Invalid task link" });
+      return;
+    }
+    if (!getThread(threadId)) {
+      await ctx.answerCallbackQuery({ text: "Task is not available on this device" });
+      return;
+    }
+
+    await attachThreadHere(ctx, threadId);
+  });
+
+  // A session picked from /projects gets its own topic instead of taking over
+  // the context the pick was made from, which would otherwise be General.
+  bot.callbackQuery(/^projopen:(.+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const threadId = ctx.match?.[1];
+    if (!chatId || !threadId) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    const thread = getThread(threadId);
+    if (!thread) {
+      await ctx.answerCallbackQuery({ text: "Session is not available on this device" });
+      return;
+    }
+
+    const isForum = ctx.chat !== undefined && "is_forum" in ctx.chat && ctx.chat.is_forum === true;
+    if (!isForum) {
+      await attachThreadHere(ctx, threadId);
+      return;
+    }
+
+    const name = buildTopicName(thread);
+    const bound = findBoundTopic(registry.listContexts(), chatId, threadId);
+    if (bound !== undefined && (await topicIsAlive(chatId, bound))) {
+      await ctx.answerCallbackQuery({ text: "This session already has a topic" });
+      const url = topicUrl(chatId, bound);
+      await safeReply(ctx, `Already open: <a href="${url}">${escapeHTML(name)}</a>`, {
+        fallbackText: `Already open: ${url}`,
+      });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Creating topic..." });
+    try {
+      const topic = await bot.api.createForumTopic(chatId, name);
+      registry.bindThread(contextKeyFromMessage(chatId, topic.message_thread_id), thread);
+      await sendTextMessage(
+        bot.api,
+        chatId,
+        `<b>${escapeHTML(name)}</b>\n\nSend a message to continue this session.`,
+        { messageThreadId: topic.message_thread_id, fallbackText: name },
+      );
+      const url = topicUrl(chatId, topic.message_thread_id);
+      await safeReply(ctx, `Topic created: <a href="${url}">${escapeHTML(name)}</a>`, {
+        fallbackText: `Topic created: ${url}`,
+      });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    }
   });
 
   bot.callbackQuery(/^sess_(\d+)$/, async (ctx) => {
@@ -1845,7 +2707,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   bot.callbackQuery(/^effort_(minimal|low|medium|high|xhigh)$/, async (ctx) => {
     const chatId = ctx.chat?.id;
     const messageId = ctx.callbackQuery.message?.message_id;
-    const effort = ctx.match?.[1] as ModelReasoningEffort | undefined;
+    const effort = ctx.match?.[1] as CodexReasoningEffort | undefined;
 
     if (!chatId || !messageId || !effort) {
       return;
@@ -1870,6 +2732,29 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const html = `⚡ Reasoning effort set to <code>${escapeHTML(effort)}</code> — applies to new threads.`;
     await safeEditMessage(bot, chatId, messageId, html, {
       fallbackText: `⚡ Reasoning effort set to ${effort} — applies to new threads.`,
+    });
+  });
+
+  // Runs before the session handlers: in an inbox topic a message is a ticket,
+  // not a prompt for the topic's own session.
+  bot.on("message", async (ctx, next) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    const message = ctx.message;
+    if (!contextKey || !message || !inbox.get(contextKey)) {
+      return next();
+    }
+    if ((message.text ?? "").startsWith("/")) {
+      return next();
+    }
+
+    inboxBuffer.add(contextKey, {
+      contextKey,
+      chatId: ctx.chat.id,
+      messageId: message.message_id,
+      mediaGroupId: message.media_group_id,
+      hasAttachment: hasAttachment(message as unknown as Record<string, unknown>),
+      text: (message.text ?? message.caption ?? "").trim(),
+      message,
     });
   });
 
@@ -1903,11 +2788,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     const chatId = ctx.chat.id;
-    if (isBusy(contextKey)) {
-      await sendBusyReply(ctx);
-      return;
-    }
-
     const fileId = ctx.message.voice?.file_id ?? ctx.message.audio?.file_id;
     if (!fileId) {
       return;
@@ -1972,11 +2852,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     const chatId = ctx.chat.id;
-    if (isBusy(contextKey)) {
-      await sendBusyReply(ctx);
-      return;
-    }
-
     const photos = ctx.message.photo;
     const photo = photos[photos.length - 1];
     if (!photo) {
@@ -2027,11 +2902,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     const chatId = ctx.chat.id;
-    if (isBusy(contextKey)) {
-      await sendBusyReply(ctx);
-      return;
-    }
-
     const doc = ctx.message.document;
     if (!doc) {
       return;
@@ -2123,6 +2993,38 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   });
 
+  bot.recoverPendingJobs = async (): Promise<void> => {
+    const recoverable = jobStore.listRecoverable();
+    if (recoverable.length === 0) return;
+
+    console.log(`Recovering ${recoverable.length} Telegram job(s)`);
+    const recoveries = recoverable.map(async (job) => {
+      const session = await registry.getOrCreate(job.contextKey, { deferThreadStart: true });
+      const recoveryContext = {
+        api: bot.api,
+        chat: { id: job.chatId },
+        message: {
+          message_id: 0,
+          ...(job.messageThreadId ? { message_thread_id: job.messageThreadId } : {}),
+        },
+      } as unknown as Context;
+      await handleUserPrompt(
+        recoveryContext,
+        job.contextKey,
+        job.chatId,
+        session,
+        job.input,
+        job,
+      );
+    });
+    const results = await Promise.allSettled(recoveries);
+    for (const result of results) {
+      if (result.status === "rejected") {
+        console.error("Failed to recover Telegram job:", formatError(result.reason));
+      }
+    }
+  };
+
   bot.catch((error) => {
     const message = error.error instanceof Error ? error.error.message : String(error.error);
     console.error("Telegram bot error:", message);
@@ -2138,6 +3040,9 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "new", description: "Start a new thread" },
     { command: "session", description: "Current thread details" },
     { command: "sessions", description: "Browse & switch threads" },
+    { command: "projects", description: "Topics grouped by project" },
+    { command: "inbox", description: "Turn this topic into a ticket inbox" },
+    { command: "mr", description: "Open merge requests, tap to review" },
     { command: "retry", description: "Resend the last prompt" },
     { command: "abort", description: "Cancel current operation" },
     { command: "launch_profiles", description: "Select launch profile" },
@@ -2221,6 +3126,17 @@ function renderToolEndMessage(toolName: string, partialResult: string, isError: 
   };
 }
 
+export function isTopicLifecycleMessage(message: unknown): boolean {
+  if (typeof message !== "object" || message === null) return false;
+  const record = message as Record<string, unknown>;
+  return [
+    "forum_topic_created",
+    "forum_topic_closed",
+    "forum_topic_reopened",
+    "forum_topic_edited",
+  ].some((key) => key in record);
+}
+
 export function formatToolSummaryLine(toolCounts: Map<string, number>): string {
   if (toolCounts.size === 0) {
     return "";
@@ -2240,14 +3156,6 @@ export function formatToolSummaryLine(toolCounts: Map<string, number>): string {
     .map(([name, count]) => formatSummaryEntry(name, count))
     .join(", ");
   return `Tools used: ${tools}`;
-}
-
-function renderTodoList(items: Array<{ text: string; completed: boolean }>): string {
-  const lines = items.map((item) => {
-    const icon = item.completed ? "✅" : "⬜";
-    return `${icon} ${escapeHTML(item.text)}`;
-  });
-  return `📋 <b>Plan</b>\n${lines.join("\n")}`;
 }
 
 export function formatTurnUsageLine(usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number }): string {
@@ -2433,92 +3341,14 @@ function splitTelegramText(text: string): string[] {
 }
 
 function splitMarkdownForTelegram(markdown: string): RenderedChunk[] {
-  if (!markdown) {
-    return [];
-  }
-
-  const chunks: RenderedChunk[] = [];
-  let remaining = markdown;
-
-  while (remaining) {
-    const maxLength = Math.min(remaining.length, FORMATTED_CHUNK_TARGET);
-    const initialCut = findPreferredSplitIndex(remaining, maxLength);
-    const candidate = remaining.slice(0, initialCut) || remaining.slice(0, 1);
-    const rendered = renderMarkdownChunkWithinLimit(candidate);
-
-    chunks.push(rendered);
-    remaining = remaining.slice(rendered.sourceText.length).trimStart();
-  }
-
-  return chunks;
-}
-
-function renderMarkdownChunkWithinLimit(markdown: string): RenderedChunk {
-  if (!markdown) {
-    return {
-      text: "",
-      fallbackText: "",
+  return splitTelegramMarkdown(markdown, FORMATTED_CHUNK_TARGET, TELEGRAM_MESSAGE_LIMIT).map(
+    (chunk) => ({
+      sourceText: chunk.sourceText,
+      text: chunk.html,
+      fallbackText: chunk.plain,
       parseMode: "HTML",
-      sourceText: "",
-    };
-  }
-
-  let sourceText = markdown;
-  let rendered = formatMarkdownMessage(sourceText);
-
-  while (rendered.text.length > TELEGRAM_MESSAGE_LIMIT && sourceText.length > 1) {
-    const nextLength = Math.max(1, sourceText.length - Math.max(100, Math.ceil(sourceText.length * 0.1)));
-    sourceText = sourceText.slice(0, nextLength).trimEnd() || sourceText.slice(0, nextLength);
-    rendered = formatMarkdownMessage(sourceText);
-  }
-
-  return {
-    ...rendered,
-    sourceText,
-  };
-}
-
-function formatMarkdownMessage(markdown: string): RenderedText {
-  try {
-    return {
-      text: formatTelegramHTML(markdown),
-      fallbackText: markdown,
-      parseMode: "HTML",
-    };
-  } catch (error) {
-    console.error("Failed to format Telegram HTML, falling back to plain text", error);
-    return {
-      text: markdown,
-      fallbackText: markdown,
-      parseMode: undefined,
-    };
-  }
-}
-
-function findPreferredSplitIndex(text: string, maxLength: number): number {
-  if (text.length <= maxLength) {
-    return Math.max(1, text.length);
-  }
-
-  const newlineIndex = text.lastIndexOf("\n", maxLength);
-  if (newlineIndex >= maxLength * 0.5) {
-    return Math.max(1, newlineIndex);
-  }
-
-  const spaceIndex = text.lastIndexOf(" ", maxLength);
-  if (spaceIndex >= maxLength * 0.5) {
-    return Math.max(1, spaceIndex);
-  }
-
-  return Math.max(1, maxLength);
-}
-
-function buildStreamingPreview(text: string): string {
-  if (text.length <= STREAMING_PREVIEW_LIMIT) {
-    return text;
-  }
-
-  return `${text.slice(0, STREAMING_PREVIEW_LIMIT)}\n\n… streaming (preview truncated)`;
+    }),
+  );
 }
 
 function appendWithCap(base: string, addition: string, cap: number): string {

@@ -3,9 +3,15 @@ import { checkAuthStatus } from "./codex-auth.js";
 import { findLaunchProfile, formatLaunchProfileBehavior } from "./codex-launch.js";
 import { loadConfig } from "./config.js";
 import { SessionRegistry } from "./session-registry.js";
+import { startTelegramRunner } from "./telegram-runner.js";
+import { TopicSynchronizer } from "./topic-sync.js";
+import type { RunnerHandle } from "@grammyjs/runner";
 
 let registry: SessionRegistry | undefined;
 let bot: ReturnType<typeof createBot> | undefined;
+let topicSynchronizer: TopicSynchronizer | undefined;
+let runner: RunnerHandle | undefined;
+let recoveryStarted = false;
 
 try {
   const config = loadConfig();
@@ -33,6 +39,18 @@ try {
     }
   }
   console.log("Session mode: per Telegram context");
+  if (config.telegramForumChatId) {
+    topicSynchronizer = new TopicSynchronizer({
+      chatId: config.telegramForumChatId,
+      intervalMs: config.topicSyncIntervalMs ?? 30_000,
+      registry,
+      createForumTopic: (chatId, name) => bot!.api.createForumTopic(chatId, name),
+    });
+    topicSynchronizer.start();
+    console.log(
+      `Topic sync: enabled for ${config.telegramForumChatId} every ${(config.topicSyncIntervalMs ?? 30_000) / 1000}s`,
+    );
+  }
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`Failed to start TeleCodex: ${message}`);
@@ -41,24 +59,31 @@ try {
 }
 
 let shuttingDown = false;
-const shutdown = (signal: NodeJS.Signals) => {
+const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
   if (shuttingDown) {
     return;
   }
   shuttingDown = true;
 
   console.log(`Received ${signal}, shutting down TeleCodex...`);
-  if (bot) bot.stop();
-
-  setTimeout(() => {
+  topicSynchronizer?.stop();
+  const stoppedCleanly = runner
+    ? await Promise.race([
+        runner.stop().then(() => true, () => false),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 5_000)),
+      ])
+    : true;
+  if (stoppedCleanly) {
     registry?.disposeAll();
-    console.log("TeleCodex stopped.");
-    process.exit(0);
-  }, 500);
+  } else {
+    console.log("Active jobs remain persisted and will reconnect after restart.");
+  }
+  console.log("TeleCodex stopped.");
+  process.exit(0);
 };
 
-process.once("SIGINT", () => shutdown("SIGINT"));
-process.once("SIGTERM", () => shutdown("SIGTERM"));
+process.once("SIGINT", () => void shutdown("SIGINT"));
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
 const MAX_RESTART_ATTEMPTS = 5;
 const RESTART_DELAY_MS = 3000;
@@ -66,12 +91,15 @@ let restartAttempts = 0;
 
 async function startPolling(): Promise<void> {
   try {
-    await bot!.start({
-      drop_pending_updates: true,
-      onStart: () => {
-        restartAttempts = 0;
-      },
-    });
+    runner = startTelegramRunner(bot!);
+    if (!recoveryStarted) {
+      recoveryStarted = true;
+      void bot!.recoverPendingJobs().catch((error) => {
+        console.error("Telegram job recovery failed:", error instanceof Error ? error.message : String(error));
+      });
+    }
+    await runner.task();
+    restartAttempts = 0;
   } catch (error) {
     if (shuttingDown) {
       return;

@@ -2,9 +2,14 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { findLaunchProfile } from "./codex-launch.js";
-import { CodexSessionService } from "./codex-session.js";
+import {
+  CodexSessionService,
+  createCodexSessionDependencies,
+  type CodexSessionDependencies,
+} from "./codex-session.js";
 import type { TeleCodexConfig } from "./config.js";
-import type { TelegramContextKey } from "./context-key.js";
+import { parseContextKey, type TelegramContextKey } from "./context-key.js";
+import type { CodexThreadRecord } from "./codex-state.js";
 
 export interface ContextMetadata {
   contextKey: TelegramContextKey;
@@ -18,12 +23,20 @@ export interface ContextMetadata {
 
 export class SessionRegistry {
   private readonly sessions = new Map<TelegramContextKey, CodexSessionService>();
+  private readonly sessionCreations = new Map<TelegramContextKey, Promise<CodexSessionService>>();
   private readonly metadata = new Map<TelegramContextKey, ContextMetadata>();
   private readonly persistPath: string;
+  private readonly sessionDependencies: CodexSessionDependencies;
   private onRemoveCallback?: (contextKey: TelegramContextKey) => void;
 
-  constructor(private readonly config: TeleCodexConfig) {
+  constructor(
+    private readonly config: TeleCodexConfig,
+    sessionDependencies?: CodexSessionDependencies,
+  ) {
     this.persistPath = path.join(config.workspace, ".telecodex", "contexts.json");
+    this.sessionDependencies = sessionDependencies ?? createCodexSessionDependencies(
+      config.telegramMaxActiveTopics,
+    );
     this.loadPersistedMetadata();
   }
 
@@ -35,20 +48,33 @@ export class SessionRegistry {
     if (session) {
       return session;
     }
+    const pending = this.sessionCreations.get(contextKey);
+    if (pending) return pending;
 
     const meta = this.metadata.get(contextKey);
     const launchProfileId = resolveLaunchProfileId(this.config, meta);
-    session = await CodexSessionService.create(this.config, {
+    const creation = CodexSessionService.create(this.config, {
       workspace: meta?.workspace,
       model: meta?.model,
       reasoningEffort: meta?.reasoningEffort,
       launchProfileId,
       deferThreadStart: options?.deferThreadStart && !meta?.threadId,
       resumeThreadId: meta?.threadId ?? undefined,
-    });
+    }, this.sessionDependencies);
+    this.sessionCreations.set(contextKey, creation);
 
-    this.sessions.set(contextKey, session);
-    return session;
+    try {
+      session = await creation;
+      this.sessions.set(contextKey, session);
+      if (session.getInfo().threadId) {
+        this.updateMetadata(contextKey, session);
+      }
+      return session;
+    } finally {
+      if (this.sessionCreations.get(contextKey) === creation) {
+        this.sessionCreations.delete(contextKey);
+      }
+    }
   }
 
   get(contextKey: TelegramContextKey): CodexSessionService | undefined {
@@ -81,6 +107,49 @@ export class SessionRegistry {
     return [...this.metadata.values()].sort((left, right) => right.updatedAt - left.updatedAt);
   }
 
+  isThreadBoundInChat(threadId: string, chatId: number): boolean {
+    return [...this.metadata.values()].some((entry) => {
+      const context = parseContextKey(entry.contextKey);
+      return (
+        entry.threadId === threadId &&
+        context.chatId === chatId &&
+        context.messageThreadId !== undefined
+      );
+    });
+  }
+
+  /**
+   * Pins the workspace and launch profile a context should start with.
+   *
+   * Used for a topic that has no Codex thread yet, so an inbox ticket can be
+   * forced onto a safe sandbox regardless of the host-wide default.
+   */
+  setContextDefaults(
+    contextKey: TelegramContextKey,
+    defaults: { workspace: string; launchProfileId?: string },
+  ): void {
+    this.metadata.set(contextKey, {
+      contextKey,
+      threadId: null,
+      workspace: defaults.workspace,
+      launchProfileId: defaults.launchProfileId,
+      updatedAt: Date.now(),
+    });
+    this.persistMetadata();
+  }
+
+  bindThread(contextKey: TelegramContextKey, thread: CodexThreadRecord): void {
+    this.metadata.set(contextKey, {
+      contextKey,
+      threadId: thread.id,
+      workspace: thread.cwd,
+      model: thread.model ?? undefined,
+      launchProfileId: this.config.defaultLaunchProfileId,
+      updatedAt: thread.updatedAt.getTime(),
+    });
+    this.persistMetadata();
+  }
+
   onRemove(callback: (contextKey: TelegramContextKey) => void): void {
     this.onRemoveCallback = callback;
   }
@@ -89,6 +158,7 @@ export class SessionRegistry {
     const session = this.sessions.get(contextKey);
     session?.dispose();
     this.sessions.delete(contextKey);
+    this.sessionCreations.delete(contextKey);
     this.metadata.delete(contextKey);
     this.onRemoveCallback?.(contextKey);
     this.persistMetadata();
@@ -99,6 +169,9 @@ export class SessionRegistry {
       session.dispose();
     }
     this.sessions.clear();
+    this.sessionCreations.clear();
+    this.sessionDependencies.turnManager.dispose?.();
+    this.sessionDependencies.client.close?.();
   }
 
   private persistMetadata(): void {

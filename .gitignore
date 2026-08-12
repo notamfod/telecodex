@@ -28,3 +28,6 @@ agent-tools/
 
 # Test coverage
 coverage/
+
+# Environment backups
+.env.*

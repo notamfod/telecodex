@@ -96,6 +96,23 @@ export function listThreads(limit = 20): CodexThreadRecord[] {
   }) ?? [];
 }
 
+export function listUserThreads(limit = 100): CodexThreadRecord[] {
+  return withDatabase((db) => {
+    const query = db.prepare(`
+      SELECT id, title, cwd, model, created_at, updated_at, first_user_message
+      FROM threads
+      WHERE (archived = 0 OR archived IS NULL)
+        AND source = 'vscode'
+        AND preview <> ''
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `);
+
+    const rows = query.all(limit) as ThreadRow[];
+    return rows.map(mapThreadRow);
+  }) ?? [];
+}
+
 export function getThread(id: string): CodexThreadRecord | null {
   return (
     withDatabase((db) => {

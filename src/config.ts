@@ -32,6 +32,14 @@ export interface TeleCodexConfig {
   showTurnTokenUsage: boolean;
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
+  telegramForumChatId?: number;
+  gitlabUrl?: string;
+  gitlabToken?: string;
+  gitlabGroupId?: string;
+  gitlabWorkspaceRoot?: string;
+  topicSyncIntervalMs?: number;
+  telegramMaxActiveTopics: number;
+  telegramProgressHeartbeatMs: number;
 }
 
 export function loadConfig(): TeleCodexConfig {
@@ -61,11 +69,36 @@ export function loadConfig(): TeleCodexConfig {
   );
   const toolVerbosity = parseToolVerbosity(optionalString(process.env.TOOL_VERBOSITY));
   const showTurnTokenUsage = parseBooleanEnv(optionalString(process.env.SHOW_TURN_TOKEN_USAGE), false);
-  const enableTelegramLogin = parseBooleanEnv(optionalString(process.env.ENABLE_TELEGRAM_LOGIN), true);
+  const enableTelegramLogin = parseBooleanEnv(
+    optionalString(process.env.ENABLE_TELEGRAM_LOGIN),
+    false,
+  );
   const enableTelegramReactions = parseBooleanEnv(
     optionalString(process.env.ENABLE_TELEGRAM_REACTIONS),
     false,
   );
+  const telegramForumChatId = parseTelegramForumChatId(
+    optionalString(process.env.TELEGRAM_FORUM_CHAT_ID),
+  );
+  const gitlabUrl = optionalString(process.env.GITLAB_URL);
+  const gitlabToken = optionalString(process.env.GITLAB_TOKEN);
+  const gitlabGroupId = optionalString(process.env.GITLAB_GROUP_ID);
+  const gitlabWorkspaceRoot = optionalString(process.env.GITLAB_WORKSPACE_ROOT);
+  const topicSyncIntervalMs = parseTopicSyncInterval(
+    optionalString(process.env.TOPIC_SYNC_INTERVAL_SECONDS),
+  );
+  const telegramMaxActiveTopics = parseIntegerSetting(
+    "TELEGRAM_MAX_ACTIVE_TOPICS",
+    optionalString(process.env.TELEGRAM_MAX_ACTIVE_TOPICS),
+    4,
+    1,
+  );
+  const telegramProgressHeartbeatMs = parseIntegerSetting(
+    "TELEGRAM_PROGRESS_HEARTBEAT_SECONDS",
+    optionalString(process.env.TELEGRAM_PROGRESS_HEARTBEAT_SECONDS),
+    120,
+    30,
+  ) * 1000;
 
   return {
     telegramBotToken,
@@ -84,6 +117,14 @@ export function loadConfig(): TeleCodexConfig {
     showTurnTokenUsage,
     enableTelegramLogin,
     enableTelegramReactions,
+    telegramForumChatId,
+    gitlabUrl,
+    gitlabToken,
+    gitlabGroupId,
+    gitlabWorkspaceRoot,
+    topicSyncIntervalMs,
+    telegramMaxActiveTopics,
+    telegramProgressHeartbeatMs,
   };
 }
 
@@ -170,6 +211,44 @@ function parseAllowedUserIds(raw: string): number[] {
   }
 
   return ids;
+}
+
+function parseTelegramForumChatId(raw: string | undefined): number | undefined {
+  if (!raw) {
+    return undefined;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed >= 0) {
+    throw new Error(`Invalid TELEGRAM_FORUM_CHAT_ID: ${raw}`);
+  }
+  return parsed;
+}
+
+function parseTopicSyncInterval(raw: string | undefined): number {
+  if (!raw) {
+    return 30_000;
+  }
+
+  const seconds = Number(raw);
+  if (!Number.isInteger(seconds) || seconds < 5) {
+    throw new Error("TOPIC_SYNC_INTERVAL_SECONDS must be an integer of at least 5");
+  }
+  return seconds * 1000;
+}
+
+function parseIntegerSetting(
+  name: string,
+  raw: string | undefined,
+  defaultValue: number,
+  minimum: number,
+): number {
+  if (!raw) return defaultValue;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < minimum) {
+    throw new Error(`${name} must be an integer of at least ${minimum}`);
+  }
+  return value;
 }
 
 function parseBooleanEnv(raw: string | undefined, defaultValue: boolean): boolean {

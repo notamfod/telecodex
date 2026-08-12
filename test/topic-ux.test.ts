@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { contextKeyFromMessage } from "../src/context-key.js";
+import { isTopicLifecycleMessage } from "../src/bot.js";
 
 describe("topic-native workspace UX", () => {
   describe("context key isolation", () => {
@@ -36,5 +37,11 @@ describe("topic-native workspace UX", () => {
       expect(topicKey.includes(":")).toBe(true);
       expect(chatKey.includes(":")).toBe(false);
     });
+  });
+
+  it("ignores automatic Telegram topic lifecycle messages", () => {
+    expect(isTopicLifecycleMessage({ forum_topic_created: { name: "Session" } })).toBe(true);
+    expect(isTopicLifecycleMessage({ forum_topic_closed: {} })).toBe(true);
+    expect(isTopicLifecycleMessage({ text: "ordinary user message" })).toBe(false);
   });
 });

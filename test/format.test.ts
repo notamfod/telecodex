@@ -1,4 +1,8 @@
-import { escapeHTML, formatTelegramHTML } from "../src/format.js";
+import {
+  escapeHTML,
+  formatTelegramHTML,
+  splitTelegramMarkdown,
+} from "../src/format.js";
 
 describe("escapeHTML", () => {
   it("escapes HTML entities", () => {
@@ -85,5 +89,50 @@ describe("formatTelegramHTML", () => {
   it("handles multi-line blockquotes", () => {
     const result = formatTelegramHTML("> line one\n> line two\nnot quoted");
     expect(result).toBe("<blockquote>line one\nline two</blockquote>\nnot quoted");
+  });
+
+  it("renders headings and lists using Telegram-native HTML", () => {
+    expect(formatTelegramHTML("# Заголовок\n\n- первый\n- **второй**\n1. третий")).toBe(
+      "<b>Заголовок</b>\n\n• первый\n• <b>второй</b>\n1. третий",
+    );
+  });
+});
+
+describe("splitTelegramMarkdown", () => {
+  it("keeps fenced code and links structurally intact", () => {
+    const input = [
+      "# Отчёт",
+      "",
+      "Текст ".repeat(300),
+      "",
+      "```ts",
+      "const value = 1;",
+      "console.log(value);",
+      "```",
+      "",
+      "Подробнее: [документация](https://example.com/docs?q=one)",
+    ].join("\n");
+
+    const chunks = splitTelegramMarkdown(input, 500, 1000);
+
+    expect(chunks.length).toBeGreaterThan(2);
+    expect(chunks.every((chunk) => chunk.html.length <= 1000)).toBe(true);
+    expect(chunks.some((chunk) => chunk.html.includes(
+      '<pre><code class="language-ts">const value = 1;\nconsole.log(value);\n</code></pre>',
+    ))).toBe(true);
+    expect(chunks.some((chunk) => chunk.html.includes(
+      '<a href="https://example.com/docs?q=one">документация</a>',
+    ))).toBe(true);
+  });
+
+  it("splits oversized fenced code into valid independent code blocks", () => {
+    const input = `\`\`\`txt\n${"<&>\n".repeat(400)}\`\`\``;
+
+    const chunks = splitTelegramMarkdown(input, 300, 500);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((chunk) => chunk.html.startsWith('<pre><code class="language-txt">'))).toBe(true);
+    expect(chunks.every((chunk) => chunk.html.endsWith("</code></pre>"))).toBe(true);
+    expect(chunks.every((chunk) => chunk.html.length <= 500)).toBe(true);
   });
 });

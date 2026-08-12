@@ -4,6 +4,7 @@ import { vi } from "vitest";
 
 import { createDefaultLaunchProfile, createLaunchProfile } from "../src/codex-launch.js";
 import type { TeleCodexConfig } from "../src/config.js";
+import type { CodexThreadRecord } from "../src/codex-state.js";
 
 const mockFsState = vi.hoisted(() => {
   const files = new Map<string, string>();
@@ -21,6 +22,10 @@ const mockFsState = vi.hoisted(() => {
 
 const mockSessionState = vi.hoisted(() => {
   const create = vi.fn();
+  const dependencies = {
+    client: { connect: vi.fn(), request: vi.fn(), onNotification: vi.fn(), close: vi.fn() },
+    turnManager: { runTurn: vi.fn(), cancelTurn: vi.fn(), dispose: vi.fn() },
+  };
   const sessions: Array<{
     getInfo: ReturnType<typeof vi.fn>;
     dispose: ReturnType<typeof vi.fn>;
@@ -45,11 +50,14 @@ const mockSessionState = vi.hoisted(() => {
 
   const reset = () => {
     create.mockReset();
+    dependencies.client.close.mockReset();
+    dependencies.turnManager.dispose.mockReset();
     sessions.length = 0;
   };
 
   return {
     create,
+    dependencies,
     sessions,
     reset,
   };
@@ -77,6 +85,7 @@ vi.mock("../src/codex-session.js", () => ({
   CodexSessionService: {
     create: mockSessionState.create,
   },
+  createCodexSessionDependencies: () => mockSessionState.dependencies,
 }));
 
 import { SessionRegistry } from "../src/session-registry.js";
@@ -111,6 +120,8 @@ describe("SessionRegistry", () => {
     showTurnTokenUsage: false,
     enableTelegramLogin: true,
     enableTelegramReactions: false,
+    telegramMaxActiveTopics: 4,
+    telegramProgressHeartbeatMs: 120_000,
     ...overrides,
   });
 
@@ -174,6 +185,34 @@ describe("SessionRegistry", () => {
     expect(mockSessionState.create).toHaveBeenCalledTimes(1);
   });
 
+  it("shares an in-flight session creation for concurrent updates in one topic", async () => {
+    let resolveCreation!: (session: ReturnType<typeof createMockSession>) => void;
+    mockSessionState.create.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveCreation = resolve;
+    }));
+    const registry = new SessionRegistry(createConfig());
+
+    const first = registry.getOrCreate("123:42");
+    const second = registry.getOrCreate("123:42");
+    expect(mockSessionState.create).toHaveBeenCalledTimes(1);
+
+    const session = createMockSession({
+      threadId: "thread-shared",
+      workspace: "/workspace/base",
+      model: "o3",
+      launchProfileId: "default",
+      launchProfileLabel: "Default",
+      launchProfileBehavior: "workspace-write / never",
+      sandboxMode: "workspace-write",
+      approvalPolicy: "never",
+      unsafeLaunch: false,
+    });
+    resolveCreation(session);
+
+    await expect(first).resolves.toBe(session);
+    await expect(second).resolves.toBe(session);
+  });
+
   it("returns different session instances for different context keys", async () => {
     const registry = new SessionRegistry(createConfig());
 
@@ -182,6 +221,60 @@ describe("SessionRegistry", () => {
 
     expect(first).not.toBe(second);
     expect(mockSessionState.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("persists a newly created thread before its first prompt", async () => {
+    mockSessionState.create.mockResolvedValueOnce(createMockSession({
+      threadId: "thread-new",
+      workspace: "/workspace/base",
+      model: "o3",
+      launchProfileId: "default",
+      launchProfileLabel: "Default",
+      launchProfileBehavior: "workspace-write / never",
+      sandboxMode: "workspace-write",
+      approvalPolicy: "never",
+      unsafeLaunch: false,
+    }));
+    const registry = new SessionRegistry(createConfig());
+
+    await registry.getOrCreate("123:42");
+
+    expect(registry.listContexts()).toEqual([
+      expect.objectContaining({ contextKey: "123:42", threadId: "thread-new" }),
+    ]);
+  });
+
+  it("binds a thread to a topic without starting a Codex session", () => {
+    const config = createConfig();
+    const registry = new SessionRegistry(config);
+    const thread: CodexThreadRecord = {
+      id: "thread-visible",
+      title: "Visible chat",
+      cwd: "/workspace/project",
+      model: "gpt-5.6-sol",
+      createdAt: new Date(10_000),
+      updatedAt: new Date(20_000),
+      firstUserMessage: "Visible chat",
+    };
+
+    registry.bindThread("-100123:42", thread);
+
+    expect(registry.isThreadBoundInChat("thread-visible", -100123)).toBe(true);
+    expect(registry.isThreadBoundInChat("thread-visible", -100999)).toBe(false);
+    expect(registry.listContexts()).toEqual([
+      {
+        contextKey: "-100123:42",
+        threadId: "thread-visible",
+        workspace: "/workspace/project",
+        model: "gpt-5.6-sol",
+        launchProfileId: "default",
+        updatedAt: 20_000,
+      },
+    ]);
+    expect(mockSessionState.create).not.toHaveBeenCalled();
+
+    const restored = new SessionRegistry(config);
+    expect(restored.isThreadBoundInChat("thread-visible", -100123)).toBe(true);
   });
 
   it("two topic contexts in the same chat maintain independent sessions", async () => {
@@ -243,14 +336,14 @@ describe("SessionRegistry", () => {
       reasoningEffort: "low",
       launchProfileId: "readonly",
       resumeThreadId: "thread-a",
-    });
+    }, mockSessionState.dependencies);
     expect(mockSessionState.create).toHaveBeenNthCalledWith(2, createConfig(), {
       workspace: "/workspace/b",
       model: "gpt-5.4",
       reasoningEffort: "high",
       launchProfileId: "default",
       resumeThreadId: "thread-b",
-    });
+    }, mockSessionState.dependencies);
     expect(first.getInfo()).toEqual({
       threadId: "thread-a",
       workspace: "/workspace/a",
@@ -302,7 +395,7 @@ describe("SessionRegistry", () => {
       reasoningEffort: undefined,
       launchProfileId: undefined,
       resumeThreadId: "thread-a",
-    });
+    }, mockSessionState.dependencies);
     expect(warnSpy).toHaveBeenCalledWith(
       'Unknown persisted launch profile "missing" for 123. Falling back to default.',
     );
@@ -459,6 +552,8 @@ describe("SessionRegistry", () => {
 
     expect(registry.has("100")).toBe(false);
     expect(registry.has("200")).toBe(false);
+    expect(mockSessionState.dependencies.turnManager.dispose).toHaveBeenCalledTimes(1);
+    expect(mockSessionState.dependencies.client.close).toHaveBeenCalledTimes(1);
   });
 
   it("remove fires onRemove callback", async () => {
@@ -472,5 +567,25 @@ describe("SessionRegistry", () => {
 
     expect(removed).toEqual(["100"]);
     expect(registry.has("100")).toBe(false);
+  });
+  it("starts a session with the workspace and launch profile a topic was set up with", async () => {
+    const registry = new SessionRegistry(createConfig());
+
+    registry.setContextDefaults("-100123:512", {
+      workspace: "/workspace/billing",
+      launchProfileId: "readonly",
+    });
+
+    await registry.getOrCreate("-100123:512");
+
+    expect(mockSessionState.create).toHaveBeenCalledWith(
+      createConfig(),
+      expect.objectContaining({
+        workspace: "/workspace/billing",
+        launchProfileId: "readonly",
+        resumeThreadId: undefined,
+      }),
+      mockSessionState.dependencies,
+    );
   });
 });

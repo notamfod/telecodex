@@ -27,6 +27,10 @@ describe("loadConfig", () => {
     delete process.env.MAX_FILE_SIZE;
     delete process.env.ENABLE_TELEGRAM_LOGIN;
     delete process.env.ENABLE_TELEGRAM_REACTIONS;
+    delete process.env.TELEGRAM_FORUM_CHAT_ID;
+    delete process.env.TOPIC_SYNC_INTERVAL_SECONDS;
+    delete process.env.TELEGRAM_MAX_ACTIVE_TOPICS;
+    delete process.env.TELEGRAM_PROGRESS_HEARTBEAT_SECONDS;
     delete process.env.container;
   });
 
@@ -59,6 +63,8 @@ describe("loadConfig", () => {
     process.env.CODEX_SANDBOX_MODE = "danger-full-access";
     process.env.CODEX_APPROVAL_POLICY = "on-request";
     process.env.TOOL_VERBOSITY = "all";
+    process.env.TELEGRAM_FORUM_CHAT_ID = "-1001234567890";
+    process.env.TOPIC_SYNC_INTERVAL_SECONDS = "15";
 
     const config = loadConfig();
 
@@ -99,8 +105,12 @@ describe("loadConfig", () => {
       enableUnsafeLaunchProfiles: false,
       toolVerbosity: "all",
       showTurnTokenUsage: false,
-      enableTelegramLogin: true,
+      enableTelegramLogin: false,
       enableTelegramReactions: false,
+      telegramForumChatId: -1001234567890,
+      topicSyncIntervalMs: 15_000,
+      telegramMaxActiveTopics: 4,
+      telegramProgressHeartbeatMs: 120_000,
     });
   });
 
@@ -142,9 +152,55 @@ describe("loadConfig", () => {
     expect(config.enableUnsafeLaunchProfiles).toBe(false);
     expect(config.toolVerbosity).toBe("summary");
     expect(config.showTurnTokenUsage).toBe(false);
-    expect(config.enableTelegramLogin).toBe(true);
+    expect(config.enableTelegramLogin).toBe(false);
     expect(config.enableTelegramReactions).toBe(false);
+    expect(config.telegramForumChatId).toBeUndefined();
+    expect(config.topicSyncIntervalMs).toBe(30_000);
+    expect(config.telegramMaxActiveTopics).toBe(4);
+    expect(config.telegramProgressHeartbeatMs).toBe(120_000);
     expect(config.workspace).toBe(process.cwd());
+  });
+
+  it("rejects an invalid Telegram forum chat id", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_FORUM_CHAT_ID = "not-a-chat";
+
+    expect(() => loadConfig()).toThrow("Invalid TELEGRAM_FORUM_CHAT_ID: not-a-chat");
+  });
+
+  it("rejects a topic sync interval shorter than five seconds", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TOPIC_SYNC_INTERVAL_SECONDS = "2";
+
+    expect(() => loadConfig()).toThrow("TOPIC_SYNC_INTERVAL_SECONDS must be an integer of at least 5");
+  });
+
+  it("parses Telegram concurrency and progress heartbeat settings", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_MAX_ACTIVE_TOPICS = "6";
+    process.env.TELEGRAM_PROGRESS_HEARTBEAT_SECONDS = "90";
+
+    const config = loadConfig();
+
+    expect(config.telegramMaxActiveTopics).toBe(6);
+    expect(config.telegramProgressHeartbeatMs).toBe(90_000);
+  });
+
+  it("rejects invalid Telegram concurrency and heartbeat settings", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_MAX_ACTIVE_TOPICS = "0";
+
+    expect(() => loadConfig()).toThrow("TELEGRAM_MAX_ACTIVE_TOPICS must be an integer of at least 1");
+
+    process.env.TELEGRAM_MAX_ACTIVE_TOPICS = "4";
+    process.env.TELEGRAM_PROGRESS_HEARTBEAT_SECONDS = "10";
+    expect(() => loadConfig()).toThrow(
+      "TELEGRAM_PROGRESS_HEARTBEAT_SECONDS must be an integer of at least 30",
+    );
   });
 
   it("throws when a user id is invalid", () => {
@@ -254,7 +310,7 @@ describe("loadConfig", () => {
 
     delete process.env.ENABLE_TELEGRAM_LOGIN;
     const config = loadConfig();
-    expect(config.enableTelegramLogin).toBe(true);
+    expect(config.enableTelegramLogin).toBe(false);
   });
 
   it("parses ENABLE_TELEGRAM_REACTIONS boolean values", () => {

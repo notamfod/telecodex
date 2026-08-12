@@ -94,6 +94,7 @@ import {
   type PersistentTelegramJob,
 } from "./telegram-job-store.js";
 import type { AppServerHookBlock } from "./app-server-turn-manager.js";
+import { buildMarkdownDocument } from "./markdown-document.js";
 import { parseReopenCommand, runReopenCommand } from "./thread-reopen.js";
 import { TurnProgressPresenter } from "./turn-progress.js";
 import {
@@ -475,6 +476,39 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }
     };
 
+    /**
+     * Telegram renders an attached `.md` far better than an answer chopped into
+     * four messages, so a long one travels as a file with its opening as the
+     * caption. Returns false when it could not be sent, so the caller can still
+     * deliver the answer the plain way.
+     */
+    const deliverMarkdownDocument = async (markdown: string): Promise<boolean> => {
+      const partKey = "final:document";
+      if (jobStore.hasPart(persistentJob.id, partKey)) {
+        return true;
+      }
+
+      const document = buildMarkdownDocument(markdown);
+      const [caption] = splitMarkdownForTelegram(document.caption);
+      try {
+        await bot.api.sendDocument(
+          chatId,
+          new InputFile(Buffer.from(document.content, "utf8"), document.fileName),
+          {
+            caption: caption.text,
+            parse_mode: "HTML",
+            ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+            reply_markup: finalChunkThreadKeyboard(markdown, 0, 1),
+          },
+        );
+        jobStore.markPartSent(persistentJob.id, partKey);
+        return true;
+      } catch (error) {
+        console.error("Failed to send the answer as a document:", formatError(error));
+        return false;
+      }
+    };
+
     const finalizeResponse = async (): Promise<void> => {
       if (finalized) {
         return;
@@ -494,7 +528,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         return;
       }
 
-      await deliverRenderedChunks(splitMarkdownForTelegram(finalText), finalText);
+      const chunks = splitMarkdownForTelegram(finalText);
+      if (chunks.length > 1 && (await deliverMarkdownDocument(finalText))) {
+        return;
+      }
+
+      await deliverRenderedChunks(chunks, finalText);
     };
 
     const deliverGeneratedImages = async (): Promise<void> => {

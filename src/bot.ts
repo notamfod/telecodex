@@ -93,6 +93,7 @@ import {
   TelegramJobStore,
   type PersistentTelegramJob,
 } from "./telegram-job-store.js";
+import type { AppServerHookBlock } from "./app-server-turn-manager.js";
 import { TurnProgressPresenter } from "./turn-progress.js";
 import {
   finalChunkThreadKeyboard,
@@ -381,6 +382,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     let currentAgentPhase: string | undefined;
     let finalized = false;
     let lastTurnUsage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | undefined;
+    let hookBlock: AppServerHookBlock | undefined;
     const generatedImages: Array<{ path?: string; base64?: string }> = [];
     let codexCompleted = false;
 
@@ -483,7 +485,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
 
       const finalText = buildFinalResponseText(accumulatedText);
       if (!finalText) {
-        await deliverRenderedChunks(splitMarkdownForTelegram("**✅ Done**"));
+        // A hook that blocked the prompt ends the turn as a success with nothing
+        // in it, so an empty turn is the only chance to report the block.
+        const emptyTurnText = hookBlock
+          ? `**⛔ Ход остановлен хуком \`${hookBlock.eventName}\`**\n\n${hookBlock.reason}`
+          : "**✅ Done**";
+        await deliverRenderedChunks(splitMarkdownForTelegram(emptyTurnText));
         return;
       }
 
@@ -651,6 +658,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       },
       onGeneratedImage: (image) => {
         generatedImages.push(image);
+      },
+      onHookBlocked: (block) => {
+        hookBlock = block;
       },
       onAgentEnd: () => {},
     };

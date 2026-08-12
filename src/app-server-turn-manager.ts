@@ -22,6 +22,13 @@ export interface AppServerTurnCallbacks {
     cachedInputTokens: number;
     outputTokens: number;
   }) => void;
+  onHookBlocked?: (block: AppServerHookBlock) => void;
+}
+
+/** A hook that refused to let the turn proceed, and what it wants said about it. */
+export interface AppServerHookBlock {
+  eventName: string;
+  reason: string;
 }
 
 export interface AppServerAgentMessage {
@@ -431,6 +438,18 @@ export class AppServerTurnManager {
       };
       return;
     }
+    if (method === "hook/completed") {
+      // A blocked hook still ends the turn as `completed`, just with nothing in
+      // it, so this is the only place the reason is ever stated.
+      const run = asRecord(params.run);
+      if (readString(run, "status") === "blocked") {
+        callbacks.onHookBlocked?.({
+          eventName: readString(run, "eventName") ?? "hook",
+          reason: hookBlockReason(run),
+        });
+      }
+      return;
+    }
     if (method === "error") {
       job.errorMessage = readString(asRecord(params.error), "message") ?? "Codex turn failed";
       return;
@@ -551,6 +570,22 @@ export class AppServerTurnManager {
     job.releaseSlot = undefined;
     release?.();
   }
+}
+
+/**
+ * What a blocking hook wants the user to read. `context` entries are addressed to
+ * the model rather than to a person, so they are left out.
+ */
+export function hookBlockReason(run: unknown): string {
+  const record = asRecord(run);
+  const entries = Array.isArray(record.entries) ? record.entries : [];
+  const text = entries
+    .map(asRecord)
+    .filter((entry) => readString(entry, "kind") !== "context")
+    .map((entry) => readString(entry, "text") ?? "")
+    .filter(Boolean)
+    .join("\n");
+  return text || readString(record, "statusMessage") || "The hook stopped this turn without saying why.";
 }
 
 function findJobForTurn(state: ThreadState, turnId: string): TurnJob | undefined {

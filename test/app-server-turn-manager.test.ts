@@ -3,6 +3,7 @@ import { vi } from "vitest";
 import type { AppServerNotification } from "../src/app-server-client.js";
 import {
   AppServerTurnManager,
+  hookBlockReason,
   type AppServerTurnCallbacks,
   type AppServerTurnRequest,
 } from "../src/app-server-turn-manager.js";
@@ -58,7 +59,101 @@ const createThreadRequest = (
   threadId,
 });
 
+describe("hookBlockReason", () => {
+  it("reads what the hook wanted the user to see", () => {
+    expect(
+      hookBlockReason({
+        statusMessage: "Checking synchronized thread ownership",
+        entries: [{ kind: "feedback", text: "Reopen this exact task before continuing." }],
+      }),
+    ).toBe("Reopen this exact task before continuing.");
+  });
+
+  it("ignores context entries, which are written for the model rather than the user", () => {
+    expect(
+      hookBlockReason({
+        statusMessage: "Checking ownership",
+        entries: [{ kind: "context", text: "owner=windows epoch=2" }],
+      }),
+    ).toBe("Checking ownership");
+  });
+
+  it("falls back to something sayable when the hook explained nothing", () => {
+    expect(hookBlockReason({ entries: [] })).not.toBe("");
+  });
+});
+
 describe("AppServerTurnManager", () => {
+  it("reports why a hook blocked the turn, and still completes it", async () => {
+    const client = new FakeAppServerClient();
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "turn/start") {
+        return { turn: { id: "blocked-turn", status: "inProgress" } };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    const manager = new AppServerTurnManager(client);
+    const callbacks = { ...createCallbacks(), onHookBlocked: vi.fn() };
+
+    manager.trackThread("thread-1", "idle");
+    const completion = manager.runTurn(createRequest(callbacks));
+    await vi.waitFor(() =>
+      expect(client.request).toHaveBeenCalledWith("turn/start", expect.anything()),
+    );
+
+    client.emit("hook/completed", {
+      threadId: "thread-1",
+      turnId: "blocked-turn",
+      run: {
+        eventName: "userPromptSubmit",
+        status: "blocked",
+        statusMessage: "Checking synchronized thread ownership",
+        entries: [{ kind: "feedback", text: "Reopen this exact task before continuing." }],
+      },
+    });
+    client.emit("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: "blocked-turn", status: "completed" },
+    });
+
+    await completion;
+    expect(callbacks.onHookBlocked).toHaveBeenCalledWith({
+      eventName: "userPromptSubmit",
+      reason: "Reopen this exact task before continuing.",
+    });
+  });
+
+  it("says nothing about hooks that ran and let the turn through", async () => {
+    const client = new FakeAppServerClient();
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "turn/start") {
+        return { turn: { id: "open-turn", status: "inProgress" } };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    const manager = new AppServerTurnManager(client);
+    const callbacks = { ...createCallbacks(), onHookBlocked: vi.fn() };
+
+    manager.trackThread("thread-1", "idle");
+    const completion = manager.runTurn(createRequest(callbacks));
+    await vi.waitFor(() =>
+      expect(client.request).toHaveBeenCalledWith("turn/start", expect.anything()),
+    );
+
+    client.emit("hook/completed", {
+      threadId: "thread-1",
+      turnId: "open-turn",
+      run: { eventName: "userPromptSubmit", status: "completed", entries: [] },
+    });
+    client.emit("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: "open-turn", status: "completed" },
+    });
+
+    await completion;
+    expect(callbacks.onHookBlocked).not.toHaveBeenCalled();
+  });
+
   it("starts the first turn of a newly created in-memory thread without resuming it", async () => {
     const client = new FakeAppServerClient();
     client.request.mockImplementation(async (method: string) => {

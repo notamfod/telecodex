@@ -386,6 +386,15 @@ async function main(): Promise<void> {
     throw new Error("--from needs a commit-ish");
   }
 
+  // Checked before the agent runs: finding out about a missing token after a
+  // twenty-minute review means the whole run is wasted.
+  if (recipe.deliver && !probe && !process.env.TELEGRAM_BOT_TOKEN) {
+    throw new Error(
+      `${recipe.id} delivers to Telegram but TELEGRAM_BOT_TOKEN is unset; ` +
+        "run it through telecodex-recipe@.service, which loads .env",
+    );
+  }
+
   const stamp = new Date().toISOString();
   const state = await loadState();
   const previous = state.runs?.[recipe.id] ?? {};

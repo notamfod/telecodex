@@ -1902,7 +1902,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       inboxContextKey: contextKey,
       workTopicId: 0,
       workspace: run.cwd,
-      launchProfileId: "review",
+      // The prompt asks for a diff, not for an edit, so no write access is
+      // needed; "review" would also mean on-request approvals nobody can grant
+      // from a topic.
+      launchProfileId: "readonly",
       prompt: buildFixPrompt(run.recipe, finding),
       source: `рецепт ${run.recipe}`,
     });
@@ -1911,7 +1914,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     inbox.attachTopic(ticket.id, topic.message_thread_id);
     registry.setContextDefaults(contextKeyFromMessage(chatId, topic.message_thread_id), {
       workspace: run.cwd,
-      launchProfileId: "review",
+      launchProfileId: "readonly",
     });
 
     const card = [

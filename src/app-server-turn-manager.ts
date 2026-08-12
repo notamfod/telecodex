@@ -118,6 +118,32 @@ export class AppServerTurnManager {
     });
   }
 
+  /**
+   * Makes the daemon re-read the thread from disk. `thread/unsubscribe` will not
+   * do it — a thread stays loaded after its last subscriber leaves, and a resume
+   * then just rejoins the copy already in memory. Archiving evicts it for real.
+   */
+  async reloadThread(threadId: string): Promise<void> {
+    const state = this.threads.get(threadId);
+    if (state?.activeJob || state?.startingJob) {
+      throw new Error(`Cannot reload thread ${threadId}: a turn is in flight`);
+    }
+
+    await this.client.request("thread/archive", { threadId });
+    try {
+      await this.client.request("thread/unarchive", { threadId });
+    } catch (error) {
+      throw new Error(
+        `Thread ${threadId} is left archived after a failed reload: ${asError(error).message}`,
+      );
+    }
+
+    const response = await this.client.request<ThreadResumeResponse>("thread/resume", {
+      threadId,
+    });
+    this.getThreadState(threadId).status = response.thread.status.type;
+  }
+
   trackThread(threadId: string, status: ThreadStatus["type"]): void {
     const state = this.getThreadState(threadId);
     state.status = status;

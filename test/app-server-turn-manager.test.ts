@@ -84,6 +84,66 @@ describe("hookBlockReason", () => {
 });
 
 describe("AppServerTurnManager", () => {
+  it("reloads a thread by evicting it, because unsubscribing leaves it loaded", async () => {
+    const client = new FakeAppServerClient();
+    const calls: string[] = [];
+    client.request.mockImplementation(async (method: string) => {
+      calls.push(method);
+      if (method === "thread/resume") {
+        return { thread: { id: "thread-1", status: { type: "idle" } } };
+      }
+      return {};
+    });
+    const manager = new AppServerTurnManager(client);
+
+    await manager.reloadThread("thread-1");
+
+    expect(calls).toEqual(["thread/archive", "thread/unarchive", "thread/resume"]);
+  });
+
+  it("puts the thread back even when the reload itself fails", async () => {
+    const client = new FakeAppServerClient();
+    const calls: string[] = [];
+    client.request.mockImplementation(async (method: string) => {
+      calls.push(method);
+      if (method === "thread/resume") {
+        throw new Error("resume exploded");
+      }
+      return {};
+    });
+    const manager = new AppServerTurnManager(client);
+
+    await expect(manager.reloadThread("thread-1")).rejects.toThrow("resume exploded");
+    expect(calls).toContain("thread/unarchive");
+  });
+
+  it("refuses to reload a thread with a turn in flight", async () => {
+    const client = new FakeAppServerClient();
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "turn/start") {
+        return { turn: { id: "busy-turn", status: "inProgress" } };
+      }
+      return {};
+    });
+    const manager = new AppServerTurnManager(client);
+    const callbacks = createCallbacks();
+
+    manager.trackThread("thread-1", "idle");
+    const completion = manager.runTurn(createRequest(callbacks));
+    void completion.catch(() => undefined);
+    await vi.waitFor(() =>
+      expect(client.request).toHaveBeenCalledWith("turn/start", expect.anything()),
+    );
+
+    await expect(manager.reloadThread("thread-1")).rejects.toThrow(/in flight|active/i);
+
+    client.emit("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: "busy-turn", status: "completed" },
+    });
+    await completion;
+  });
+
   it("reports why a hook blocked the turn, and still completes it", async () => {
     const client = new FakeAppServerClient();
     client.request.mockImplementation(async (method: string) => {

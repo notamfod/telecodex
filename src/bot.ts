@@ -94,6 +94,7 @@ import {
   type PersistentTelegramJob,
 } from "./telegram-job-store.js";
 import type { AppServerHookBlock } from "./app-server-turn-manager.js";
+import { parseReopenCommand, runReopenCommand } from "./thread-reopen.js";
 import { TurnProgressPresenter } from "./turn-progress.js";
 import {
   finalChunkThreadKeyboard,
@@ -705,6 +706,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       ) {
         await session.recoverPrompt(latestJob.turnId, callbacks);
       } else {
+        await session.prompt(userInput, callbacks);
+      }
+      if (hookBlock?.eventName === "userPromptSubmit" && (await reopenThread(session, config.threadReopenCommand))) {
+        // The daemon can be holding a thread whose rollout changed underneath it,
+        // and the hook is the only signal we get. Now that it has been re-read,
+        // the prompt is worth exactly one more try.
+        hookBlock = undefined;
         await session.prompt(userInput, callbacks);
       }
       codexCompleted = true;
@@ -3452,6 +3460,27 @@ function isTelegramParseError(error: unknown): boolean {
     message.includes("entity name") ||
     message.includes("parse entities")
   );
+}
+
+async function reopenThread(
+  session: CodexSessionService,
+  configuredCommand: string | undefined,
+): Promise<boolean> {
+  const reopen = parseReopenCommand(configuredCommand);
+  const threadId = session.getInfo().threadId;
+  if (!reopen || !threadId) {
+    return false;
+  }
+
+  try {
+    await session.reloadThread();
+    // Only after the reload is the claim this makes ("it has been reopened") true.
+    await runReopenCommand(reopen, threadId);
+    return true;
+  } catch (error) {
+    console.error("Failed to reopen thread after a blocking hook:", formatError(error));
+    return false;
+  }
 }
 
 function renderPromptFailure(accumulatedText: string, error: unknown): string {

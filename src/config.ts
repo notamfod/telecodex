@@ -22,6 +22,8 @@ export interface TeleCodexConfig {
   workspace: string;
   maxFileSize: number;
   codexApiKey?: string;
+  /** Told that a thread was re-read from disk, so a sync tool can clear its guard. */
+  threadReopenCommand?: string;
   codexModel?: string;
   codexSandboxMode: CodexSandboxMode;
   codexApprovalPolicy: CodexApprovalPolicy;
@@ -50,6 +52,7 @@ export function loadConfig(): TeleCodexConfig {
   const workspace = resolveWorkspace();
   const maxFileSize = parseMaxFileSize(optionalString(process.env.MAX_FILE_SIZE));
   const codexApiKey = optionalString(process.env.CODEX_API_KEY);
+  const threadReopenCommand = optionalString(process.env.THREAD_REOPEN_COMMAND);
   const codexModel = optionalString(process.env.CODEX_MODEL);
   const codexSandboxMode = parseSandboxMode(optionalString(process.env.CODEX_SANDBOX_MODE));
   const codexApprovalPolicy = parseApprovalPolicy(optionalString(process.env.CODEX_APPROVAL_POLICY));
@@ -107,6 +110,7 @@ export function loadConfig(): TeleCodexConfig {
     workspace,
     maxFileSize,
     codexApiKey,
+    threadReopenCommand,
     codexModel,
     codexSandboxMode,
     codexApprovalPolicy,

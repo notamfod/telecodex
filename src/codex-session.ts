@@ -59,7 +59,12 @@ export interface CreateOptions {
 export interface CodexSessionDependencies {
   client: AppServerRequestClient & { close?: () => void };
   turnManager: Pick<AppServerTurnManager, "runTurn"> &
-    Partial<Pick<AppServerTurnManager, "cancelTurn" | "dispose" | "trackThread" | "recoverTurn">>;
+    Partial<
+      Pick<
+        AppServerTurnManager,
+        "cancelTurn" | "dispose" | "trackThread" | "recoverTurn" | "reloadThread"
+      >
+    >;
 }
 
 export type CodexPromptInput = string | {
@@ -157,6 +162,17 @@ export class CodexSessionService {
 
   getCurrentWorkspace(): string {
     return this.currentWorkspace;
+  }
+
+  /** Re-reads this thread from disk, so the next turn sees what is actually there. */
+  async reloadThread(): Promise<void> {
+    if (!this.currentThreadId) {
+      throw new Error("No thread to reload");
+    }
+    if (!this.dependencies.turnManager.reloadThread) {
+      throw new Error("This turn manager cannot reload threads");
+    }
+    await this.dependencies.turnManager.reloadThread(this.currentThreadId);
   }
 
   async prompt(input: CodexPromptInput, callbacks: CodexSessionCallbacks): Promise<void> {

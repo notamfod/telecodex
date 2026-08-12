@@ -2,6 +2,10 @@
 
 TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex thread alive from your phone, streams agent responses and tool output in real time, and lets you hand the thread back to the CLI whenever you want.
 
+> **This is a fork.** On top of upstream it adds a project registry, a ticket inbox,
+> a GitLab bridge, scheduled review recipes, and a few fixes to how turns are
+> delivered. See [Fork additions](#fork-additions).
+
 ## Features
 
 - **Per-context sessions** — each Telegram chat or forum topic gets its own independent Codex session with separate thread, model, and busy state
@@ -93,6 +97,10 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/voice` | Check voice transcription backend status |
 | `/handback` | Print `codex resume <id>` for CLI handoff |
 | `/attach <id>` | Bind an existing Codex thread to this forum topic |
+| `/projects` | Threads grouped by project, with links to their topics |
+| `/inbox on\|off\|status` | Turn this topic into a ticket inbox for forwarded messages |
+| `/mr` | Open merge requests from GitLab; tap one to open a review topic |
+| `/done` | Draft a "done" comment for the merge request linked to this ticket |
 
 ### Voice, image & file input
 
@@ -194,6 +202,106 @@ Telegram ←→ Grammy bot (auto-retry, HTML formatting, inline keyboards)
                                      ──→  OpenAI Whisper (cloud fallback)
 ```
 
+## Fork additions
+
+Everything below is specific to this fork.
+
+### Project registry and topics
+
+`/projects` lists live threads grouped by the project they run in, each with a link
+to its forum topic. Topics that were deleted in Telegram are detected and pruned, so
+the list never offers a link that goes nowhere.
+
+### Ticket inbox
+
+`/inbox on [workspace]` turns the current forum topic into an inbox. Anything
+forwarded into it becomes a ticket in its own topic, with a start button and the
+session defaults the inbox was configured with.
+
+- A message that carries a known issue key (`ABC-1234`) lands in the topic that key
+  already has, instead of opening a second one for the same issue.
+- Attachments are forwarded into the ticket topic, so the context arrives with it.
+- A ticket topic gets the same launch profile a hand-made topic gets. A topic that
+  cannot write to the repository it was opened for is useless.
+
+### GitLab bridge
+
+With `GITLAB_URL`, `GITLAB_TOKEN` and `GITLAB_GROUP_ID` set:
+
+- `/mr` lists open merge requests across the group. Tapping one opens a review topic
+  with the diff already fetched and a review prompt sent.
+- `/done [KEY] [text]` finds the merge requests linked to a ticket and drafts a
+  comment for each. **Nothing is posted until you tap "send"** — the draft is shown
+  first, exactly as it will appear on GitLab.
+
+### Scheduled review recipes
+
+A recipe is a deterministic prepare step (run by the runner, not by the agent) plus a
+prompt that asks for machine-readable findings:
+
+```
+FINDING|severity|file:line|category|description
+```
+
+Three example prompts ship in `recipes/`: a daily diff review, a migration audit and a
+dependency review with changelog links. Which recipes exist, where they run and where
+they report is deployment-specific, so it lives in `recipes/recipes.json` — copy
+`recipes/recipes.example.json` and edit it. `RECIPES_CONFIG` overrides the path.
+
+```bash
+node dist/recipe-run.js daily-diff-review              # as the timer runs it
+node dist/recipe-run.js daily-diff-review --from HEAD~20   # probe: never delivers, never saves state
+```
+
+- A finding is fingerprinted by file, category and description with digits masked, so
+  the same issue is reported once and not again on every run.
+- A finding naming a file that does not exist is dropped, which is what an agent
+  copying the prompt's own examples produces.
+- A recipe with no `deliver` target runs in shadow mode: findings go to a file and
+  nothing reaches Telegram. Run a week that way before turning delivery on.
+- Delivered findings carry two buttons: open a fix thread (a ticket, with the finding
+  as its prompt) or mute the fingerprint for good.
+
+Schedule them with a systemd timer:
+
+```ini
+# /etc/systemd/system/telecodex-recipe@.service
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/telecodex
+EnvironmentFile=/opt/telecodex/.env
+ExecStart=/usr/bin/node /opt/telecodex/dist/recipe-run.js %i
+```
+
+### Turn delivery
+
+- **Every turn gets an outbox.** Files the agent produces are delivered as documents
+  whether or not the turn started with an upload. Read-only contexts are excluded,
+  since they cannot write one.
+- **A long answer is sent as a `.md` document** with its opening as the caption:
+  Telegram renders attached Markdown in place, which beats an answer chopped into
+  four messages. If the upload fails the answer still goes out as plain chunks.
+
+### Blocking hooks
+
+A Codex hook can stop a turn — `UserPromptSubmit` hooks that guard against editing a
+thread that changed elsewhere, for instance. The app-server reports such a turn as
+`status: "completed"` with nothing in it, so it used to arrive as a cheerful `Done`.
+
+TeleCodex now reads `hook/completed`, and on `status: "blocked"` reports what the hook
+said instead. It then tries to recover once:
+
+1. `thread/archive` + `thread/unarchive` — this is what actually evicts a thread from
+   the daemon. `thread/unsubscribe` does not: a thread stays loaded after its last
+   subscriber leaves, and a resume then rejoins the copy already in memory.
+2. `thread/resume`, which now reads the rollout from disk.
+3. `THREAD_REOPEN_COMMAND` (optional) is run as `<command> <threadId>`, telling the
+   sync tool that the thread really was re-read.
+4. The prompt is retried exactly once. If it is blocked again, the reason is shown.
+
+With no `THREAD_REOPEN_COMMAND` configured, nothing is retried and the block is simply
+reported.
+
 ## Project Layout
 
 ```
@@ -213,8 +321,21 @@ TeleCodex/
 │   ├── error-messages.ts  — SDK/network error → user-friendly translation
 │   ├── voice.ts           — voice transcription (parakeet / Whisper)
 │   ├── config.ts          — environment loading and validation
-│   └── format.ts          — Markdown → Telegram HTML conversion
-├── test/                  — 15 test files, 180+ tests (vitest)
+│   ├── format.ts          — Markdown → Telegram HTML conversion
+│   ├── projects.ts        — thread grouping and topic links for /projects
+│   ├── inbox.ts           — ticket store: inboxes, tickets, dedup by issue key
+│   ├── gitlab.ts          — GitLab API client, review prompts, done comments
+│   ├── recipes.ts         — finding parsing, fingerprints, triage, rendering
+│   ├── recipe-config.ts   — recipes.json parsing and validation
+│   ├── recipe-run.ts      — scheduled runner (prepare, run agent, deliver)
+│   ├── recipe-store.ts    — pending runs and muted fingerprints
+│   ├── deps.ts            — go.mod / composer manifests and version comparison
+│   ├── markdown-document.ts — long answers as .md with a lead-in caption
+│   ├── thread-reopen.ts   — the command that says a thread was re-read
+│   ├── topic-sync.ts      — forum topic reconciliation
+│   └── thread-links.ts    — thread id detection and copy buttons
+├── recipes/               — review prompts and recipes.example.json
+├── test/                  — 33 test files, 430+ tests (vitest)
 ├── .env.example
 ├── Dockerfile
 ├── docker-compose.yml

@@ -28,6 +28,7 @@ import {
   renderDepsTable,
 } from "./deps.js";
 import type { DepRequirement, DepUpdate, Ecosystem } from "./deps.js";
+import { RECIPE_CONFIG_PATH, parseRecipes, type Recipe } from "./recipe-config.js";
 
 /**
  * Scheduled review recipes.
@@ -45,48 +46,6 @@ const DIFF_LIMIT = 60_000;
 const CODEX_TIMEOUT_MS = 20 * 60 * 1000;
 /** Keep the seen-set bounded; a fingerprint older than this many entries may re-alert. */
 const MAX_SEEN = 500;
-
-export interface Recipe {
-  id: string;
-  /** "diff" reviews new commits; "deps" reviews outdated dependencies. */
-  kind?: "diff" | "deps";
-  cwd: string;
-  baseRef: string;
-  promptFile: string;
-  /** Pathspec limiting the diff; empty means the whole tree. */
-  paths: string[];
-  model?: string;
-  /** Absent means shadow mode: findings go to a file, nothing reaches Telegram. */
-  deliver?: { chatId: number; messageThreadId: number };
-}
-
-export const RECIPES: Recipe[] = [
-  {
-    id: "daily-diff-review",
-    deliver: { chatId: -1001234567890, messageThreadId: 635 },
-    cwd: "/srv/projects/storefront/mir-back",
-    baseRef: "origin/main",
-    promptFile: "recipes/daily-diff-review.md",
-    paths: ["*.php", "*.sql"],
-  },
-  {
-    id: "dependency-review",
-    deliver: { chatId: -1001234567890, messageThreadId: 635 },
-    kind: "deps",
-    cwd: "/srv/projects/storefront",
-    baseRef: "",
-    promptFile: "recipes/dependency-review.md",
-    paths: [],
-  },
-  {
-    id: "migration-audit",
-    deliver: { chatId: -1001234567890, messageThreadId: 635 },
-    cwd: "/srv/projects/storefront/mir-back",
-    baseRef: "origin/main",
-    promptFile: "recipes/migration-audit.md",
-    paths: ["src/database/migrations/*"],
-  },
-];
 
 interface RecipeState {
   lastSha?: string;
@@ -375,11 +334,29 @@ async function buildDepsTable(recipe: Recipe): Promise<string> {
   return renderDepsTable(updates.filter((update): update is DepUpdate => update !== undefined));
 }
 
+/** Which recipes exist is deployment-specific, so it comes from a file. */
+async function loadRecipes(): Promise<Recipe[]> {
+  const configPath = process.env.RECIPES_CONFIG ?? RECIPE_CONFIG_PATH;
+  try {
+    return parseRecipes(await readFile(configPath, "utf8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(
+        `No recipes config at ${configPath}; copy recipes/recipes.example.json and edit it`,
+      );
+    }
+    throw error;
+  }
+}
+
 async function main(): Promise<void> {
   const id = process.argv[2];
-  const recipe = RECIPES.find((entry) => entry.id === id);
+  const recipes = await loadRecipes();
+  const recipe = recipes.find((entry) => entry.id === id);
   if (!recipe) {
-    throw new Error(`unknown recipe: ${id ?? "(none)"}; known: ${RECIPES.map((r) => r.id).join(", ")}`);
+    throw new Error(
+      `unknown recipe: ${id ?? "(none)"}; known: ${recipes.map((entry) => entry.id).join(", ")}`,
+    );
   }
 
   // A probe reviews an arbitrary range without moving the daily pointer or
@@ -402,7 +379,7 @@ async function main(): Promise<void> {
   const stamp = new Date().toISOString();
   const state = await loadState();
   const previous = state.runs?.[recipe.id] ?? {};
-  const template = await readFile(recipe.promptFile, "utf8");
+  const template = (await readFile(recipe.promptFile, "utf8")).replaceAll("{{CWD}}", recipe.cwd);
 
   let prompt: string;
   let head: string | undefined;

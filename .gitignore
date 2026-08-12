@@ -31,3 +31,6 @@ coverage/
 
 # Environment backups
 .env.*
+
+# Deployment-specific: chat ids and absolute paths
+recipes/recipes.json

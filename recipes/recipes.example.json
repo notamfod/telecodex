@@ -1,0 +1,24 @@
+{
+  "recipes": [
+    {
+      "id": "daily-diff-review",
+      "cwd": "/srv/projects/example/backend",
+      "baseRef": "origin/main",
+      "promptFile": "recipes/daily-diff-review.md",
+      "paths": [
+        "*.php",
+        "*.sql"
+      ],
+      "deliver": {
+        "chatId": -1001111111111,
+        "messageThreadId": 42
+      }
+    },
+    {
+      "id": "dependency-review",
+      "kind": "deps",
+      "cwd": "/srv/projects/example",
+      "promptFile": "recipes/dependency-review.md"
+    }
+  ]
+}

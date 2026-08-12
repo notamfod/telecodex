@@ -9,6 +9,7 @@ import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 
 import {
   buildFileInstructions,
+  buildOutboxInstructions,
   cleanupInbox,
   outboxPath,
   stageFile,
@@ -753,10 +754,38 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       .catch(() => undefined)
       .then(async () => {
         activeJobIds.set(contextKey, persistentJob.id);
+        // Every turn gets an outbox, not just the ones that arrived with a file:
+        // otherwise an agent that produces a file has nowhere to put it. A
+        // read-only context is the exception, since it cannot write one.
+        const outDir = outboxPath(session.getCurrentWorkspace(), persistentJob.id);
+        const canWriteFiles = session.getInfo().sandboxMode !== "read-only";
+        // The input is either bare text or the object form; normalise before adding to it.
+        const base = typeof userInput === "string" ? { text: userInput } : userInput;
+        const input: CodexPromptInput = canWriteFiles
+          ? {
+              ...base,
+              stagedFileInstructions: [
+                base.stagedFileInstructions,
+                buildOutboxInstructions(outDir),
+              ]
+                .filter(Boolean)
+                .join("\n\n"),
+            }
+          : base;
         try {
-          await executeUserPrompt(ctx, contextKey, chatId, session, userInput, persistentJob);
+          if (canWriteFiles) {
+            await ensureOutDir(outDir);
+          }
+          await executeUserPrompt(ctx, contextKey, chatId, session, input, persistentJob);
         } finally {
           if (activeJobIds.get(contextKey) === persistentJob.id) activeJobIds.delete(contextKey);
+          try {
+            if (canWriteFiles) {
+              await deliverArtifacts(ctx, chatId, outDir, parsed.messageThreadId);
+            }
+          } catch (artifactError) {
+            console.error("Failed to deliver artifacts:", artifactError);
+          }
         }
       });
     const tail = current
@@ -2966,11 +2995,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     // Keep typing visible during the gap between staging and prompt execution
     await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
 
-    const outDir = outboxPath(workspace, turnId);
-    await ensureOutDir(outDir);
-
     const promptInput: CodexPromptInput = {
-      stagedFileInstructions: buildFileInstructions([stagedFile], outDir),
+      stagedFileInstructions: buildFileInstructions([stagedFile]),
     };
     const caption = ctx.message.caption?.trim();
     if (caption) {
@@ -2985,14 +3011,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     } catch {
       await clearReaction(ctx);
     } finally {
-      try {
-        await deliverArtifacts(ctx, chatId, outDir, parseContextKey(contextKey).messageThreadId);
-      } catch (artifactError) {
-        console.error("Failed to deliver artifacts:", artifactError);
-      } finally {
-        await cleanupInbox(workspace, turnId);
-        // TODO: prune old outbox turn folders by age or count to avoid unbounded growth
-      }
+      await cleanupInbox(workspace, turnId);
+      // TODO: prune old outbox turn folders by age or count to avoid unbounded growth
     }
   });
 

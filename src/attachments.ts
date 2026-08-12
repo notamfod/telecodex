@@ -65,7 +65,7 @@ export async function stageFile(
   };
 }
 
-export function buildFileInstructions(files: StagedFile[], outDir: string): string {
+export function buildFileInstructions(files: StagedFile[]): string {
   if (files.length === 0) {
     return "";
   }
@@ -76,11 +76,22 @@ export function buildFileInstructions(files: StagedFile[], outDir: string): stri
     lines.push(`- ${file.safeName} (${file.mimeType}, ${formatBytes(file.sizeBytes)}) → ${file.localPath}`);
   }
 
-  lines.push("");
-  lines.push(`Write any output files to: ${outDir}`);
-  lines.push("The user will receive files from that directory after this turn completes.");
-
   return lines.join("\n");
+}
+
+/**
+ * Told to the agent on every turn.
+ *
+ * This used to ride along with the staged-file instructions, so a turn where the
+ * user uploaded nothing never learned the outbox existed: the agent wrote its
+ * CSV into the workspace, announced it, and nothing was ever sent.
+ */
+export function buildOutboxInstructions(outDir: string): string {
+  return [
+    `If you produce a file for the user (report, export, image, archive), copy it to: ${outDir}`,
+    "Everything in that directory is sent to the user on Telegram once the turn ends.",
+    "A file left anywhere else is not delivered, so do not just name its path and stop.",
+  ].join("\n");
 }
 
 export async function cleanupInbox(workspace: string, turnId: string): Promise<void> {

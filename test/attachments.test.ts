@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 
 import {
   buildFileInstructions,
+  buildOutboxInstructions,
   cleanupInbox,
   inboxPath,
   outboxPath,
@@ -105,12 +106,31 @@ describe("buildFileInstructions", () => {
       },
     ];
 
-    const result = buildFileInstructions(files, "/workspace/.telecodex/turns/t1/out");
+    const result = buildFileInstructions(files);
 
     expect(result).toContain("log.txt");
     expect(result).toContain("text/plain");
-    expect(result).toContain("/workspace/.telecodex/turns/t1/out");
     expect(result).toContain("staged on disk");
+  });
+
+  it("says nothing when the user uploaded nothing", () => {
+    expect(buildFileInstructions([])).toBe("");
+  });
+});
+
+describe("buildOutboxInstructions", () => {
+  const outDir = "/workspace/.telecodex/turns/t1/out";
+
+  it("names the directory whose contents reach the user", () => {
+    expect(buildOutboxInstructions(outDir)).toContain(outDir);
+  });
+
+  it("is produced unconditionally, since a turn can make a file without being sent one", () => {
+    expect(buildOutboxInstructions(outDir).length).toBeGreaterThan(0);
+  });
+
+  it("warns that a file left elsewhere is not delivered", () => {
+    expect(buildOutboxInstructions(outDir)).toMatch(/not delivered/i);
   });
 });
 

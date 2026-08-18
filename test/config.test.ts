@@ -26,6 +26,7 @@ describe("loadConfig", () => {
     delete process.env.ENABLE_UNSAFE_LAUNCH_PROFILES;
     delete process.env.TOOL_VERBOSITY;
     delete process.env.SHOW_TURN_TOKEN_USAGE;
+    delete process.env.TELEGRAM_WEEKLY_TOKEN_LIMIT;
     delete process.env.MAX_FILE_SIZE;
     delete process.env.ENABLE_TELEGRAM_LOGIN;
     delete process.env.ENABLE_TELEGRAM_REACTIONS;
@@ -112,6 +113,7 @@ describe("loadConfig", () => {
       enableUnsafeLaunchProfiles: false,
       toolVerbosity: "all",
       showTurnTokenUsage: false,
+      telegramWeeklyTokenLimit: undefined,
       enableTelegramLogin: false,
       enableTelegramReactions: false,
       telegramForumChatId: -1001234567890,
@@ -164,6 +166,7 @@ describe("loadConfig", () => {
     expect(config.enableUnsafeLaunchProfiles).toBe(false);
     expect(config.toolVerbosity).toBe("summary");
     expect(config.showTurnTokenUsage).toBe(false);
+    expect(config.telegramWeeklyTokenLimit).toBeUndefined();
     expect(config.enableTelegramLogin).toBe(false);
     expect(config.enableTelegramReactions).toBe(false);
     expect(config.telegramForumChatId).toBeUndefined();
@@ -419,6 +422,19 @@ describe("loadConfig", () => {
     delete process.env.SHOW_TURN_TOKEN_USAGE;
     const config = loadConfig();
     expect(config.showTurnTokenUsage).toBe(false);
+  });
+
+  it("parses an optional positive weekly token limit", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_WEEKLY_TOKEN_LIMIT = "250000";
+
+    expect(loadConfig().telegramWeeklyTokenLimit).toBe(250_000);
+
+    process.env.TELEGRAM_WEEKLY_TOKEN_LIMIT = "0";
+    expect(() => loadConfig()).toThrow(
+      "TELEGRAM_WEEKLY_TOKEN_LIMIT must be an integer of at least 1",
+    );
   });
 
   it("falls back to defaults for invalid optional enum values", () => {

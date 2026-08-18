@@ -153,6 +153,11 @@ import {
   parseCodexThreadCallback,
 } from "./thread-links.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
+import {
+  UsageStore,
+  tokenBudgetStatus,
+  type UsageAggregate,
+} from "./usage-store.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const TYPING_INTERVAL_MS = 4500;
@@ -312,6 +317,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   const bot = new Bot<Context>(config.telegramBotToken) as TeleCodexBot;
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
   const jobStore = new TelegramJobStore(path.join(config.workspace, ".telecodex", "jobs.json"));
+  const usageStore = new UsageStore(path.join(config.workspace, ".telecodex", "token-usage.jsonl"));
+  try {
+    usageStore.compact();
+  } catch (error) {
+    console.warn("Failed to compact token usage ledger:", friendlyErrorText(error));
+  }
   const topicActivity = new TopicActivityIndicator({
     filePath: path.join(config.workspace, ".telecodex", "topic-icons.json"),
     listIconStickers: async () => (await bot.api.getForumTopicIconStickers()).map((sticker) => ({
@@ -973,6 +984,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       },
       onTurnComplete: (usage) => {
         lastTurnUsage = usage;
+        try {
+          const info = session.getInfo();
+          usageStore.record({
+            ts: Date.now(),
+            contextKey,
+            workspace: info.workspace,
+            model: info.model,
+            ...usage,
+          });
+        } catch (error) {
+          console.warn("Failed to record token usage:", friendlyErrorText(error));
+        }
       },
       onGeneratedImage: (image) => {
         generatedImages.push(image);
@@ -2207,6 +2230,33 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     await safeReply(ctx, html, {
       fallbackText: unresolved.map((ticket) => ticketHeading(ticket)).join("\n"),
     });
+  });
+
+  bot.command("usage", async (ctx) => {
+    const rawDays = String(ctx.match ?? "").trim();
+    if (rawDays && rawDays !== "7" && rawDays !== "30") {
+      await safeReply(ctx, "Использование: <code>/usage [7|30]</code>", {
+        fallbackText: "Использование: /usage [7|30]",
+      });
+      return;
+    }
+    const days = rawDays === "30" ? 30 : 7;
+    try {
+      const aggregates = usageStore.aggregate(days);
+      const weeklyTotal = config.telegramWeeklyTokenLimit
+        ? usageStore.aggregate(7).reduce((sum, item) => sum + item.totalTokens, 0)
+        : undefined;
+      const report = renderUsageReport(
+        aggregates,
+        days,
+        config.telegramWeeklyTokenLimit,
+        weeklyTotal,
+      );
+      await safeReply(ctx, report.html, { fallbackText: report.plain });
+    } catch (error) {
+      const message = `Не удалось прочитать статистику: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+    }
   });
 
   bot.command("title", async (ctx) => {
@@ -4214,6 +4264,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "jira", description: "Open Jira sprint and filters" },
     { command: "inbox", description: "Turn this topic into a ticket inbox" },
     { command: "tickets", description: "List unresolved inbox tickets" },
+    { command: "usage", description: "Token usage by project" },
     { command: "title", description: "Rename the current ticket topic" },
     { command: "mr", description: "Open merge requests, tap to review" },
     { command: "retry", description: "Resend the last prompt" },
@@ -4337,6 +4388,53 @@ export function formatToolSummaryLine(toolCounts: Map<string, number>): string {
 
 export function formatTurnUsageLine(usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number }): string {
   return `🪙 in: ${usage.inputTokens} · cached: ${usage.cachedInputTokens} · out: ${usage.outputTokens}`;
+}
+
+export function renderUsageReport(
+  aggregates: UsageAggregate[],
+  days: 7 | 30,
+  weeklyLimit?: number,
+  weeklyTotal?: number,
+): { html: string; plain: string } {
+  const html = [`<b>Использование токенов</b>`, `За ${days} дней`];
+  const plain = ["Использование токенов", `За ${days} дней`];
+
+  if (aggregates.length === 0) {
+    html.push("", "Завершённых ходов пока нет.");
+    plain.push("", "Завершённых ходов пока нет.");
+  } else {
+    for (const item of aggregates) {
+      const summary = [
+        `Вход: ${formatTokenCount(item.inputTokens)}`,
+        `кэш: ${formatTokenCount(item.cachedInputTokens)}`,
+        `выход: ${formatTokenCount(item.outputTokens)}`,
+        `Всего: ${formatTokenCount(item.totalTokens)}`,
+        `ходов: ${item.turns}`,
+      ].join(" · ");
+      html.push("", `📁 <code>${escapeHTML(item.workspace)}</code>`, summary);
+      plain.push("", `📁 ${item.workspace}`, summary);
+    }
+  }
+
+  if (weeklyLimit !== undefined && weeklyTotal !== undefined) {
+    const status = tokenBudgetStatus(weeklyTotal, weeklyLimit);
+    if (status === "warning") {
+      const percentage = Math.floor((weeklyTotal / weeklyLimit) * 100);
+      const warning = `⚠️ Использовано ${percentage}% недельного лимита (${formatTokenCount(weeklyTotal)} / ${formatTokenCount(weeklyLimit)}).`;
+      html.push("", warning);
+      plain.push("", warning);
+    } else if (status === "exceeded") {
+      const warning = `🚨 Недельный лимит исчерпан (${formatTokenCount(weeklyTotal)} / ${formatTokenCount(weeklyLimit)}).`;
+      html.push("", warning);
+      plain.push("", warning);
+    }
+  }
+
+  return { html: html.join("\n"), plain: plain.join("\n") };
+}
+
+function formatTokenCount(value: number): string {
+  return new Intl.NumberFormat("en-US").format(value);
 }
 
 export function summarizeToolName(toolName: string): string {

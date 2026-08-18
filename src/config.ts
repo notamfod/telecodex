@@ -45,6 +45,7 @@ export interface TeleCodexConfig {
   enableUnsafeLaunchProfiles: boolean;
   toolVerbosity: ToolVerbosity;
   showTurnTokenUsage: boolean;
+  telegramWeeklyTokenLimit?: number;
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
   telegramForumChatId?: number;
@@ -98,6 +99,14 @@ export function loadConfig(): TeleCodexConfig {
   );
   const toolVerbosity = parseToolVerbosity(optionalString(process.env.TOOL_VERBOSITY));
   const showTurnTokenUsage = parseBooleanEnv(optionalString(process.env.SHOW_TURN_TOKEN_USAGE), false);
+  const telegramWeeklyTokenLimit = optionalString(process.env.TELEGRAM_WEEKLY_TOKEN_LIMIT) === undefined
+    ? undefined
+    : parseIntegerSetting(
+        "TELEGRAM_WEEKLY_TOKEN_LIMIT",
+        optionalString(process.env.TELEGRAM_WEEKLY_TOKEN_LIMIT),
+        1,
+        1,
+      );
   const enableTelegramLogin = parseBooleanEnv(
     optionalString(process.env.ENABLE_TELEGRAM_LOGIN),
     false,
@@ -162,6 +171,7 @@ export function loadConfig(): TeleCodexConfig {
     enableUnsafeLaunchProfiles,
     toolVerbosity,
     showTurnTokenUsage,
+    telegramWeeklyTokenLimit,
     enableTelegramLogin,
     enableTelegramReactions,
     telegramForumChatId,

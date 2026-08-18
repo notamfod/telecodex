@@ -67,6 +67,7 @@ import {
   ensureThreadTopic,
   findLiveBoundTopic,
   groupThreadsByProject,
+  partitionJobsByTopicLiveness,
   projectButtons,
   renderProjectHTML,
   renderProjectsHTML,
@@ -3592,7 +3593,19 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   });
 
   bot.recoverPendingJobs = async (): Promise<void> => {
-    const awaitingModel = jobStore.listAwaitingModel();
+    const awaitingModelPartition = await partitionJobsByTopicLiveness(
+      jobStore.listAwaitingModel(),
+      topicIsAlive,
+    );
+    const awaitingModel = awaitingModelPartition.retained;
+    const loggedDeadContexts = new Set<TelegramContextKey>();
+    for (const job of awaitingModelPartition.dead) {
+      jobStore.update(job.id, { state: "failed" });
+      if (!loggedDeadContexts.has(job.contextKey)) {
+        loggedDeadContexts.add(job.contextKey);
+        console.warn(`Dropping Telegram model picker for missing topic: ${job.contextKey}`);
+      }
+    }
     const recoverable = jobStore.listRecoverable();
     await topicActivity.restoreStaleTopics({
       exclude: recoverable

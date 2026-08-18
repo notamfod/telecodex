@@ -137,6 +137,31 @@ export async function probeForumTopic(
   return true;
 }
 
+export async function partitionJobsByTopicLiveness<
+  T extends { chatId: number; messageThreadId?: number },
+>(
+  jobs: T[],
+  topicIsAlive: (chatId: number, messageThreadId: number) => Promise<boolean>,
+): Promise<{ retained: T[]; dead: T[] }> {
+  const retained: T[] = [];
+  const dead: T[] = [];
+
+  for (const job of jobs) {
+    if (job.messageThreadId === undefined || job.messageThreadId === 1) {
+      retained.push(job);
+      continue;
+    }
+
+    try {
+      (await topicIsAlive(job.chatId, job.messageThreadId) ? retained : dead).push(job);
+    } catch {
+      dead.push(job);
+    }
+  }
+
+  return { retained, dead };
+}
+
 function isTopicNotModifiedError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /TOPIC_NOT_MODIFIED|topic is already (?:open|closed)/i.test(message);

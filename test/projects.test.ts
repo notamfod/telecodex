@@ -6,6 +6,7 @@ import {
   findBoundTopic,
   findLiveBoundTopic,
   isMissingForumTopicError,
+  partitionJobsByTopicLiveness,
   probeForumTopic,
   ensureThreadTopic,
   groupThreadsByProject,
@@ -267,6 +268,52 @@ describe("probeForumTopic", () => {
     })).resolves.toBe(false);
 
     expect(close).not.toHaveBeenCalled();
+  });
+});
+
+describe("partitionJobsByTopicLiveness", () => {
+  const generalJob = { id: "general", chatId: -1001, messageThreadId: undefined };
+  const generalTopicJob = { id: "general-topic", chatId: -1001, messageThreadId: 1 };
+  const liveJob = { id: "live", chatId: -1001, messageThreadId: 14 };
+  const deletedJob = { id: "deleted", chatId: -1001, messageThreadId: 15 };
+  const failedProbeJob = { id: "failed-probe", chatId: -1001, messageThreadId: 16 };
+
+  it("retains General chat jobs without probing Telegram", async () => {
+    const topicIsAlive = vi.fn();
+
+    const result = await partitionJobsByTopicLiveness(
+      [generalJob, generalTopicJob],
+      topicIsAlive,
+    );
+
+    expect(result).toEqual({ retained: [generalJob, generalTopicJob], dead: [] });
+    expect(topicIsAlive).not.toHaveBeenCalled();
+  });
+
+  it("partitions live and deleted topic jobs", async () => {
+    const topicIsAlive = vi.fn(async (_chatId: number, messageThreadId: number) =>
+      messageThreadId === 14
+    );
+
+    const result = await partitionJobsByTopicLiveness(
+      [liveJob, deletedJob],
+      topicIsAlive,
+    );
+
+    expect(result).toEqual({ retained: [liveJob], dead: [deletedJob] });
+    expect(topicIsAlive.mock.calls).toEqual([
+      [-1001, 14],
+      [-1001, 15],
+    ]);
+  });
+
+  it("treats a failed liveness probe as a dead topic", async () => {
+    const result = await partitionJobsByTopicLiveness(
+      [failedProbeJob],
+      vi.fn().mockRejectedValue(new Error("network failure")),
+    );
+
+    expect(result).toEqual({ retained: [], dead: [failedProbeJob] });
   });
 });
 

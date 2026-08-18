@@ -51,28 +51,12 @@ import {
   type MergeRequestSummary,
 } from "./gitlab.js";
 import {
-  BurstBuffer,
-  DEFAULT_TICKET_TEMPLATE,
   InboxStore,
-  buildTicketPrompt,
-  describeSource,
-  duplicateTicketButtons,
   extractTicketKey,
-  hasAttachment,
-  groupTicketsByWorkspace,
-  groupBurst,
-  parseInboxTemplateCommand,
   ticketActionButtons,
-  ticketHeading,
-  ticketTopicName,
-  validateTicketTemplate,
-  type InboxSettings,
   type Ticket,
 } from "./inbox.js";
-import {
-  isSafeProjectContext,
-  loadDofboxRealmContext,
-} from "./project-context.js";
+import { registerInboxHandlers } from "./bot-inbox.js";
 import {
   ensureThreadTopic,
   findLiveBoundTopic,
@@ -104,9 +88,7 @@ import {
 import { JiraClient } from "./jira-client.js";
 import {
   JiraCommentClient,
-  buildJiraComment,
   canPostTicketToJira,
-  readTicketAnswer,
   saveTicketAnswer,
 } from "./jira-comment.js";
 import {
@@ -130,12 +112,7 @@ import {
 import { buildFixPrompt, fingerprintFinding, fixTopicName } from "./recipes.js";
 import { parseRecipes, RECIPE_CONFIG_PATH } from "./recipe-config.js";
 import { SessionRegistry } from "./session-registry.js";
-import {
-  SentryBridge,
-  renderSentryTicketText,
-  type SentryIssue,
-  type SentryBridgeTarget,
-} from "./sentry-bridge.js";
+import type { SentryBridge } from "./sentry-bridge.js";
 import { listHostThreads } from "./host-threads.js";
 import {
   buildStatusSnapshot,
@@ -217,18 +194,6 @@ type RenderedChunk = RenderedText & {
   sourceText: string;
 };
 
-/** Inbox tickets always run in this sandbox, whatever the host default is. */
-
-interface InboxItem {
-  contextKey: TelegramContextKey;
-  chatId: number;
-  messageId: number;
-  mediaGroupId?: string;
-  hasAttachment: boolean;
-  text: string;
-  message: Parameters<typeof describeSource>[0];
-}
-
 export interface TeleCodexBot extends Bot<Context> {
   recoverPendingJobs(): Promise<void>;
   statusBoard?: StatusBoard;
@@ -269,14 +234,6 @@ function ticketKeyboard(ticket: Pick<Ticket, "id" | "startedAt" | "resolvedAt">)
   const keyboard = new InlineKeyboard();
   for (const button of ticketActionButtons(ticket)) {
     keyboard.text(button.label, button.callbackData);
-  }
-  return keyboard;
-}
-
-function duplicateTicketKeyboard(decisionId: number): InlineKeyboard {
-  const keyboard = new InlineKeyboard();
-  for (const button of duplicateTicketButtons(decisionId)) {
-    keyboard.text(button.label, button.callbackData).row();
   }
   return keyboard;
 }
@@ -398,7 +355,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   const jiraComment = config.jiraComment
     ? new JiraCommentClient(config.jiraComment)
     : undefined;
-  const pendingJiraPosts = new Set<number>();
   const gitlab =
     config.gitlabUrl && config.gitlabToken
       ? new GitLabClient(config.gitlabUrl, config.gitlabToken)
@@ -408,14 +364,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   /** Drafted GitLab comments awaiting a tap; a restart just expires them. */
   const pendingDoneDrafts = new Map<number, { key: string; body: string }>();
   let nextDoneDraftId = 1;
-  const pendingBatches = new Map<string, InboxItem[][]>();
-  let nextBatchId = 1;
-  /** Duplicate choices intentionally expire on restart instead of guessing a branch. */
-  const pendingDuplicateDecisions = new Map<
-    number,
-    { group: InboxItem[]; previousTicketId: number }
-  >();
-  let nextDuplicateDecisionId = 1;
   const pendingProjectPicks = new Map<TelegramContextKey, string[]>();
   const pendingProjectButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingProjectSessionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
@@ -2074,222 +2022,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     });
   });
 
-  const INBOX_QUIET_MS = 2_000;
-  const INBOX_TOPIC_PAUSE_MS = 3_000;
-
-  const inboxUsage = [
-    "Использование:",
-    "/inbox on [путь] — сделать этот топик инбоксом",
-    "/inbox off — выключить",
-    "/inbox status — показать настройки",
-    "/inbox template — показать шаблон",
-    "/inbox template set <текст> — изменить шаблон",
-    "/inbox template reset — вернуть шаблон по умолчанию",
-    "/inbox context — показать контекст проекта",
-    "/inbox context set <текст> — изменить контекст",
-    "/inbox context reset — очистить контекст",
-    "/inbox realm <имя|off> — подключить безопасный контекст dofbox",
-  ].join("\n");
-
-  bot.command("inbox", async (ctx) => {
-    const contextKey = contextKeyFromCtx(ctx);
-    if (!contextKey) {
-      return;
-    }
-
-    const args = (ctx.message?.text ?? "").replace(/^\/inbox(?:@\w+)?\s*/, "").trim();
-    const [action, ...rest] = args.split(/\s+/);
-    const settings = inbox.get(contextKey);
-    const templateCommand = parseInboxTemplateCommand(args);
-
-    if (templateCommand) {
-      if (!settings) {
-        const text = "Сначала включи этот инбокс: /inbox on [путь]";
-        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-        return;
-      }
-      if (templateCommand.action === "show") {
-        await safeReply(ctx, `<b>Шаблон тикета:</b>\n<pre>${escapeHTML(settings.template)}</pre>`, {
-          fallbackText: `Шаблон тикета:\n${settings.template}`,
-        });
-        return;
-      }
-
-      const template = templateCommand.action === "reset"
-        ? DEFAULT_TICKET_TEMPLATE
-        : templateCommand.template;
-      const validationError = validateTicketTemplate(template);
-      if (validationError) {
-        await safeReply(ctx, escapeHTML(validationError), { fallbackText: validationError });
-        return;
-      }
-      inbox.setTemplate(contextKey, template);
-      const text = templateCommand.action === "reset"
-        ? "Шаблон тикета сброшен."
-        : "Шаблон тикета обновлён.";
-      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-      return;
-    }
-
-    if (action === "context") {
-      if (!settings) {
-        const text = "Сначала включи этот инбокс: /inbox on [путь]";
-        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-        return;
-      }
-      const contextSet = /^context\s+set(?:\s+([\s\S]*))?$/.exec(args);
-      if (contextSet) {
-        const projectContext = (contextSet[1] ?? "").replaceAll("\\n", "\n").trim();
-        if (!isSafeProjectContext(projectContext)) {
-          const text = "Контекст пуст или содержит секретные данные.";
-          await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-          return;
-        }
-        inbox.setProjectContext(contextKey, projectContext);
-        const text = "Контекст проекта обновлён.";
-        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-        return;
-      }
-      if (rest[0] === "reset") {
-        inbox.setProjectContext(contextKey, undefined);
-        const text = "Контекст проекта очищен.";
-        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-        return;
-      }
-      if (rest.length === 0) {
-        const projectContext = settings.projectContext ?? "(не задан)";
-        await safeReply(ctx, `<b>Контекст проекта:</b>\n<pre>${escapeHTML(projectContext)}</pre>`, {
-          fallbackText: `Контекст проекта:\n${projectContext}`,
-        });
-        return;
-      }
-      await safeReply(ctx, escapeHTML(inboxUsage), { fallbackText: inboxUsage });
-      return;
-    }
-
-    if (action === "realm") {
-      if (!settings) {
-        const text = "Сначала включи этот инбокс: /inbox on [путь]";
-        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-        return;
-      }
-      const realmName = rest[0];
-      if (realmName === "off") {
-        inbox.setRealm(contextKey, undefined);
-        const text = "Dofbox realm отключён.";
-        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-        return;
-      }
-      if (!realmName || rest.length !== 1) {
-        await safeReply(ctx, escapeHTML(inboxUsage), { fallbackText: inboxUsage });
-        return;
-      }
-      try {
-        const preview = loadDofboxRealmContext(realmName);
-        inbox.setRealm(contextKey, realmName);
-        await safeReply(ctx, `<b>Dofbox realm:</b> <code>${escapeHTML(realmName)}</code>\n<pre>${escapeHTML(preview)}</pre>`, {
-          fallbackText: `Dofbox realm: ${realmName}\n${preview}`,
-        });
-      } catch (error) {
-        const text = `Не удалось загрузить realm ${realmName}: ${friendlyErrorText(error)}`;
-        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-      }
-      return;
-    }
-
-    if (action === "off") {
-      const text = inbox.disable(contextKey)
-        ? "Инбокс выключен, сообщения снова идут в сессию этого топика."
-        : "Этот топик и так не инбокс.";
-      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-      return;
-    }
-
-    if (action === "on") {
-      const workspace = rest.join(" ").trim() || registry.listContexts().find(
-        (entry) => entry.contextKey === contextKey,
-      )?.workspace || config.workspace;
-      let projectContext = settings?.projectContext;
-      try {
-        const contextFile = (await readFile(path.join(workspace, ".telecodex", "context.md"), "utf8")).trim();
-        if (contextFile && isSafeProjectContext(contextFile)) {
-          projectContext = contextFile;
-        } else if (contextFile) {
-          console.warn(`Skipped secret-bearing project context for ${workspace}`);
-        }
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-          console.warn(`Failed to load project context for ${workspace}:`, friendlyErrorText(error));
-        }
-      }
-      inbox.enable(contextKey, {
-        workspace,
-        // A ticket topic is a working topic: same profile as one opened by hand,
-        // or it cannot touch the repository it was opened for.
-        launchProfileId: config.defaultLaunchProfileId,
-        template: settings?.template ?? DEFAULT_TICKET_TEMPLATE,
-        iconCustomEmojiId: settings?.iconCustomEmojiId,
-        projectContext,
-        realm: settings?.realm,
-      });
-      const html = [
-        "<b>Инбокс включён.</b>",
-        `Проект: <code>${escapeHTML(workspace)}</code>`,
-        `Профиль запуска тикетов: <code>${escapeHTML(config.defaultLaunchProfileId)}</code>`,
-        "",
-        "Пересылай сюда обращения — на каждое заведу отдельный топик.",
-      ].join("\n");
-      await safeReply(ctx, html, { fallbackText: "Инбокс включён." });
-      return;
-    }
-
-    if (action === "status" || action === "") {
-      if (!settings) {
-        const text = `Этот топик не инбокс.\n\n${inboxUsage}`;
-        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-        return;
-      }
-      const html = [
-        "<b>Инбокс включён.</b>",
-        `Проект: <code>${escapeHTML(settings.workspace)}</code>`,
-        `Профиль: <code>${escapeHTML(settings.launchProfileId ?? "по умолчанию")}</code>`,
-      ].join("\n");
-      await safeReply(ctx, html, { fallbackText: "Инбокс включён." });
-      return;
-    }
-
-    await safeReply(ctx, escapeHTML(inboxUsage), { fallbackText: inboxUsage });
-  });
-
-  bot.command("tickets", async (ctx) => {
-    const unresolved = inbox.listUnresolved();
-    if (unresolved.length === 0) {
-      const text = "Открытых тикетов нет.";
-      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-      return;
-    }
-
-    const lines = ["<b>Открытые тикеты</b>"];
-    for (const group of groupTicketsByWorkspace(unresolved)) {
-      lines.push("", `📁 <code>${escapeHTML(group.workspace)}</code>`);
-      for (const ticket of group.tickets) {
-        const chatId = parseContextKey(ticket.inboxContextKey).chatId;
-        const label = escapeHTML(ticketHeading(ticket));
-        const started = ticket.startedAt === undefined ? "" : " · разбор запущен";
-        lines.push(
-          ticket.workTopicId
-            ? `• <a href="${topicUrl(chatId, ticket.workTopicId)}">${label}</a>${started}`
-            : `• ${label}${started}`,
-        );
-      }
-    }
-
-    const html = lines.join("\n");
-    await safeReply(ctx, html, {
-      fallbackText: unresolved.map((ticket) => ticketHeading(ticket)).join("\n"),
-    });
-  });
-
   bot.command("usage", async (ctx) => {
     const rawDays = String(ctx.match ?? "").trim();
     if (rawDays && rawDays !== "7" && rawDays !== "30") {
@@ -2315,534 +2047,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       const message = `Не удалось прочитать статистику: ${friendlyErrorText(error)}`;
       await safeReply(ctx, escapeHTML(message), { fallbackText: message });
     }
-  });
-
-  bot.command("sentry", async (ctx) => {
-    if (!bot.sentryBridge) {
-      const text = "Sentry bridge не настроен.";
-      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-      return;
-    }
-    const rawHours = String(ctx.match ?? "").trim();
-    const hours = rawHours ? Number(rawHours) : 24;
-    if (!Number.isInteger(hours) || hours < 1 || hours > 720) {
-      await safeReply(ctx, "Использование: <code>/sentry [hours]</code>, от 1 до 720", {
-        fallbackText: "Использование: /sentry [hours], от 1 до 720",
-      });
-      return;
-    }
-    const result = await bot.sentryBridge.run(hours);
-    const lines = [
-      `<b>Sentry за ${hours} ч.</b>`,
-      `Получено: ${result.fetched}`,
-      `Создано тикетов: ${result.created}`,
-      `Уже обработано: ${result.skipped}`,
-      result.failures.length
-        ? `Ошибки: ${escapeHTML(result.failures.join("; "))}`
-        : "Ошибок нет.",
-    ];
-    const plain = lines.map((line) => line.replace(/<[^>]+>/g, ""));
-    await safeReply(ctx, lines.join("\n"), { fallbackText: plain.join("\n") });
-  });
-
-  bot.command("title", async (ctx) => {
-    const chatId = ctx.chat?.id;
-    const messageThreadId = ctx.message?.message_thread_id;
-    const ticket = messageThreadId ? inbox.findTicketByTopic(messageThreadId) : undefined;
-    if (!chatId || !messageThreadId || !ticket) {
-      const text = "Команда /title работает только внутри топика тикета.";
-      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-      return;
-    }
-
-    const requested = (ctx.message?.text ?? "").replace(/^\/title(?:@\w+)?\s*/, "").trim();
-    const extracted = extractTopicRename(`TOPIC: ${requested}\n\n`);
-    if (!extracted) {
-      const text = "Укажи безопасное непустое название: /title <текст>";
-      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-      return;
-    }
-
-    const topicName = renamedTicketTopic(ticket, extracted.title);
-    try {
-      await bot.api.editForumTopic(chatId, messageThreadId, { name: topicName });
-    } catch (error) {
-      if (!/TOPIC_NOT_MODIFIED/i.test(formatError(error))) {
-        throw error;
-      }
-    }
-    inbox.setTopicTitle(ticket.id, extracted.title);
-    const text = `Топик переименован: ${topicName}`;
-    await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-  });
-
-  const ticketTextOf = (group: InboxItem[]): string =>
-    group
-      .map((item) => item.text)
-      .filter(Boolean)
-      .join("\n\n")
-      .trim();
-
-  const projectContextForTicket = (settings: InboxSettings): string | undefined => {
-    const parts: string[] = [];
-    if (settings.projectContext && isSafeProjectContext(settings.projectContext)) {
-      parts.push(settings.projectContext);
-    }
-    if (settings.realm) {
-      try {
-        const realmContext = loadDofboxRealmContext(settings.realm);
-        if (realmContext) {
-          parts.push(realmContext);
-        }
-      } catch (error) {
-        console.warn(`Failed to load dofbox realm ${settings.realm}:`, friendlyErrorText(error));
-      }
-    }
-    return parts.length ? parts.join("\n\n") : undefined;
-  };
-
-  /** Only attachments are worth forwarding; the card already quotes the text. */
-  const forwardAttachments = async (
-    group: InboxItem[],
-    messageThreadId: number,
-    ticketId: number,
-  ): Promise<void> => {
-    const [first] = group;
-    for (const item of group.filter((entry) => entry.hasAttachment)) {
-      try {
-        await bot.api.forwardMessage(first.chatId, first.chatId, item.messageId, {
-          message_thread_id: messageThreadId,
-        });
-      } catch (error) {
-        console.warn(
-          `Failed to forward message ${item.messageId} into ticket #${ticketId}:`,
-          error instanceof Error ? error.message : String(error),
-        );
-      }
-    }
-  };
-
-  const appendToTicket = async (
-    ticket: Ticket,
-    group: InboxItem[],
-    text: string,
-    source: string,
-  ): Promise<void> => {
-    const [first] = group;
-    const card = [
-      `\u2795 <b>Дополнение к ${escapeHTML(ticketHeading(ticket))}</b>`,
-      `Источник: ${escapeHTML(source)}`,
-      "",
-      escapeHTML(text || "(без текста, см. пересланные сообщения ниже)"),
-    ].join("\n");
-
-    await sendTextMessage(bot.api, first.chatId, card, {
-      messageThreadId: ticket.workTopicId,
-      fallbackText: `Дополнение к ${ticketHeading(ticket)}. Источник: ${source}`,
-    });
-
-    await forwardAttachments(group, ticket.workTopicId, ticket.id);
-
-    const url = topicUrl(first.chatId, ticket.workTopicId);
-    await sendTextMessage(
-      bot.api,
-      first.chatId,
-      `Уже заведён <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a> — добавил туда.`,
-      {
-        messageThreadId: parseContextKey(first.contextKey).messageThreadId,
-        fallbackText: `${ticketHeading(ticket)}: ${url}`,
-      },
-    );
-  };
-
-  const createTicket = async (
-    group: InboxItem[],
-    options: {
-      skipDuplicateCheck?: boolean;
-      supersedesId?: number;
-      continueTicketId?: number;
-      externalKeyOverride?: string;
-      sourceOverride?: string;
-    } = {},
-  ): Promise<void> => {
-    const [first] = group;
-    if (!first) {
-      return;
-    }
-    const settings = inbox.get(first.contextKey);
-    if (!settings) {
-      return;
-    }
-
-    const text = ticketTextOf(group);
-    const source = options.sourceOverride ?? describeSource(first.message);
-    const externalKey = options.externalKeyOverride ?? extractTicketKey(text);
-
-    if (externalKey && !options.skipDuplicateCheck) {
-      const candidates = inbox.listTicketsByKey(first.contextKey, externalKey);
-      for (const candidate of candidates) {
-        if (candidate.resolvedAt !== undefined || !candidate.workTopicId) {
-          continue;
-        }
-        const live = await topicIsAlive(first.chatId, candidate.workTopicId).catch(() => false);
-        if (live) {
-          await appendToTicket(candidate, group, text, source);
-          return;
-        }
-      }
-
-      const previous = candidates[0];
-      if (previous) {
-        const decisionId = nextDuplicateDecisionId++;
-        pendingDuplicateDecisions.set(decisionId, { group, previousTicketId: previous.id });
-        const message = [
-          `Нашёл ${ticketHeading(previous)}, но активного рабочего топика у него нет.`,
-          "Продолжить старый тикет или завести новый?",
-        ].join("\n");
-        await sendTextMessage(bot.api, first.chatId, escapeHTML(message), {
-          messageThreadId: parseContextKey(first.contextKey).messageThreadId,
-          fallbackText: message,
-          replyMarkup: duplicateTicketKeyboard(decisionId),
-        });
-        return;
-      }
-    }
-
-    const prompt = buildTicketPrompt(settings.template, {
-      source,
-      message: text,
-      projectContext: projectContextForTicket(settings),
-    });
-    const continuedTicket = options.continueTicketId
-      ? inbox.getTicket(options.continueTicketId)
-      : undefined;
-    if (options.continueTicketId && !continuedTicket) {
-      throw new Error(`Ticket ${options.continueTicketId} no longer exists`);
-    }
-    const pendingTicket = continuedTicket ?? inbox.createTicket({
-      inboxContextKey: first.contextKey,
-      externalKey,
-      workTopicId: 0,
-      workspace: settings.workspace,
-      launchProfileId: settings.launchProfileId,
-      prompt,
-      source,
-      supersedesId: options.supersedesId,
-    });
-
-    const topicName = ticketTopicName(pendingTicket.id, text, pendingTicket.externalKey);
-    const topic = await bot.api.createForumTopic(
-      first.chatId,
-      topicName,
-      settings.iconCustomEmojiId
-        ? { icon_custom_emoji_id: settings.iconCustomEmojiId }
-        : undefined,
-    );
-    topicActivity.rememberIdleIcon(
-      first.chatId,
-      topic.message_thread_id,
-      settings.iconCustomEmojiId ?? null,
-    );
-    const ticket = continuedTicket
-      ? inbox.continueTicket(continuedTicket.id, {
-          workTopicId: topic.message_thread_id,
-          prompt,
-          source,
-        })!
-      : pendingTicket;
-    if (!continuedTicket) {
-      inbox.attachTopic(ticket.id, topic.message_thread_id);
-    }
-    registry.setContextDefaults(
-      contextKeyFromMessage(first.chatId, topic.message_thread_id),
-      { workspace: settings.workspace, launchProfileId: settings.launchProfileId, topicName },
-    );
-
-    const card = [
-      `🎫 <b>${escapeHTML(ticketHeading(ticket))}</b>`,
-      `Источник: ${escapeHTML(source)}`,
-      `Проект: <code>${escapeHTML(settings.workspace)}</code>`,
-      ticket.supersedesId
-        ? `Предыдущий: ${escapeHTML(ticketHeading(inbox.getTicket(ticket.supersedesId) ?? { id: ticket.supersedesId }))}`
-        : undefined,
-      "",
-      escapeHTML(text || "(без текста, см. пересланные сообщения ниже)"),
-    ].filter((line): line is string => line !== undefined).join("\n");
-
-    await sendTextMessage(bot.api, first.chatId, card, {
-      messageThreadId: topic.message_thread_id,
-      fallbackText: `${ticketHeading(ticket)}. Источник: ${source}`,
-      replyMarkup: ticketKeyboard(ticket),
-    });
-
-    await forwardAttachments(group, topic.message_thread_id, ticket.id);
-
-    const url = topicUrl(first.chatId, topic.message_thread_id);
-    await sendTextMessage(
-      bot.api,
-      first.chatId,
-      `${continuedTicket ? "Тикет продолжен" : "Заведён тикет"} <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a>.`,
-      {
-        messageThreadId: parseContextKey(first.contextKey).messageThreadId,
-        fallbackText: `${ticketHeading(ticket)}: ${url}`,
-      },
-    );
-  };
-
-  const createTicketsSequentially = async (groups: InboxItem[][]): Promise<void> => {
-    for (const [index, group] of groups.entries()) {
-      if (index > 0) {
-        // Telegram rate-limits topic creation hard; pace them.
-        await new Promise((resolve) => setTimeout(resolve, INBOX_TOPIC_PAUSE_MS));
-      }
-      try {
-        await createTicket(group);
-      } catch (error) {
-        console.error(
-          "Failed to create ticket:",
-          error instanceof Error ? error.message : String(error),
-        );
-      }
-    }
-  };
-
-  const createSentryTicket = async (
-    issue: SentryIssue,
-    target: SentryBridgeTarget,
-    project: string,
-  ): Promise<void> => {
-    const settings = inbox.get(target.inboxContextKey);
-    if (!settings) {
-      throw new Error(`Inbox ${target.inboxContextKey} is not configured`);
-    }
-    if (settings.workspace !== target.workspace) {
-      throw new Error(
-        `Inbox ${target.inboxContextKey} workspace mismatch: ${settings.workspace}`,
-      );
-    }
-    const parsed = parseContextKey(target.inboxContextKey);
-    if (!parsed.messageThreadId || !Number.isFinite(parsed.chatId)) {
-      throw new Error(`Inbox ${target.inboxContextKey} is not a forum topic`);
-    }
-    await createTicket([{
-      contextKey: target.inboxContextKey,
-      chatId: parsed.chatId,
-      messageId: 0,
-      hasAttachment: false,
-      text: renderSentryTicketText(issue),
-      message: {},
-    }], {
-      skipDuplicateCheck: true,
-      externalKeyOverride: issue.shortId,
-      sourceOverride: `Sentry project ${project}`,
-    });
-  };
-
-  if (config.sentryBridge) {
-    bot.sentryBridge = new SentryBridge({
-      ...config.sentryBridge,
-      statePath: path.join(config.workspace, ".telecodex", "sentry-bridge.json"),
-      createTicket: createSentryTicket,
-    });
-  }
-
-  const askHowToSplit = async (groups: InboxItem[][]): Promise<void> => {
-    const first = groups[0]?.[0];
-    if (!first) {
-      return;
-    }
-    const batchId = String(nextBatchId++);
-    pendingBatches.set(batchId, groups);
-
-    const keyboard = new InlineKeyboard()
-      .text("Одним тикетом", `inbox_batch:${batchId}:one`)
-      .row()
-      .text(`По отдельности (${groups.length})`, `inbox_batch:${batchId}:each`)
-      .row()
-      .text("Отмена", `inbox_batch:${batchId}:cancel`);
-
-    const text = `Переслано сообщений: ${groups.length}. Как их разобрать?`;
-    await sendTextMessage(bot.api, first.chatId, escapeHTML(text), {
-      messageThreadId: parseContextKey(first.contextKey).messageThreadId,
-      fallbackText: text,
-      replyMarkup: keyboard,
-    });
-  };
-
-  const inboxBuffer = new BurstBuffer<InboxItem>(INBOX_QUIET_MS, (items) => {
-    const groups = groupBurst(items);
-    const run = groups.length === 1 ? createTicket(groups[0]) : askHowToSplit(groups);
-    void run.catch((error) => {
-      console.error(
-        "Inbox burst failed:",
-        error instanceof Error ? error.message : String(error),
-      );
-    });
-  });
-
-  bot.callbackQuery(/^inbox_batch:(\d+):(one|each|cancel)$/, async (ctx) => {
-    const batchId = ctx.match?.[1];
-    const choice = ctx.match?.[2];
-    const groups = batchId ? pendingBatches.get(batchId) : undefined;
-    if (!groups) {
-      await ctx.answerCallbackQuery({ text: "Устарело, перешли сообщения заново" });
-      return;
-    }
-    pendingBatches.delete(batchId!);
-
-    if (choice === "cancel") {
-      await ctx.answerCallbackQuery({ text: "Отменено" });
-      await ctx.editMessageText("Отменено, тикеты не заводились.");
-      return;
-    }
-
-    await ctx.answerCallbackQuery({ text: "Завожу тикеты..." });
-    const batches = choice === "one" ? [groups.flat()] : groups;
-    await ctx.editMessageText(
-      choice === "one" ? "Завожу один тикет..." : `Завожу тикетов: ${batches.length}...`,
-    );
-    await createTicketsSequentially(batches);
-  });
-
-  bot.callbackQuery(/^ticket_dup:(\d+):(reuse|new)$/, async (ctx) => {
-    const decisionId = Number.parseInt(ctx.match?.[1] ?? "", 10);
-    const choice = ctx.match?.[2];
-    const pending = Number.isNaN(decisionId)
-      ? undefined
-      : pendingDuplicateDecisions.get(decisionId);
-    if (!pending || (choice !== "reuse" && choice !== "new")) {
-      await ctx.answerCallbackQuery({ text: "Выбор устарел, перешли сообщение заново" });
-      return;
-    }
-    pendingDuplicateDecisions.delete(decisionId);
-
-    await ctx.answerCallbackQuery({
-      text: choice === "reuse" ? "Продолжаю тикет..." : "Создаю новый тикет...",
-    });
-    try {
-      await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-    } catch {
-      // The decision message may already have lost its keyboard.
-    }
-    await createTicket(pending.group, {
-      skipDuplicateCheck: true,
-      ...(choice === "reuse"
-        ? { continueTicketId: pending.previousTicketId }
-        : { supersedesId: pending.previousTicketId }),
-    });
-  });
-
-  bot.callbackQuery(/^ticket_start:(\d+)$/, async (ctx) => {
-    const ticketId = Number.parseInt(ctx.match?.[1] ?? "", 10);
-    const ticket = Number.isNaN(ticketId) ? undefined : inbox.getTicket(ticketId);
-    if (!ticket) {
-      await ctx.answerCallbackQuery({ text: "Тикет не найден" });
-      return;
-    }
-    if (ticket.startedAt) {
-      await ctx.answerCallbackQuery({ text: "Разбор уже запускали" });
-      return;
-    }
-
-    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
-    if (!contextSession) {
-      return;
-    }
-    const { contextKey, session } = contextSession;
-    if (isBusy(contextKey)) {
-      await ctx.answerCallbackQuery({ text: "Дождись окончания текущего прогона" });
-      return;
-    }
-
-    await ctx.answerCallbackQuery({ text: "Запускаю разбор..." });
-    inbox.markStarted(ticket.id);
-    try {
-      await ctx.editMessageReplyMarkup({ reply_markup: ticketKeyboard(inbox.getTicket(ticket.id)!) });
-    } catch {
-      // The card may already have lost its keyboard; nothing to undo.
-    }
-    await handleUserPrompt(
-      ctx,
-      contextKey,
-      ctx.chat!.id,
-      session,
-      ticket.prompt,
-      undefined,
-      ticketPromptOptions(ticket.workTopicId),
-    );
-  });
-
-  bot.callbackQuery(/^jira_post:(\d+)$/, async (ctx) => {
-    const ticketId = Number.parseInt(ctx.match?.[1] ?? "", 10);
-    const ticket = Number.isNaN(ticketId) ? undefined : inbox.getTicket(ticketId);
-    const inboxContext = ticket ? parseContextKey(ticket.inboxContextKey) : undefined;
-    const callbackTopicId = ctx.callbackQuery.message?.message_thread_id;
-    if (
-      !ticket
-      || !inboxContext
-      || ctx.chat?.id !== inboxContext.chatId
-      || callbackTopicId !== ticket.workTopicId
-    ) {
-      await ctx.answerCallbackQuery({ text: "Тикет не найден" });
-      return;
-    }
-    if (!jiraComment || !canPostTicketToJira(ticket)) {
-      await ctx.answerCallbackQuery({ text: ticket.jiraCommentPostedAt ? "Уже отправлено" : "Jira не настроена" });
-      if (ticket.jiraCommentPostedAt) {
-        await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
-      }
-      return;
-    }
-    if (pendingJiraPosts.has(ticket.id)) {
-      await ctx.answerCallbackQuery({ text: "Отправка уже идёт" });
-      return;
-    }
-
-    pendingJiraPosts.add(ticket.id);
-    await ctx.answerCallbackQuery({ text: "Отправляю в Jira..." });
-    try {
-      const answer = await readTicketAnswer(config.workspace, ticket.id);
-      const url = topicUrl(inboxContext.chatId, ticket.workTopicId);
-      await jiraComment.postComment(ticket.externalKey!, buildJiraComment(answer, url));
-      inbox.markJiraCommentPosted(ticket.id);
-      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
-      const text = `✅ Комментарий отправлен в ${ticket.externalKey}.`;
-      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-    } catch (error) {
-      const text = `Не удалось отправить комментарий в Jira: ${friendlyErrorText(error)}`;
-      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
-    } finally {
-      pendingJiraPosts.delete(ticket.id);
-    }
-  });
-
-  bot.callbackQuery(/^ticket_done:(\d+)$/, async (ctx) => {
-    const ticketId = Number.parseInt(ctx.match?.[1] ?? "", 10);
-    const ticket = Number.isNaN(ticketId) ? undefined : inbox.getTicket(ticketId);
-    if (!ticket) {
-      await ctx.answerCallbackQuery({ text: "Тикет не найден" });
-      return;
-    }
-    if (!inbox.markResolved(ticket.id)) {
-      await ctx.answerCallbackQuery({ text: "Тикет уже отмечен решённым" });
-      return;
-    }
-
-    await ctx.answerCallbackQuery({ text: "Тикет решён" });
-    try {
-      await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-    } catch {
-      // The card may already have lost its keyboard; nothing to undo.
-    }
-
-    const inboxContext = parseContextKey(ticket.inboxContextKey);
-    const url = topicUrl(inboxContext.chatId, ticket.workTopicId);
-    const text = `✅ <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a> решён.`;
-    await sendTextMessage(bot.api, inboxContext.chatId, text, {
-      messageThreadId: inboxContext.messageThreadId,
-      fallbackText: `${ticketHeading(ticket)} решён: ${url}`,
-    });
-    await bot.api.closeForumTopic(inboxContext.chatId, ticket.workTopicId);
   });
 
   const recipeMutes = new RecipeMutes(RECIPE_MUTES_PATH);
@@ -3931,28 +3135,30 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     });
   });
 
-  // Runs before the session handlers: in an inbox topic a message is a ticket,
-  // not a prompt for the topic's own session.
-  bot.on("message", async (ctx, next) => {
-    const contextKey = contextKeyFromCtx(ctx);
-    const message = ctx.message;
-    if (!contextKey || !message || !inbox.get(contextKey)) {
-      return next();
-    }
-    if ((message.text ?? "").startsWith("/")) {
-      return next();
-    }
-
-    inboxBuffer.add(contextKey, {
-      contextKey,
-      chatId: ctx.chat.id,
-      messageId: message.message_id,
-      mediaGroupId: message.media_group_id,
-      hasAttachment: hasAttachment(message as unknown as Record<string, unknown>),
-      text: (message.text ?? message.caption ?? "").trim(),
-      message,
-    });
+  const inboxRuntime = registerInboxHandlers({
+    bot,
+    config,
+    registry,
+    inbox,
+    jiraComment,
+    topicActivity,
+    getContextSession,
+    isBusy,
+    handleTicketPrompt: (ctx, contextKey, chatId, session, ticket) =>
+      handleUserPrompt(
+        ctx,
+        contextKey,
+        chatId,
+        session,
+        ticket.prompt,
+        undefined,
+        ticketPromptOptions(ticket.workTopicId),
+      ),
+    topicIsAlive,
+    sendText: (chatId, text, options) => sendTextMessage(bot.api, chatId, text, options),
+    safeReply,
   });
+  bot.sentryBridge = inboxRuntime.sentryBridge;
 
   bot.on("message:text", async (ctx) => {
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });

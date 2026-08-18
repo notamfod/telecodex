@@ -28,7 +28,14 @@ import {
   renderDepsTable,
 } from "./deps.js";
 import type { DepRequirement, DepUpdate, Ecosystem } from "./deps.js";
-import { RECIPE_CONFIG_PATH, parseRecipes, type Recipe } from "./recipe-config.js";
+import { runJiraFilterRecipe } from "./jira-recipe.js";
+import {
+  RECIPE_CONFIG_PATH,
+  parseRecipes,
+  type Recipe,
+  type ReviewRecipe,
+} from "./recipe-config.js";
+import { sendRecipeMessage } from "./recipe-telegram.js";
 
 /**
  * Scheduled review recipes.
@@ -88,7 +95,7 @@ async function git(cwd: string, args: string[]): Promise<string> {
  * which is empty on a host that fetches sporadically, and silently yields an
  * empty range instead of an error.
  */
-async function firstBaseline(recipe: Recipe): Promise<string> {
+async function firstBaseline(recipe: ReviewRecipe): Promise<string> {
   const since = await git(recipe.cwd, [
     "rev-list",
     "-1",
@@ -99,7 +106,7 @@ async function firstBaseline(recipe: Recipe): Promise<string> {
   return sha || (await git(recipe.cwd, ["rev-parse", `${recipe.baseRef}~1`])).trim();
 }
 
-function runCodex(recipe: Recipe, prompt: string, outputFile: string): Promise<void> {
+function runCodex(recipe: ReviewRecipe, prompt: string, outputFile: string): Promise<void> {
   // The monorepo root is a folder of repositories, not a repository itself.
   const args = [
     "exec",
@@ -140,41 +147,13 @@ function runCodex(recipe: Recipe, prompt: string, outputFile: string): Promise<v
   });
 }
 
-async function sendMessage(
-  recipe: Recipe,
-  text: string,
-  replyMarkup?: Record<string, unknown>,
-): Promise<void> {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token || !recipe.deliver) {
-    throw new Error("delivery requested without a bot token or target topic");
-  }
-
-  const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: recipe.deliver.chatId,
-      message_thread_id: recipe.deliver.messageThreadId,
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      text,
-      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`sendMessage failed: ${response.status} ${await response.text()}`);
-  }
-}
-
 /**
  * One message per finding, each with its own buttons.
  *
  * A single message with twenty buttons cannot say which one was pressed once a
  * mute has to grey out just that finding.
  */
-async function deliverFindings(recipe: Recipe, runId: number, triage: Triage): Promise<void> {
+async function deliverFindings(recipe: ReviewRecipe, runId: number, triage: Triage): Promise<void> {
   const notes = [
     `${triage.fresh.length} ${triage.fresh.length === 1 ? "новая" : "новых"}`,
     triage.repeated.length > 0 ? `повторов: ${triage.repeated.length}` : "",
@@ -182,13 +161,13 @@ async function deliverFindings(recipe: Recipe, runId: number, triage: Triage): P
   ].filter(Boolean);
 
   const project = path.basename(recipe.cwd);
-  await sendMessage(
+  await sendRecipeMessage(
     recipe,
     `\u{1F50D} <b>${recipe.id}</b> \u00B7 ${project} \u00B7 ${notes.join(" \u00B7 ")}`,
   );
 
   for (const [index, finding] of triage.fresh.entries()) {
-    await sendMessage(recipe, renderFindingHTML(finding, project), {
+    await sendRecipeMessage(recipe, renderFindingHTML(finding, project), {
       inline_keyboard: [
         [
           { text: "\u{1F527} Тред-фикс", callback_data: `rfix:${runId}:${index}` },
@@ -211,7 +190,12 @@ function toPlainText(html: string): string {
 }
 
 /** During calibration the findings land here so false positives can be muted by hand. */
-async function writeShadow(recipe: Recipe, stamp: string, findings: Finding[], html: string): Promise<void> {
+async function writeShadow(
+  recipe: ReviewRecipe,
+  stamp: string,
+  findings: Finding[],
+  html: string,
+): Promise<void> {
   await mkdir(SHADOW_DIR, { recursive: true });
   const lines = [
     `## ${stamp}`,
@@ -315,7 +299,7 @@ async function collectRequirements(
   return [...unique.values()];
 }
 
-async function buildDepsTable(recipe: Recipe): Promise<string> {
+async function buildDepsTable(recipe: ReviewRecipe): Promise<string> {
   const requirements = await collectRequirements(recipe.cwd);
   console.log(`${recipe.id}: checking ${requirements.length} direct dependencies`);
 
@@ -374,6 +358,20 @@ async function main(): Promise<void> {
       `${recipe.id} delivers to Telegram but TELEGRAM_BOT_TOKEN is unset; ` +
         "run it through telecodex-recipe@.service, which loads .env",
     );
+  }
+
+  if (recipe.kind === "jira-filter") {
+    if (probe) {
+      throw new Error(`${recipe.id} has no commit range; --from does not apply`);
+    }
+    const result = await runJiraFilterRecipe(
+      recipe,
+      (html, replyMarkup) => sendRecipeMessage(recipe, html, replyMarkup),
+    );
+    console.log(
+      `${recipe.id}: ${result.total} total, ${result.delivered} new, ${result.repeated} repeated`,
+    );
+    return;
   }
 
   const stamp = new Date().toISOString();

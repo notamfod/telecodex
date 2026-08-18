@@ -42,6 +42,39 @@ describe("parseRecipes", () => {
     });
   });
 
+  it("parses a Jira filter recipe without review-only fields", () => {
+    const configured = {
+      recipes: [
+        {
+          id: "hourly-jira-new-issues",
+          kind: "jira-filter",
+          cwd: "/root/dev/Projects/mircli",
+          jiraClient: "/root/.local/share/jira-mcp/.venv/bin/jira-client",
+          filterId: "11525",
+          deliver: { chatId: -1003981282865, messageThreadId: 999 },
+        },
+      ],
+    };
+
+    expect(parseRecipes(JSON.stringify(configured))).toEqual(configured.recipes);
+  });
+
+  it("requires a delivery target for a Jira filter recipe", () => {
+    const configured = {
+      recipes: [
+        {
+          id: "hourly-jira-new-issues",
+          kind: "jira-filter",
+          cwd: "/root/dev/Projects/mircli",
+          jiraClient: "jira-client",
+          filterId: "11525",
+        },
+      ],
+    };
+
+    expect(() => parseRecipes(JSON.stringify(configured))).toThrow(/deliver/i);
+  });
+
   it("refuses a recipe that is missing what the runner needs", () => {
     expect(() => parseRecipes(JSON.stringify({ recipes: [{ id: "daily" }] }))).toThrow(/cwd/);
   });

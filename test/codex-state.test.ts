@@ -6,6 +6,7 @@ type ThreadFixture = {
   title: string;
   cwd: string;
   model: string | null;
+  model_provider?: string | null;
   created_at: number;
   updated_at: number;
   first_user_message: string;
@@ -112,9 +113,15 @@ function runAllQuery(sql: string, threads: ThreadFixture[], args: unknown[]) {
   }
 
   if (sql.includes("FROM threads")) {
-    const limit = typeof args[0] === "number" ? args[0] : 20;
+    const recentSince = sql.includes("updated_at >= ?") && typeof args[0] === "number"
+      ? args[0]
+      : undefined;
+    const limitArgument = recentSince === undefined ? args[0] : args[1];
+    const limit = typeof limitArgument === "number" ? limitArgument : 20;
     return threads
       .filter((thread) => thread.archived !== 1)
+      .filter((thread) => recentSince === undefined || thread.updated_at >= recentSince)
+      .filter((thread) => !sql.includes("source NOT LIKE") || !thread.source?.includes('"subagent"'))
       .filter((thread) => !sql.includes("source = 'vscode'") || thread.source === "vscode")
       .filter((thread) => !sql.includes("preview <> ''") || Boolean(thread.preview))
       .sort((left, right) => right.updated_at - left.updated_at)
@@ -172,6 +179,7 @@ describe("codex-state", () => {
           title: "Newest",
           cwd: "/workspace/b",
           model: "gpt-5.4",
+          model_provider: "openai",
           created_at: 1_700_000_000,
           updated_at: 1_700_000_200,
           first_user_message: "hello",
@@ -204,6 +212,7 @@ describe("codex-state", () => {
         title: "Newest",
         cwd: "/workspace/b",
         model: "gpt-5.4",
+        modelProvider: "openai",
         createdAt: new Date(1_700_000_000 * 1000),
         updatedAt: new Date(1_700_000_200 * 1000),
         firstUserMessage: "hello",
@@ -213,6 +222,7 @@ describe("codex-state", () => {
         title: "Older",
         cwd: "/workspace/a",
         model: null,
+        modelProvider: null,
         createdAt: new Date(1_700_000_000 * 1000),
         updatedAt: new Date(1_700_000_100 * 1000),
         firstUserMessage: "older",
@@ -277,10 +287,75 @@ describe("codex-state", () => {
         title: "Visible chat",
         cwd: "/workspace",
         model: "gpt-5.6-sol",
+        modelProvider: null,
         createdAt: new Date(10_000),
         updatedAt: new Date(40_000),
         firstUserMessage: "visible",
       },
+    ]);
+  });
+
+  it("listRecentRootThreads returns recent roots from every user-facing source", async () => {
+    const state = await loadCodexState({
+      files: ["state_main.sqlite"],
+      threads: [
+        {
+          id: "vscode-root",
+          title: "Editor task",
+          cwd: "/workspace/editor",
+          model: "gpt-5.6-sol",
+          created_at: 10,
+          updated_at: 90,
+          first_user_message: "editor",
+          source: "vscode",
+        },
+        {
+          id: "cli-root",
+          title: "CLI task",
+          cwd: "/workspace/cli",
+          model: "gpt-5.6-sol",
+          created_at: 10,
+          updated_at: 80,
+          first_user_message: "cli",
+          source: "exec",
+        },
+        {
+          id: "telegram-root",
+          title: "Telegram task",
+          cwd: "/workspace/telegram",
+          model: "gpt-5.6-sol",
+          created_at: 10,
+          updated_at: 70,
+          first_user_message: "telegram",
+          source: '{"custom":"telecodex"}',
+        },
+        {
+          id: "subagent",
+          title: "Review",
+          cwd: "/workspace/editor",
+          model: "gpt-5.6-sol",
+          created_at: 10,
+          updated_at: 95,
+          first_user_message: "review",
+          source: '{"subagent":{"thread_spawn":{}}}',
+        },
+        {
+          id: "old-root",
+          title: "Old task",
+          cwd: "/workspace/old",
+          model: "gpt-5.6-sol",
+          created_at: 10,
+          updated_at: 40,
+          first_user_message: "old",
+          source: "vscode",
+        },
+      ],
+    });
+
+    expect(state.listRecentRootThreads(new Date(50_000), 10)).toEqual([
+      expect.objectContaining({ id: "vscode-root", source: "vscode" }),
+      expect.objectContaining({ id: "cli-root", source: "cli" }),
+      expect.objectContaining({ id: "telegram-root", source: "телеграм" }),
     ]);
   });
 
@@ -360,6 +435,31 @@ describe("codex-state", () => {
     const state = await loadCodexState({ files: ["state_main.sqlite"], threads: [] });
 
     expect(state.getThread("missing")).toBeNull();
+  });
+
+  it("maps the model provider stored by Codex", async () => {
+    const state = await loadCodexState({
+      files: ["state_main.sqlite"],
+      threads: [
+        {
+          id: "thread-glm",
+          title: "GLM task",
+          cwd: "/workspace",
+          model: "glm-5.3",
+          model_provider: "zai",
+          created_at: 10,
+          updated_at: 20,
+          first_user_message: "hello",
+        },
+      ],
+    });
+
+    expect(state.getThread("thread-glm")).toEqual(
+      expect.objectContaining({
+        model: "glm-5.3",
+        modelProvider: "zai",
+      }),
+    );
   });
 
   it("returns empty results gracefully when opening the database fails", async () => {

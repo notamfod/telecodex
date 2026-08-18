@@ -19,6 +19,17 @@
       "kind": "deps",
       "cwd": "/srv/projects/example",
       "promptFile": "recipes/dependency-review.md"
+    },
+    {
+      "id": "hourly-jira-new-issues",
+      "kind": "jira-filter",
+      "cwd": "/srv/projects/example",
+      "jiraClient": "/opt/jira-mcp/.venv/bin/jira-client",
+      "filterId": "11525",
+      "deliver": {
+        "chatId": -1001111111111,
+        "messageThreadId": 42
+      }
     }
   ]
 }

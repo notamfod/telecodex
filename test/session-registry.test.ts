@@ -34,6 +34,9 @@ const mockSessionState = vi.hoisted(() => {
       threadId: string | null;
       workspace: string;
       model?: string;
+      modelProvider?: string;
+      modelChoiceId?: string;
+      nextModelChoiceId?: string;
       reasoningEffort?: string;
       launchProfileId: string;
       launchProfileLabel: string;
@@ -103,6 +106,8 @@ describe("SessionRegistry", () => {
     maxFileSize: 20 * 1024 * 1024,
     codexApiKey: "codex-key",
     codexModel: "o3",
+    modelChoices: [],
+    defaultModelChoiceId: undefined,
     codexSandboxMode: "workspace-write",
     codexApprovalPolicy: "never",
     launchProfiles: [
@@ -129,6 +134,9 @@ describe("SessionRegistry", () => {
     threadId: string | null;
     workspace: string;
     model?: string;
+    modelProvider?: string;
+    modelChoiceId?: string;
+    nextModelChoiceId?: string;
     reasoningEffort?: string;
     launchProfileId: string;
     launchProfileLabel: string;
@@ -156,6 +164,8 @@ describe("SessionRegistry", () => {
     mockSessionState.create.mockImplementation(async (config: TeleCodexConfig, options?: {
       workspace?: string;
       model?: string;
+      modelProvider?: string;
+      modelChoiceId?: string;
       reasoningEffort?: string;
       launchProfileId?: string;
       resumeThreadId?: string;
@@ -164,6 +174,8 @@ describe("SessionRegistry", () => {
         threadId: options?.resumeThreadId ?? null,
         workspace: options?.workspace ?? config.workspace,
         model: options?.model ?? config.codexModel,
+        modelProvider: options?.modelProvider,
+        modelChoiceId: options?.modelChoiceId,
         reasoningEffort: options?.reasoningEffort,
         launchProfileId: options?.launchProfileId ?? config.defaultLaunchProfileId,
         launchProfileLabel: options?.launchProfileId === "readonly" ? "Read Only" : "Default",
@@ -252,6 +264,7 @@ describe("SessionRegistry", () => {
       title: "Visible chat",
       cwd: "/workspace/project",
       model: "gpt-5.6-sol",
+      modelProvider: "zai",
       createdAt: new Date(10_000),
       updatedAt: new Date(20_000),
       firstUserMessage: "Visible chat",
@@ -267,6 +280,7 @@ describe("SessionRegistry", () => {
         threadId: "thread-visible",
         workspace: "/workspace/project",
         model: "gpt-5.6-sol",
+        modelProvider: "zai",
         launchProfileId: "default",
         updatedAt: 20_000,
       },
@@ -333,6 +347,8 @@ describe("SessionRegistry", () => {
     expect(mockSessionState.create).toHaveBeenNthCalledWith(1, createConfig(), {
       workspace: "/workspace/a",
       model: "o4-mini",
+      modelProvider: "openai",
+      modelChoiceId: undefined,
       reasoningEffort: "low",
       launchProfileId: "readonly",
       resumeThreadId: "thread-a",
@@ -340,6 +356,8 @@ describe("SessionRegistry", () => {
     expect(mockSessionState.create).toHaveBeenNthCalledWith(2, createConfig(), {
       workspace: "/workspace/b",
       model: "gpt-5.4",
+      modelProvider: "openai",
+      modelChoiceId: undefined,
       reasoningEffort: "high",
       launchProfileId: "default",
       resumeThreadId: "thread-b",
@@ -348,6 +366,8 @@ describe("SessionRegistry", () => {
       threadId: "thread-a",
       workspace: "/workspace/a",
       model: "o4-mini",
+      modelProvider: "openai",
+      modelChoiceId: undefined,
       reasoningEffort: "low",
       launchProfileId: "readonly",
       launchProfileLabel: "Read Only",
@@ -360,6 +380,8 @@ describe("SessionRegistry", () => {
       threadId: "thread-b",
       workspace: "/workspace/b",
       model: "gpt-5.4",
+      modelProvider: "openai",
+      modelChoiceId: undefined,
       reasoningEffort: "high",
       launchProfileId: "default",
       launchProfileLabel: "Default",
@@ -368,6 +390,58 @@ describe("SessionRegistry", () => {
       approvalPolicy: "never",
       unsafeLaunch: false,
     });
+  });
+
+  it("persists provider and the next selected model choice", async () => {
+    const registry = new SessionRegistry(createConfig());
+    const session = (await registry.getOrCreate("123:42")) as any;
+
+    session.setInfo({
+      threadId: "thread-glm",
+      workspace: "/workspace/glm",
+      model: "glm-5.3",
+      modelProvider: "zai",
+      modelChoiceId: "glm-53",
+      nextModelChoiceId: "openai-default",
+    });
+    registry.updateMetadata("123:42", session);
+
+    expect(registry.listContexts()[0]).toEqual(
+      expect.objectContaining({
+        model: "glm-5.3",
+        modelProvider: "zai",
+        modelChoiceId: "openai-default",
+      }),
+    );
+  });
+
+  it("loads old metadata without rewriting it and supplies an OpenAI resume hint", async () => {
+    const persistPath = path.join("/workspace/base", ".telecodex", "contexts.json");
+    const original = JSON.stringify([
+      {
+        contextKey: "123:42",
+        threadId: "old-thread",
+        workspace: "/workspace",
+        model: "gpt-5.6-sol",
+        updatedAt: 1,
+      },
+    ]);
+    mockFsState.files.set(persistPath, original);
+
+    const registry = new SessionRegistry(createConfig());
+    expect(mockFsState.files.get(persistPath)).toBe(original);
+
+    await registry.getOrCreate("123:42");
+
+    expect(mockSessionState.create).toHaveBeenCalledWith(
+      createConfig(),
+      expect.objectContaining({
+        model: "gpt-5.6-sol",
+        modelProvider: "openai",
+        resumeThreadId: "old-thread",
+      }),
+      mockSessionState.dependencies,
+    );
   });
 
   it("falls back to the default launch profile when persisted metadata references a missing profile", async () => {

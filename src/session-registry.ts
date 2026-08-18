@@ -16,8 +16,11 @@ export interface ContextMetadata {
   threadId: string | null;
   workspace: string;
   model?: string;
+  modelProvider?: string;
+  modelChoiceId?: string;
   reasoningEffort?: string;
   launchProfileId?: string;
+  topicName?: string;
   updatedAt: number;
 }
 
@@ -53,11 +56,15 @@ export class SessionRegistry {
 
     const meta = this.metadata.get(contextKey);
     const launchProfileId = resolveLaunchProfileId(this.config, meta);
+    const modelProvider = meta?.modelProvider ?? (meta?.model ? "openai" : undefined);
     const creation = CodexSessionService.create(this.config, {
       workspace: meta?.workspace,
       model: meta?.model,
+      modelProvider,
+      modelChoiceId: meta?.modelChoiceId,
       reasoningEffort: meta?.reasoningEffort,
       launchProfileId,
+      topicName: meta?.topicName,
       deferThreadStart: options?.deferThreadStart && !meta?.threadId,
       resumeThreadId: meta?.threadId ?? undefined,
     }, this.sessionDependencies);
@@ -96,11 +103,18 @@ export class SessionRegistry {
       threadId: info.threadId,
       workspace: info.workspace,
       model: info.model,
+      modelProvider: info.modelProvider,
+      modelChoiceId: info.nextModelChoiceId ?? info.modelChoiceId,
       reasoningEffort: info.reasoningEffort,
       launchProfileId: info.nextLaunchProfileId ?? info.launchProfileId,
       updatedAt: Date.now(),
     });
     this.persistMetadata();
+  }
+
+  /** The shared app-server connection, for callers that ask it about threads we did not start. */
+  getAppServerClient(): CodexSessionDependencies["client"] {
+    return this.sessionDependencies.client;
   }
 
   listContexts(): ContextMetadata[] {
@@ -126,13 +140,14 @@ export class SessionRegistry {
    */
   setContextDefaults(
     contextKey: TelegramContextKey,
-    defaults: { workspace: string; launchProfileId?: string },
+    defaults: { workspace: string; launchProfileId?: string; topicName?: string },
   ): void {
     this.metadata.set(contextKey, {
       contextKey,
       threadId: null,
       workspace: defaults.workspace,
       launchProfileId: defaults.launchProfileId,
+      topicName: defaults.topicName,
       updatedAt: Date.now(),
     });
     this.persistMetadata();
@@ -144,6 +159,11 @@ export class SessionRegistry {
       threadId: thread.id,
       workspace: thread.cwd,
       model: thread.model ?? undefined,
+      modelProvider: thread.modelProvider ?? "openai",
+      modelChoiceId: this.config.modelChoices.find(
+        (choice) =>
+          choice.model === thread.model && choice.provider === (thread.modelProvider ?? "openai"),
+      )?.id,
       launchProfileId: this.config.defaultLaunchProfileId,
       updatedAt: thread.updatedAt.getTime(),
     });

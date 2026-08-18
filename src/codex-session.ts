@@ -10,6 +10,11 @@ import {
 } from "./app-server-turn-manager.js";
 import type { TeleCodexConfig } from "./config.js";
 import {
+  findModelChoice,
+  resolveDefaultModelChoice,
+  type CodexModelChoice,
+} from "./codex-model.js";
+import {
   getThread,
   listModels,
   listThreads,
@@ -33,6 +38,15 @@ export interface CodexSessionInfo {
   threadId: string | null;
   workspace: string;
   model?: string;
+  modelProvider?: string;
+  modelChoiceId?: string;
+  modelLabel?: string;
+  supportsImages?: boolean;
+  nextModel?: string;
+  nextModelProvider?: string;
+  nextModelChoiceId?: string;
+  nextModelLabel?: string;
+  nextSupportsImages?: boolean;
   reasoningEffort?: string;
   launchProfileId: string;
   launchProfileLabel: string;
@@ -50,10 +64,14 @@ export interface CodexSessionInfo {
 export interface CreateOptions {
   workspace?: string;
   model?: string;
+  modelProvider?: string;
+  modelChoiceId?: string;
   reasoningEffort?: string;
   launchProfileId?: string;
   deferThreadStart?: boolean;
   resumeThreadId?: string;
+  /** Name of the Telegram topic this session belongs to, given to Codex as the thread title. */
+  topicName?: string;
 }
 
 export interface CodexSessionDependencies {
@@ -77,6 +95,7 @@ interface ThreadResponse {
   thread: { id: string; status: { type: "notLoaded" | "idle" | "systemError" | "active" } };
   cwd?: string;
   model?: string;
+  modelProvider?: string;
   approvalPolicy?: CodexApprovalPolicy;
   sandbox?: { type?: string };
   reasoningEffort?: CodexReasoningEffort | null;
@@ -85,7 +104,11 @@ interface ThreadResponse {
 export class CodexSessionService {
   private currentWorkspace: string;
   private currentThreadId: string | null = null;
+  private topicName: string | undefined;
   private currentModel: string | undefined;
+  private currentModelProvider = "openai";
+  private activeModelChoice: CodexModelChoice | null = null;
+  private selectedModelChoice: CodexModelChoice | undefined;
   private currentReasoningEffort: CodexReasoningEffort | undefined;
   private currentLaunchProfile: CodexLaunchProfile;
   private activeThreadLaunchProfile: CodexLaunchProfile | null = null;
@@ -99,6 +122,11 @@ export class CodexSessionService {
   ) {
     this.currentWorkspace = config.workspace;
     this.currentLaunchProfile = getLaunchProfile(config, config.defaultLaunchProfileId);
+    this.selectedModelChoice = resolveDefaultModelChoice(
+      config.modelChoices,
+      config.defaultModelChoiceId,
+      config.codexModel,
+    );
   }
 
   static async create(
@@ -111,8 +139,19 @@ export class CodexSessionService {
       dependencies ?? createCodexSessionDependencies(config.telegramMaxActiveTopics),
     );
     service.currentWorkspace = options?.workspace ?? config.workspace;
-    service.currentModel = options?.model ?? config.codexModel;
+    if (options?.modelChoiceId) {
+      service.selectedModelChoice = service.requireModelChoice(options.modelChoiceId);
+    }
+    service.currentModel = options?.model ?? service.selectedModelChoice?.model ?? config.codexModel;
+    service.currentModelProvider = options?.modelProvider ?? "openai";
+    if (options?.resumeThreadId && service.currentModel) {
+      service.activeModelChoice = service.choiceFromPair(
+        service.currentModel,
+        service.currentModelProvider,
+      );
+    }
     service.currentReasoningEffort = options?.reasoningEffort as CodexReasoningEffort | undefined;
+    service.topicName = options?.topicName;
     service.currentLaunchProfile = getLaunchProfile(
       config,
       options?.launchProfileId ?? config.defaultLaunchProfileId,
@@ -121,17 +160,20 @@ export class CodexSessionService {
     if (options?.resumeThreadId) {
       await service.resumeThread(options.resumeThreadId);
     } else if (!options?.deferThreadStart) {
-      await service.newThread(service.currentWorkspace, service.currentModel);
+      await service.newThread(service.currentWorkspace);
     }
     return service;
   }
 
   getInfo(): CodexSessionInfo {
     const effectiveProfile = this.activeThreadLaunchProfile ?? this.currentLaunchProfile;
+    const activeChoice = this.activeModelChoice;
+    const reportedChoice = activeChoice ?? this.selectedModelChoice;
     const info: CodexSessionInfo = {
       threadId: this.currentThreadId,
       workspace: this.currentWorkspace,
-      model: this.currentModel ?? this.config.codexModel,
+      model: reportedChoice?.model ?? this.currentModel,
+      modelProvider: reportedChoice?.provider ?? this.currentModelProvider,
       launchProfileId: effectiveProfile.id,
       launchProfileLabel: effectiveProfile.label,
       launchProfileBehavior: formatLaunchProfileBehavior(effectiveProfile),
@@ -139,6 +181,23 @@ export class CodexSessionService {
       approvalPolicy: effectiveProfile.approvalPolicy,
       unsafeLaunch: effectiveProfile.unsafe,
     };
+    if (reportedChoice) {
+      info.modelChoiceId = reportedChoice.id;
+      info.modelLabel = reportedChoice.label;
+      info.supportsImages = reportedChoice.supportsImages;
+    }
+    if (
+      activeChoice &&
+      this.selectedModelChoice &&
+      (activeChoice.model !== this.selectedModelChoice.model ||
+        activeChoice.provider !== this.selectedModelChoice.provider)
+    ) {
+      info.nextModel = this.selectedModelChoice.model;
+      info.nextModelProvider = this.selectedModelChoice.provider;
+      info.nextModelChoiceId = this.selectedModelChoice.id;
+      info.nextModelLabel = this.selectedModelChoice.label;
+      info.nextSupportsImages = this.selectedModelChoice.supportsImages;
+    }
     if (this.currentReasoningEffort) info.reasoningEffort = this.currentReasoningEffort;
     if (this.activeThreadLaunchProfile && this.activeThreadLaunchProfile.id !== this.currentLaunchProfile.id) {
       info.nextLaunchProfileId = this.currentLaunchProfile.id;
@@ -189,7 +248,7 @@ export class CodexSessionService {
         threadId: this.currentThreadId,
         input: buildAppServerInput(input),
         cwd: this.currentWorkspace,
-        model: this.currentModel,
+        model: this.activeModelChoice?.model ?? this.currentModel,
         reasoningEffort: this.currentReasoningEffort,
         approvalPolicy: profile.approvalPolicy,
         sandbox: profile.sandboxMode,
@@ -217,7 +276,7 @@ export class CodexSessionService {
         threadId: this.currentThreadId,
         input: [],
         cwd: this.currentWorkspace,
-        model: this.currentModel,
+        model: this.activeModelChoice?.model ?? this.currentModel,
         reasoningEffort: this.currentReasoningEffort,
         approvalPolicy: profile.approvalPolicy,
         sandbox: profile.sandboxMode,
@@ -235,22 +294,34 @@ export class CodexSessionService {
     }
   }
 
-  async newThread(workspace?: string, model?: string): Promise<CodexSessionInfo> {
+  async newThread(workspace?: string, modelChoiceId?: string): Promise<CodexSessionInfo> {
     this.ensureIdle("start a new thread");
     const effectiveWorkspace = workspace ?? this.currentWorkspace;
-    const effectiveModel = model ?? this.currentModel;
+    const choice = this.resolveSelectedModelChoice(modelChoiceId);
+    const effectiveModel = choice?.model ?? this.currentModel;
+    const modelProvider = choice?.provider ?? "openai";
+    const threadConfig = {
+      ...(this.currentReasoningEffort
+        ? { model_reasoning_effort: this.currentReasoningEffort }
+        : {}),
+      ...(choice?.webSearch ? { web_search: choice.webSearch } : {}),
+    };
     await this.dependencies.client.connect();
     const response = await this.dependencies.client.request<ThreadResponse>("thread/start", {
       cwd: effectiveWorkspace,
       model: effectiveModel,
+      modelProvider,
       approvalPolicy: this.currentLaunchProfile.approvalPolicy,
       sandbox: this.currentLaunchProfile.sandboxMode,
       serviceName: "telecodex",
-      ...(this.currentReasoningEffort ? { config: { model_reasoning_effort: this.currentReasoningEffort } } : {}),
+      ...(Object.keys(threadConfig).length ? { config: threadConfig } : {}),
     });
     this.currentWorkspace = effectiveWorkspace;
-    if (model) this.currentModel = model;
-    this.applyThreadResponse(response, this.currentLaunchProfile);
+    this.currentModel = effectiveModel;
+    this.currentModelProvider = modelProvider;
+    if (choice) this.selectedModelChoice = choice;
+    this.applyThreadResponse(response, this.currentLaunchProfile, choice);
+    await this.nameThread(response.thread.id);
     return this.getInfo();
   }
 
@@ -268,7 +339,14 @@ export class CodexSessionService {
     this.ensureIdle("switch session");
     const record = getThread(threadId);
     if (record?.cwd) this.currentWorkspace = record.cwd;
-    if (record?.model) this.currentModel = record.model;
+    if (record?.model) {
+      this.currentModel = record.model;
+      this.currentModelProvider = record.modelProvider ?? "openai";
+      this.activeModelChoice = this.choiceFromPair(
+        record.model,
+        this.currentModelProvider,
+      );
+    }
     return this.resumeThread(threadId);
   }
 
@@ -284,8 +362,34 @@ export class CodexSessionService {
     return listModels();
   }
 
+  listModelChoices(): CodexModelChoice[] {
+    if (this.config.modelChoices.length) {
+      return [...this.config.modelChoices];
+    }
+    return listModels().map((model) => ({
+      id: model.slug,
+      label: model.displayName,
+      provider: "openai",
+      model: model.slug,
+      supportsImages: true,
+    }));
+  }
+
+  getModelChoice(choiceId: string): CodexModelChoice | undefined {
+    return findModelChoice(this.listModelChoices(), choiceId);
+  }
+
+  setModelChoice(choiceId: string): CodexModelChoice {
+    const choice = this.requireModelChoice(choiceId);
+    this.selectedModelChoice = choice;
+    return choice;
+  }
+
   setModel(slug: string): string {
-    this.currentModel = slug;
+    const choice = this.listModelChoices().find(
+      (candidate) => candidate.id === slug || candidate.model === slug,
+    ) ?? createLegacyChoice(slug, "openai");
+    this.selectedModelChoice = choice;
     return slug;
   }
 
@@ -306,6 +410,7 @@ export class CodexSessionService {
     const info = { threadId: this.currentThreadId, workspace: this.currentWorkspace };
     void this.abort();
     this.currentThreadId = null;
+    this.activeModelChoice = null;
     this.activeThreadLaunchProfile = null;
     return info;
   }
@@ -313,14 +418,47 @@ export class CodexSessionService {
   dispose(): void {
     void this.abort();
     this.currentThreadId = null;
+    this.activeModelChoice = null;
     this.activeThreadLaunchProfile = null;
   }
 
-  private applyThreadResponse(response: ThreadResponse, baseProfile: CodexLaunchProfile): void {
+  /**
+   * Gives Codex the name the Telegram topic already carries.
+   *
+   * Without this a thread opened from an inbox ticket is titled with the whole
+   * forwarded message, so the topic list and `codex resume` disagree about what
+   * the same conversation is called.
+   */
+  private async nameThread(threadId: string): Promise<void> {
+    if (!this.topicName) return;
+    try {
+      await this.dependencies.client.request("thread/name/set", {
+        threadId,
+        name: this.topicName,
+      });
+    } catch (error) {
+      // A nameless thread still works, so this never fails a turn.
+      console.error("Failed to name Codex thread:", error);
+    }
+  }
+
+  private applyThreadResponse(
+    response: ThreadResponse,
+    baseProfile: CodexLaunchProfile,
+    fallbackChoice: CodexModelChoice | null = this.activeModelChoice,
+  ): void {
     this.currentThreadId = response.thread.id;
     this.dependencies.turnManager.trackThread?.(response.thread.id, response.thread.status.type);
     if (response.cwd) this.currentWorkspace = response.cwd;
     if (response.model) this.currentModel = response.model;
+    if (response.modelProvider) this.currentModelProvider = response.modelProvider;
+    const effectiveModel = response.model ?? fallbackChoice?.model ?? this.currentModel;
+    const effectiveProvider =
+      response.modelProvider ?? fallbackChoice?.provider ?? this.currentModelProvider ?? "openai";
+    if (effectiveModel) {
+      this.currentModelProvider = effectiveProvider;
+      this.activeModelChoice = this.choiceFromPair(effectiveModel, effectiveProvider, fallbackChoice);
+    }
     if (response.reasoningEffort) this.currentReasoningEffort = response.reasoningEffort;
     this.activeThreadLaunchProfile = profileFromResponse(baseProfile, response);
   }
@@ -340,6 +478,35 @@ export class CodexSessionService {
   private ensureIdle(action: string): void {
     if (this.processing) throw new Error(`Cannot ${action} while a turn is in progress`);
   }
+
+  private resolveSelectedModelChoice(choiceId: string | undefined): CodexModelChoice | undefined {
+    if (choiceId) {
+      return this.requireModelChoice(choiceId);
+    }
+    if (this.selectedModelChoice) {
+      return this.selectedModelChoice;
+    }
+    return this.currentModel ? createLegacyChoice(this.currentModel, "openai") : undefined;
+  }
+
+  private requireModelChoice(choiceId: string): CodexModelChoice {
+    const choice = this.getModelChoice(choiceId);
+    if (!choice) throw new Error(`Unknown model choice: ${choiceId}`);
+    return choice;
+  }
+
+  private choiceFromPair(
+    model: string,
+    provider: string,
+    fallback?: CodexModelChoice | null,
+  ): CodexModelChoice {
+    const configured = this.listModelChoices().find(
+      (choice) => choice.model === model && choice.provider === provider,
+    );
+    if (configured) return configured;
+    if (fallback && fallback.model === model && fallback.provider === provider) return fallback;
+    return createLegacyChoice(model, provider);
+  }
 }
 
 export function createCodexSessionDependencies(maxActiveTopics = 4): CodexSessionDependencies {
@@ -356,12 +523,24 @@ function getLaunchProfile(config: TeleCodexConfig, profileId: string): CodexLaun
   return profile;
 }
 
+function createLegacyChoice(model: string, provider: string): CodexModelChoice {
+  return {
+    id: model,
+    label: model,
+    provider,
+    model,
+    supportsImages: provider === "openai",
+  };
+}
+
 function buildAppServerInput(input: CodexPromptInput): AppServerUserInput[] {
   if (typeof input === "string") {
     return [{ type: "text", text: input, text_elements: [] }];
   }
   const result: AppServerUserInput[] = [];
-  const text = [input.stagedFileInstructions, input.text].filter(Boolean).join("\n\n");
+  // The user's text leads: Codex titles the thread with the first message,
+  // and boilerplate at the front made every thread carry the same title.
+  const text = [input.text, input.stagedFileInstructions].filter(Boolean).join("\n\n");
   if (text) result.push({ type: "text", text, text_elements: [] });
   for (const imagePath of input.imagePaths ?? []) {
     result.push({ type: "localImage", path: imagePath });

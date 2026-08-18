@@ -2,19 +2,30 @@
  * Which reviews run, where, and where their findings go. Deployment-specific, so
  * it lives in a file rather than in the code: see recipes/recipes.example.json.
  */
-export interface Recipe {
+interface RecipeBase {
   id: string;
+  cwd: string;
+  deliver?: { chatId: number; messageThreadId: number };
+}
+
+export interface ReviewRecipe extends RecipeBase {
   /** "diff" reviews new commits; "deps" reviews outdated dependencies. */
   kind?: "diff" | "deps";
-  cwd: string;
   baseRef: string;
   promptFile: string;
   /** Pathspec limiting the diff; empty means the whole tree. */
   paths: string[];
   model?: string;
-  /** Absent means shadow mode: findings go to a file, nothing reaches Telegram. */
-  deliver?: { chatId: number; messageThreadId: number };
 }
+
+export interface JiraFilterRecipe extends RecipeBase {
+  kind: "jira-filter";
+  jiraClient: string;
+  filterId: string;
+  deliver: { chatId: number; messageThreadId: number };
+}
+
+export type Recipe = ReviewRecipe | JiraFilterRecipe;
 
 export const RECIPE_CONFIG_PATH = "recipes/recipes.json";
 
@@ -52,12 +63,27 @@ function parseRecipe(value: unknown, index: number): Recipe {
 
   const id = requireString(entry.id, "id", where);
   const cwd = requireString(entry.cwd, "cwd", where);
-  const promptFile = requireString(entry.promptFile, "promptFile", where);
 
   const kind = entry.kind;
-  if (kind !== undefined && kind !== "diff" && kind !== "deps") {
+  if (kind !== undefined && kind !== "diff" && kind !== "deps" && kind !== "jira-filter") {
     throw new Error(`Invalid recipes config: ${where} has an unknown kind "${String(kind)}"`);
   }
+
+  if (kind === "jira-filter") {
+    if (entry.deliver === undefined) {
+      throw new Error(`Invalid recipes config: ${where} needs a deliver target`);
+    }
+    return {
+      id,
+      kind,
+      cwd,
+      jiraClient: requireString(entry.jiraClient, "jiraClient", where),
+      filterId: requireString(entry.filterId, "filterId", where),
+      deliver: parseDeliver(entry.deliver, where),
+    };
+  }
+
+  const promptFile = requireString(entry.promptFile, "promptFile", where);
 
   const paths = entry.paths ?? [];
   if (!Array.isArray(paths) || paths.some((path) => typeof path !== "string")) {

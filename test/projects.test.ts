@@ -1,9 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { CodexThreadRecord } from "../src/codex-state.js";
 import type { ContextMetadata } from "../src/session-registry.js";
 import {
   findBoundTopic,
+  findLiveBoundTopic,
+  isMissingForumTopicError,
+  probeForumTopic,
+  ensureThreadTopic,
   groupThreadsByProject,
   projectButtons,
   renderProjectHTML,
@@ -158,6 +162,111 @@ describe("findBoundTopic", () => {
     );
 
     expect(topic).toBeUndefined();
+  });
+});
+
+describe("ensureThreadTopic", () => {
+  const FORUM_CHAT_ID = -1001234567890;
+
+  it("returns an existing live topic without creating another one", async () => {
+    const contexts: ContextMetadata[] = [{
+      contextKey: `${FORUM_CHAT_ID}:154`,
+      threadId: thread().id,
+      workspace: thread().cwd,
+      updatedAt: 1_000,
+    }];
+    const createForumTopic = vi.fn();
+
+    const result = await ensureThreadTopic(thread(), {
+      chatId: FORUM_CHAT_ID,
+      contexts,
+      topicIsAlive: vi.fn().mockResolvedValue(true),
+      createForumTopic,
+      bindThread: vi.fn(),
+      sendWelcome: vi.fn(),
+    });
+
+    expect(result).toEqual(expect.objectContaining({ created: false, messageThreadId: 154 }));
+    expect(createForumTopic).not.toHaveBeenCalled();
+  });
+
+  it("creates, binds and welcomes a thread whose topic is missing", async () => {
+    const bindThread = vi.fn();
+    const sendWelcome = vi.fn();
+
+    const result = await ensureThreadTopic(thread(), {
+      chatId: FORUM_CHAT_ID,
+      contexts: [],
+      topicIsAlive: vi.fn(),
+      createForumTopic: vi.fn().mockResolvedValue({ message_thread_id: 91 }),
+      bindThread,
+      sendWelcome,
+    });
+
+    expect(result).toEqual(expect.objectContaining({ created: true, messageThreadId: 91 }));
+    expect(bindThread).toHaveBeenCalledWith(`${FORUM_CHAT_ID}:91`, thread());
+    expect(sendWelcome).toHaveBeenCalledWith(91, expect.stringContaining("storefront"));
+  });
+});
+
+describe("findLiveBoundTopic", () => {
+  it("ignores foreign bindings and skips a deleted binding when another one is live", async () => {
+    const chatId = -1001234567890;
+    const threadId = thread().id;
+    const contexts: ContextMetadata[] = [
+      { contextKey: "-1009999999999:12", threadId, workspace: "/foreign", updatedAt: 3_000 },
+      { contextKey: `${chatId}:13`, threadId, workspace: "/stale", updatedAt: 2_000 },
+      { contextKey: `${chatId}:14`, threadId, workspace: "/live", updatedAt: 1_000 },
+    ];
+    const topicIsAlive = vi.fn(async (messageThreadId: number) => messageThreadId === 14);
+
+    expect(await findLiveBoundTopic(contexts, chatId, threadId, topicIsAlive)).toBe(14);
+    expect(topicIsAlive.mock.calls.map(([messageThreadId]) => messageThreadId)).toEqual([13, 14]);
+  });
+});
+
+describe("isMissingForumTopicError", () => {
+  it.each([
+    "Bad Request: TOPIC_ID_INVALID",
+    "Bad Request: TOPIC_DELETED",
+    "Bad Request: message thread not found",
+  ])("recognises %s", (message) => {
+    expect(isMissingForumTopicError(new Error(message))).toBe(true);
+  });
+});
+
+describe("probeForumTopic", () => {
+  it("restores a closed topic after probing it", async () => {
+    const close = vi.fn().mockResolvedValue(undefined);
+
+    await expect(probeForumTopic(14, {
+      reopen: vi.fn().mockResolvedValue(undefined),
+      close,
+    })).resolves.toBe(true);
+
+    expect(close).toHaveBeenCalledWith(14);
+  });
+
+  it("leaves an already open topic open", async () => {
+    const close = vi.fn();
+
+    await expect(probeForumTopic(14, {
+      reopen: vi.fn().mockRejectedValue(new Error("Bad Request: TOPIC_NOT_MODIFIED")),
+      close,
+    })).resolves.toBe(true);
+
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it("reports a deleted topic without trying to close it", async () => {
+    const close = vi.fn();
+
+    await expect(probeForumTopic(14, {
+      reopen: vi.fn().mockRejectedValue(new Error("Bad Request: TOPIC_DELETED")),
+      close,
+    })).resolves.toBe(false);
+
+    expect(close).not.toHaveBeenCalled();
   });
 });
 

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   formatSessionLabel,
   renderHelpMessage,
+  renderModelSummaryPlain,
   renderWelcomeFirstTime,
   renderWelcomeReturning,
 } from "../src/bot-ui.js";
@@ -19,12 +20,13 @@ describe("bot-ui", () => {
       expect(plain).toContain("/help");
       expect(plain).toContain("/retry");
       expect(plain).toContain("/launch_profiles");
+      expect(plain).toContain("/jira");
     });
 
-    it("lists all 20 commands", () => {
+    it("lists all 21 commands", () => {
       const { plain } = renderHelpMessage();
       const commandMatches = plain.match(/\/\w+/g) ?? [];
-      expect(commandMatches.length).toBe(20);
+      expect(commandMatches.length).toBe(21);
     });
 
     it("returns valid HTML with bold tags", () => {
@@ -34,11 +36,32 @@ describe("bot-ui", () => {
     });
   });
 
+  describe("renderModelSummaryPlain", () => {
+    it("shows active and next provider/model pairs", () => {
+      expect(
+        renderModelSummaryPlain({
+          model: "gpt-5.6-sol",
+          modelProvider: "openai",
+          nextModel: "glm-5.3",
+          nextModelProvider: "zai",
+        }),
+      ).toEqual([
+        "Model: openai/gpt-5.6-sol",
+        "Next model: zai/glm-5.3",
+      ]);
+    });
+
+    it("omits missing model values", () => {
+      expect(renderModelSummaryPlain({})).toEqual([]);
+    });
+  });
+
   describe("renderWelcomeFirstTime", () => {
     it("shows welcome without auth warning", () => {
       const { html, plain } = renderWelcomeFirstTime();
       expect(html).toContain("TeleCodex is ready");
       expect(plain).toContain("/help");
+      expect(plain).toContain("Send a message, then choose a model to start a thread.");
       expect(html).not.toContain("⚠️");
     });
 

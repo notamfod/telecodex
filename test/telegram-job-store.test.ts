@@ -63,4 +63,76 @@ describe("TelegramJobStore", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("persists a model-selection wait and releases it exactly once", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "telecodex-job-store-"));
+    const file = path.join(dir, "jobs.json");
+    try {
+      const store = new TelegramJobStore(file, () => 1000);
+      const waiting = store.create({
+        contextKey: "-100:42",
+        chatId: -100,
+        messageThreadId: 42,
+        threadId: null,
+        input: "inspect this",
+      });
+
+      const awaiting = store.awaitModelSelection(waiting.id);
+
+      expect(awaiting.state).toBe("awaiting-model");
+      expect(awaiting.selectionToken).toMatch(/^[a-f0-9]{12}$/);
+      expect(store.listRecoverable()).toEqual([]);
+      expect(store.listAwaitingModel()).toHaveLength(1);
+      expect(store.findAwaitingModel(awaiting.selectionToken!, "-100:42")?.id).toBe(waiting.id);
+      expect(store.findAwaitingModel(awaiting.selectionToken!, "-100:99")).toBeUndefined();
+
+      expect(() =>
+        store.selectModel(awaiting.selectionToken!, "-100:99", "glm-53", "thread-glm"),
+      ).toThrow("Invalid or expired model selection");
+
+      const released = store.selectModel(
+        awaiting.selectionToken!,
+        "-100:42",
+        "glm-53",
+        "thread-glm",
+      );
+      expect(released).toEqual(
+        expect.objectContaining({
+          state: "waiting",
+          modelChoiceId: "glm-53",
+          threadId: "thread-glm",
+        }),
+      );
+      expect(released.selectionToken).toBeUndefined();
+      expect(() =>
+        store.selectModel(awaiting.selectionToken!, "-100:42", "glm-53", "thread-glm"),
+      ).toThrow("Invalid or expired model selection");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("round-trips inbox cleanup metadata", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "telecodex-job-store-"));
+    const file = path.join(dir, "jobs.json");
+    try {
+      const store = new TelegramJobStore(file, () => 1000);
+      const job = store.create({
+        contextKey: "-100:1",
+        chatId: -100,
+        messageThreadId: 1,
+        threadId: null,
+        input: { imagePaths: ["/workspace/.telecodex/inbox/turn/photo.jpg"] },
+        cleanupInbox: { workspace: "/workspace", turnId: "turn" },
+      });
+
+      const restored = new TelegramJobStore(file, () => 2000);
+      expect(restored.get(job.id)?.cleanupInbox).toEqual({
+        workspace: "/workspace",
+        turnId: "turn",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

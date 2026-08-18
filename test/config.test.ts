@@ -17,6 +17,8 @@ describe("loadConfig", () => {
     delete process.env.TELEGRAM_ALLOWED_USER_IDS;
     delete process.env.CODEX_API_KEY;
     delete process.env.CODEX_MODEL;
+    delete process.env.CODEX_MODEL_CHOICES_JSON;
+    delete process.env.CODEX_DEFAULT_MODEL_CHOICE;
     delete process.env.CODEX_SANDBOX_MODE;
     delete process.env.CODEX_APPROVAL_POLICY;
     delete process.env.CODEX_LAUNCH_PROFILES_JSON;
@@ -31,6 +33,9 @@ describe("loadConfig", () => {
     delete process.env.TOPIC_SYNC_INTERVAL_SECONDS;
     delete process.env.TELEGRAM_MAX_ACTIVE_TOPICS;
     delete process.env.TELEGRAM_PROGRESS_HEARTBEAT_SECONDS;
+    delete process.env.JIRA_PANEL_CHAT_ID;
+    delete process.env.JIRA_PANEL_TOPIC_ID;
+    delete process.env.JIRA_CLIENT_PATH;
     delete process.env.container;
   });
 
@@ -76,6 +81,8 @@ describe("loadConfig", () => {
       maxFileSize: 20 * 1024 * 1024,
       codexApiKey: "secret-key",
       codexModel: "o3",
+      modelChoices: [],
+      defaultModelChoiceId: undefined,
       codexSandboxMode: "danger-full-access",
       codexApprovalPolicy: "on-request",
       launchProfiles: [
@@ -109,8 +116,11 @@ describe("loadConfig", () => {
       enableTelegramReactions: false,
       telegramForumChatId: -1001234567890,
       topicSyncIntervalMs: 15_000,
+      topicSyncEnabled: true,
       telegramMaxActiveTopics: 4,
       telegramProgressHeartbeatMs: 120_000,
+      statusBoardIntervalMs: 30_000,
+      jiraPanel: undefined,
     });
   });
 
@@ -122,6 +132,8 @@ describe("loadConfig", () => {
 
     expect(config.codexApiKey).toBeUndefined();
     expect(config.codexModel).toBeUndefined();
+    expect(config.modelChoices).toEqual([]);
+    expect(config.defaultModelChoiceId).toBeUndefined();
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
     expect(config.codexSandboxMode).toBe("workspace-write");
     expect(config.codexApprovalPolicy).toBe("never");
@@ -159,6 +171,33 @@ describe("loadConfig", () => {
     expect(config.telegramMaxActiveTopics).toBe(4);
     expect(config.telegramProgressHeartbeatMs).toBe(120_000);
     expect(config.workspace).toBe(process.cwd());
+    expect(config.jiraPanel).toBeUndefined();
+  });
+
+  it("parses the Jira panel topic and executable", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.JIRA_PANEL_CHAT_ID = "-1003981282865";
+    process.env.JIRA_PANEL_TOPIC_ID = "999";
+    process.env.JIRA_CLIENT_PATH = "/opt/jira-client";
+
+    const config = loadConfig();
+
+    expect(config.jiraPanel).toEqual({
+      chatId: -1003981282865,
+      topicId: 999,
+      clientPath: "/opt/jira-client",
+    });
+  });
+
+  it("requires both Jira panel topic coordinates", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.JIRA_PANEL_CHAT_ID = "-1003981282865";
+
+    expect(() => loadConfig()).toThrow(
+      "JIRA_PANEL_CHAT_ID and JIRA_PANEL_TOPIC_ID must be configured together",
+    );
   });
 
   it("rejects an invalid Telegram forum chat id", () => {
@@ -167,6 +206,27 @@ describe("loadConfig", () => {
     process.env.TELEGRAM_FORUM_CHAT_ID = "not-a-chat";
 
     expect(() => loadConfig()).toThrow("Invalid TELEGRAM_FORUM_CHAT_ID: not-a-chat");
+  });
+
+  it("leaves topic sync off until its interval is configured", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_FORUM_CHAT_ID = "-1001234567890";
+
+    const config = loadConfig();
+
+    expect(config.topicSyncEnabled).toBe(false);
+  });
+
+  it("turns topic sync on once its interval is configured", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_FORUM_CHAT_ID = "-1001234567890";
+    process.env.TOPIC_SYNC_INTERVAL_SECONDS = "30";
+
+    const config = loadConfig();
+
+    expect(config.topicSyncEnabled).toBe(true);
   });
 
   it("rejects a topic sync interval shorter than five seconds", () => {
@@ -377,6 +437,64 @@ describe("loadConfig", () => {
     expect(config.toolVerbosity).toBe("summary");
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
     expect(warnSpy).toHaveBeenCalledTimes(4);
+  });
+
+  it("parses model choices and their explicit default", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_MODEL_CHOICES_JSON = JSON.stringify([
+      {
+        id: "openai-default",
+        label: "OpenAI GPT-5.6 Sol",
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        supportsImages: true,
+      },
+      {
+        id: "glm-53",
+        label: "Z.AI GLM-5.3",
+        provider: "zai",
+        model: "glm-5.3",
+        supportsImages: false,
+        webSearch: "disabled",
+      },
+    ]);
+    process.env.CODEX_DEFAULT_MODEL_CHOICE = "glm-53";
+
+    const config = loadConfig();
+
+    expect(config.modelChoices).toHaveLength(2);
+    expect(config.modelChoices[1]).toEqual({
+      id: "glm-53",
+      label: "Z.AI GLM-5.3",
+      provider: "zai",
+      model: "glm-5.3",
+      supportsImages: false,
+      webSearch: "disabled",
+    });
+    expect(config.defaultModelChoiceId).toBe("glm-53");
+  });
+
+  it("uses the first configured choice when no explicit default is set", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_MODEL_CHOICES_JSON = JSON.stringify([
+      { id: "openai", label: "OpenAI", provider: "openai", model: "gpt" },
+      { id: "glm", label: "GLM", provider: "zai", model: "glm" },
+    ]);
+
+    expect(loadConfig().defaultModelChoiceId).toBe("openai");
+  });
+
+  it("rejects an unknown default model choice", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_MODEL_CHOICES_JSON = JSON.stringify([
+      { id: "openai", label: "OpenAI", provider: "openai", model: "gpt" },
+    ]);
+    process.env.CODEX_DEFAULT_MODEL_CHOICE = "missing";
+
+    expect(() => loadConfig()).toThrow("Unknown CODEX_DEFAULT_MODEL_CHOICE: missing");
   });
 
   it("parses explicit launch profiles and default selection", () => {

@@ -38,6 +38,8 @@ function createConfig(overrides: Partial<TeleCodexConfig> = {}): TeleCodexConfig
     maxFileSize: 20 * 1024 * 1024,
     codexApiKey: "codex-key",
     codexModel: "o3",
+    modelChoices: [],
+    defaultModelChoiceId: undefined,
     codexSandboxMode: "workspace-write",
     codexApprovalPolicy: "never",
     launchProfiles: [
@@ -73,6 +75,7 @@ function createDependencies(): FakeDependencies {
           thread: { id: `thread-${threadCounter}`, status: { type: "idle" } },
           cwd: request?.cwd,
           model: request?.model,
+          modelProvider: request?.modelProvider,
         };
       }
       if (method === "thread/resume") {
@@ -118,6 +121,7 @@ describe("CodexSessionService", () => {
     expect(dependencies.client.request).toHaveBeenCalledWith("thread/start", {
       cwd: "/workspace/base",
       model: "o3",
+      modelProvider: "openai",
       approvalPolicy: "never",
       sandbox: "workspace-write",
       serviceName: "telecodex",
@@ -184,6 +188,138 @@ describe("CodexSessionService", () => {
     }));
   });
 
+  it("keeps the active model while selecting GLM for the next thread", async () => {
+    const dependencies = createDependencies();
+    const service = await CodexSessionService.create(
+      createConfig({
+        codexModel: "gpt-5.6-sol",
+        modelChoices: [
+          {
+            id: "openai-default",
+            label: "OpenAI GPT-5.6 Sol",
+            provider: "openai",
+            model: "gpt-5.6-sol",
+            supportsImages: true,
+          },
+          {
+            id: "glm-53",
+            label: "Z.AI GLM-5.3",
+            provider: "zai",
+            model: "glm-5.3",
+            supportsImages: false,
+            webSearch: "disabled",
+          },
+        ],
+        defaultModelChoiceId: "openai-default",
+      }),
+      undefined,
+      dependencies,
+    );
+
+    service.setModelChoice("glm-53");
+
+    expect(service.getInfo()).toEqual(
+      expect.objectContaining({
+        model: "gpt-5.6-sol",
+        modelProvider: "openai",
+        nextModel: "glm-5.3",
+        nextModelProvider: "zai",
+        nextModelChoiceId: "glm-53",
+      }),
+    );
+
+    await service.prompt("continue", createCallbacks());
+    expect(dependencies.turnManager.runTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "gpt-5.6-sol" }),
+    );
+    expect(dependencies.turnManager.runTurn.mock.calls[0]![0]).not.toHaveProperty("modelProvider");
+  });
+
+  it("starts a GLM thread with its provider and capability config", async () => {
+    const dependencies = createDependencies();
+    const service = await CodexSessionService.create(
+      createConfig({
+        modelChoices: [
+          {
+            id: "openai-default",
+            label: "OpenAI",
+            provider: "openai",
+            model: "gpt-5.6-sol",
+            supportsImages: true,
+          },
+          {
+            id: "glm-53",
+            label: "Z.AI GLM-5.3",
+            provider: "zai",
+            model: "glm-5.3",
+            supportsImages: false,
+            webSearch: "disabled",
+          },
+        ],
+        defaultModelChoiceId: "openai-default",
+      }),
+      { deferThreadStart: true },
+      dependencies,
+    );
+
+    const info = await service.newThread("/workspace/glm", "glm-53");
+
+    expect(dependencies.client.request).toHaveBeenCalledWith("thread/start", {
+      cwd: "/workspace/glm",
+      model: "glm-5.3",
+      modelProvider: "zai",
+      approvalPolicy: "never",
+      sandbox: "workspace-write",
+      serviceName: "telecodex",
+      config: { web_search: "disabled" },
+    });
+    expect(info).toEqual(
+      expect.objectContaining({
+        model: "glm-5.3",
+        modelProvider: "zai",
+        modelChoiceId: "glm-53",
+        supportsImages: false,
+      }),
+    );
+  });
+
+  it("reports and persists the selected choice before a thread exists", async () => {
+    const service = await CodexSessionService.create(
+      createConfig({
+        modelChoices: [
+          {
+            id: "openai-default",
+            label: "OpenAI",
+            provider: "openai",
+            model: "gpt-5.6-sol",
+            supportsImages: true,
+          },
+          {
+            id: "glm-53",
+            label: "GLM",
+            provider: "zai",
+            model: "glm-5.3",
+            supportsImages: false,
+          },
+        ],
+        defaultModelChoiceId: "openai-default",
+      }),
+      { deferThreadStart: true },
+      createDependencies(),
+    );
+
+    service.setModelChoice("glm-53");
+
+    expect(service.getInfo()).toEqual(
+      expect.objectContaining({
+        threadId: null,
+        model: "glm-5.3",
+        modelProvider: "zai",
+        modelChoiceId: "glm-53",
+      }),
+    );
+  });
+
   it("maps text, staged files, and images into an app-server turn", async () => {
     const dependencies = createDependencies();
     const service = await CodexSessionService.create(createConfig(), undefined, dependencies);
@@ -203,7 +339,7 @@ describe("CodexSessionService", () => {
       input: [
         {
           type: "text",
-          text: "Files staged at /inbox:\n- log.txt\n\nanalyze",
+          text: "analyze\n\nFiles staged at /inbox:\n- log.txt",
           text_elements: [],
         },
         { type: "localImage", path: "/tmp/image.png" },
@@ -281,6 +417,7 @@ describe("CodexSessionService", () => {
     expect(dependencies.client.request).toHaveBeenLastCalledWith("thread/start", {
       cwd: "/workspace/other",
       model: "gpt-5.6-sol",
+      modelProvider: "openai",
       approvalPolicy: "never",
       sandbox: "read-only",
       serviceName: "telecodex",

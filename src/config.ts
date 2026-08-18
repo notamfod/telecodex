@@ -12,8 +12,19 @@ import {
   type CodexLaunchProfile,
   type CodexSandboxMode,
 } from "./codex-launch.js";
+import {
+  parseModelChoicesJson,
+  resolveDefaultModelChoice,
+  type CodexModelChoice,
+} from "./codex-model.js";
 
 export type ToolVerbosity = "all" | "summary" | "errors-only" | "none";
+
+export interface JiraPanelConfig {
+  chatId: number;
+  topicId: number;
+  clientPath: string;
+}
 
 export interface TeleCodexConfig {
   telegramBotToken: string;
@@ -25,6 +36,8 @@ export interface TeleCodexConfig {
   /** Told that a thread was re-read from disk, so a sync tool can clear its guard. */
   threadReopenCommand?: string;
   codexModel?: string;
+  modelChoices: CodexModelChoice[];
+  defaultModelChoiceId?: string;
   codexSandboxMode: CodexSandboxMode;
   codexApprovalPolicy: CodexApprovalPolicy;
   launchProfiles: CodexLaunchProfile[];
@@ -35,13 +48,16 @@ export interface TeleCodexConfig {
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
   telegramForumChatId?: number;
+  statusBoardIntervalMs: number;
   gitlabUrl?: string;
   gitlabToken?: string;
   gitlabGroupId?: string;
   gitlabWorkspaceRoot?: string;
   topicSyncIntervalMs?: number;
+  topicSyncEnabled: boolean;
   telegramMaxActiveTopics: number;
   telegramProgressHeartbeatMs: number;
+  jiraPanel?: JiraPanelConfig;
 }
 
 export function loadConfig(): TeleCodexConfig {
@@ -54,6 +70,16 @@ export function loadConfig(): TeleCodexConfig {
   const codexApiKey = optionalString(process.env.CODEX_API_KEY);
   const threadReopenCommand = optionalString(process.env.THREAD_REOPEN_COMMAND);
   const codexModel = optionalString(process.env.CODEX_MODEL);
+  const modelChoices = parseModelChoicesJson(
+    optionalString(process.env.CODEX_MODEL_CHOICES_JSON),
+  );
+  const defaultModelChoiceId = modelChoices.length
+    ? resolveDefaultModelChoice(
+        modelChoices,
+        optionalString(process.env.CODEX_DEFAULT_MODEL_CHOICE),
+        codexModel,
+      )?.id
+    : undefined;
   const codexSandboxMode = parseSandboxMode(optionalString(process.env.CODEX_SANDBOX_MODE));
   const codexApprovalPolicy = parseApprovalPolicy(optionalString(process.env.CODEX_APPROVAL_POLICY));
   const enableUnsafeLaunchProfiles = parseBooleanEnv(
@@ -90,18 +116,33 @@ export function loadConfig(): TeleCodexConfig {
   const topicSyncIntervalMs = parseTopicSyncInterval(
     optionalString(process.env.TOPIC_SYNC_INTERVAL_SECONDS),
   );
+  // Creating a forum topic for every Codex thread is its own decision. It used
+  // to switch on the moment the forum id became known, which meant you could
+  // not name the forum for anything else without also opting into that sweep.
+  const topicSyncEnabled = optionalString(process.env.TOPIC_SYNC_INTERVAL_SECONDS) !== undefined;
   const telegramMaxActiveTopics = parseIntegerSetting(
     "TELEGRAM_MAX_ACTIVE_TOPICS",
     optionalString(process.env.TELEGRAM_MAX_ACTIVE_TOPICS),
     4,
     1,
   );
+  const statusBoardIntervalMs = parseIntegerSetting(
+    "STATUS_BOARD_INTERVAL_SECONDS",
+    optionalString(process.env.STATUS_BOARD_INTERVAL_SECONDS),
+    30,
+    10,
+  ) * 1000;
   const telegramProgressHeartbeatMs = parseIntegerSetting(
     "TELEGRAM_PROGRESS_HEARTBEAT_SECONDS",
     optionalString(process.env.TELEGRAM_PROGRESS_HEARTBEAT_SECONDS),
     120,
     30,
   ) * 1000;
+  const jiraPanel = parseJiraPanelConfig(
+    optionalString(process.env.JIRA_PANEL_CHAT_ID),
+    optionalString(process.env.JIRA_PANEL_TOPIC_ID),
+    optionalString(process.env.JIRA_CLIENT_PATH),
+  );
 
   return {
     telegramBotToken,
@@ -112,6 +153,8 @@ export function loadConfig(): TeleCodexConfig {
     codexApiKey,
     threadReopenCommand,
     codexModel,
+    modelChoices,
+    defaultModelChoiceId,
     codexSandboxMode,
     codexApprovalPolicy,
     launchProfiles,
@@ -122,13 +165,16 @@ export function loadConfig(): TeleCodexConfig {
     enableTelegramLogin,
     enableTelegramReactions,
     telegramForumChatId,
+    statusBoardIntervalMs,
     gitlabUrl,
     gitlabToken,
     gitlabGroupId,
     gitlabWorkspaceRoot,
     topicSyncIntervalMs,
+    topicSyncEnabled,
     telegramMaxActiveTopics,
     telegramProgressHeartbeatMs,
+    jiraPanel,
   };
 }
 
@@ -227,6 +273,28 @@ function parseTelegramForumChatId(raw: string | undefined): number | undefined {
     throw new Error(`Invalid TELEGRAM_FORUM_CHAT_ID: ${raw}`);
   }
   return parsed;
+}
+
+function parseJiraPanelConfig(
+  rawChatId: string | undefined,
+  rawTopicId: string | undefined,
+  clientPath: string | undefined,
+): JiraPanelConfig | undefined {
+  if (!rawChatId && !rawTopicId) return undefined;
+  if (!rawChatId || !rawTopicId) {
+    throw new Error("JIRA_PANEL_CHAT_ID and JIRA_PANEL_TOPIC_ID must be configured together");
+  }
+
+  const chatId = Number(rawChatId);
+  if (!Number.isSafeInteger(chatId) || chatId >= 0) {
+    throw new Error(`Invalid JIRA_PANEL_CHAT_ID: ${rawChatId}`);
+  }
+  const topicId = Number(rawTopicId);
+  if (!Number.isSafeInteger(topicId) || topicId <= 0) {
+    throw new Error(`Invalid JIRA_PANEL_TOPIC_ID: ${rawTopicId}`);
+  }
+
+  return { chatId, topicId, clientPath: clientPath ?? "jira-client" };
 }
 
 function parseTopicSyncInterval(raw: string | undefined): number {

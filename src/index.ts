@@ -29,6 +29,12 @@ try {
   if (config.codexModel) {
     console.log(`Default model: ${config.codexModel}`);
   }
+  console.log(
+    `Model choices: ${config.modelChoices
+      .map((choice) => `${choice.id}=${choice.provider}/${choice.model}`)
+      .join(", ") || "legacy-openai"}`,
+  );
+  console.log(`Default model choice: ${config.defaultModelChoiceId ?? "legacy-openai"}`);
   const defaultLaunchProfile = findLaunchProfile(config.launchProfiles, config.defaultLaunchProfileId);
   if (defaultLaunchProfile) {
     console.log(
@@ -39,7 +45,7 @@ try {
     }
   }
   console.log("Session mode: per Telegram context");
-  if (config.telegramForumChatId) {
+  if (config.telegramForumChatId && config.topicSyncEnabled) {
     topicSynchronizer = new TopicSynchronizer({
       chatId: config.telegramForumChatId,
       intervalMs: config.topicSyncIntervalMs ?? 30_000,
@@ -50,6 +56,16 @@ try {
     console.log(
       `Topic sync: enabled for ${config.telegramForumChatId} every ${(config.topicSyncIntervalMs ?? 30_000) / 1000}s`,
     );
+  }
+
+  if (bot.statusBoard) {
+    bot.statusBoard.start();
+    console.log(`Status board: closed Dashboard topic in ${config.telegramForumChatId}, every ${config.statusBoardIntervalMs / 1000}s`);
+  }
+
+  if (bot.jiraPanel && config.jiraPanel) {
+    await bot.jiraPanel.openSafely();
+    console.log(`Jira panel: configured for ${config.jiraPanel.chatId}:${config.jiraPanel.topicId}`);
   }
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
@@ -67,6 +83,7 @@ const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
 
   console.log(`Received ${signal}, shutting down TeleCodex...`);
   topicSynchronizer?.stop();
+  bot?.statusBoard?.stop();
   const stoppedCleanly = runner
     ? await Promise.race([
         runner.stop().then(() => true, () => false),

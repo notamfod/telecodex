@@ -17,6 +17,7 @@ export function renderHelpMessage(): DualText {
         ["/session", "Current thread details"],
         ["/sessions", "Browse & switch threads"],
         ["/projects", "Topics grouped by project"],
+        ["/jira", "Open the Jira sprint and filters panel"],
         ["/inbox", "Turn this topic into a ticket inbox"],
         ["/mr", "Open merge requests, tap to review"],
         ["/done", "Draft a \u201cdone\u201d comment for the linked merge request"],
@@ -86,7 +87,7 @@ export function renderWelcomeFirstTime(authWarning?: string): DualText {
   const htmlLines = [
     "<b>👋 TeleCodex is ready.</b>",
     "",
-    "Send a message to start chatting with Codex.",
+    "Send a message, then choose a model to start a thread.",
     "You can also send voice notes, photos, or documents.",
     "",
     "Type /help for all commands.",
@@ -94,7 +95,7 @@ export function renderWelcomeFirstTime(authWarning?: string): DualText {
   const plainLines = [
     "👋 TeleCodex is ready.",
     "",
-    "Send a message to start chatting with Codex.",
+    "Send a message, then choose a model to start a thread.",
     "You can also send voice notes, photos, or documents.",
     "",
     "Type /help for all commands.",
@@ -156,6 +157,20 @@ export function formatSessionLabel(
   }
 
   return label;
+}
+
+export function renderModelSummaryPlain(info: {
+  model?: string;
+  modelProvider?: string;
+  nextModel?: string;
+  nextModelProvider?: string;
+}): string[] {
+  return [
+    info.model ? `Model: ${info.modelProvider ?? "openai"}/${info.model}` : undefined,
+    info.nextModel
+      ? `Next model: ${info.nextModelProvider ?? "openai"}/${info.nextModel}`
+      : undefined,
+  ].filter((line): line is string => Boolean(line));
 }
 
 function trimLabel(text: string, maxLength: number): string {

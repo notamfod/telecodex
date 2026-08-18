@@ -1,10 +1,10 @@
 import path from "node:path";
 
 import type { CodexThreadRecord } from "./codex-state.js";
-import { parseContextKey } from "./context-key.js";
+import { contextKeyFromMessage, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { escapeHTML } from "./format.js";
 import type { ContextMetadata } from "./session-registry.js";
-import { threadLabel, workspaceLabel } from "./topic-sync.js";
+import { buildTopicName, threadLabel, workspaceLabel } from "./topic-sync.js";
 
 /** Telegram truncates button labels past 64 code points. */
 const MAX_LABEL_LENGTH = 60;
@@ -83,6 +83,111 @@ export function findBoundTopic(
     }
   }
   return undefined;
+}
+
+export async function findLiveBoundTopic(
+  contexts: ContextMetadata[],
+  chatId: number,
+  threadId: string,
+  topicIsAlive: (messageThreadId: number) => Promise<boolean>,
+): Promise<number | undefined> {
+  const checked = new Set<number>();
+  for (const entry of contexts) {
+    const context = parseContextKey(entry.contextKey);
+    const messageThreadId = context.messageThreadId;
+    if (
+      entry.threadId !== threadId
+      || context.chatId !== chatId
+      || messageThreadId === undefined
+      || checked.has(messageThreadId)
+    ) {
+      continue;
+    }
+    checked.add(messageThreadId);
+    if (await topicIsAlive(messageThreadId)) return messageThreadId;
+  }
+  return undefined;
+}
+
+export function isMissingForumTopicError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /message thread not found|TOPIC_ID_INVALID|TOPIC_DELETED/i.test(message);
+}
+
+export async function probeForumTopic(
+  messageThreadId: number,
+  options: {
+    reopen(messageThreadId: number): Promise<unknown>;
+    close(messageThreadId: number): Promise<unknown>;
+  },
+): Promise<boolean> {
+  try {
+    await options.reopen(messageThreadId);
+  } catch (error) {
+    if (isMissingForumTopicError(error)) return false;
+    if (isTopicNotModifiedError(error)) return true;
+    throw error;
+  }
+
+  try {
+    await options.close(messageThreadId);
+  } catch (error) {
+    if (!isTopicNotModifiedError(error)) throw error;
+  }
+  return true;
+}
+
+function isTopicNotModifiedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /TOPIC_NOT_MODIFIED|topic is already (?:open|closed)/i.test(message);
+}
+
+export interface EnsureThreadTopicOptions {
+  chatId: number;
+  contexts: ContextMetadata[];
+  topicIsAlive(messageThreadId: number): Promise<boolean>;
+  createForumTopic(name: string): Promise<{ message_thread_id: number }>;
+  bindThread(contextKey: TelegramContextKey, thread: CodexThreadRecord): void;
+  sendWelcome(messageThreadId: number, name: string): Promise<void>;
+}
+
+export interface EnsuredThreadTopic {
+  created: boolean;
+  messageThreadId: number;
+  name: string;
+  url: string;
+}
+
+export async function ensureThreadTopic(
+  thread: CodexThreadRecord,
+  options: EnsureThreadTopicOptions,
+): Promise<EnsuredThreadTopic> {
+  const name = buildTopicName(thread);
+  const bound = await findLiveBoundTopic(
+    options.contexts,
+    options.chatId,
+    thread.id,
+    options.topicIsAlive,
+  );
+  if (bound !== undefined) {
+    return {
+      created: false,
+      messageThreadId: bound,
+      name,
+      url: topicUrl(options.chatId, bound),
+    };
+  }
+
+  const topic = await options.createForumTopic(name);
+  const contextKey = contextKeyFromMessage(options.chatId, topic.message_thread_id);
+  options.bindThread(contextKey, thread);
+  await options.sendWelcome(topic.message_thread_id, name);
+  return {
+    created: true,
+    messageThreadId: topic.message_thread_id,
+    name,
+    url: topicUrl(options.chatId, topic.message_thread_id),
+  };
 }
 
 /** Private supergroups are addressed by their id without the -100 prefix. */

@@ -29,6 +29,24 @@ const createConfig = (): TeleCodexConfig => ({
   workspace: "/workspace/base",
   maxFileSize: 20 * 1024 * 1024,
   codexModel: "gpt-5.6-sol",
+  modelChoices: [
+    {
+      id: "openai-default",
+      label: "OpenAI GPT-5.6 Sol",
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      supportsImages: true,
+    },
+    {
+      id: "glm-53",
+      label: "Z.AI GLM-5.3",
+      provider: "zai",
+      model: "glm-5.3",
+      supportsImages: false,
+      webSearch: "disabled",
+    },
+  ],
+  defaultModelChoiceId: "openai-default",
   codexSandboxMode: "workspace-write",
   codexApprovalPolicy: "never",
   launchProfiles: [createDefaultLaunchProfile("workspace-write", "never")],
@@ -54,12 +72,65 @@ const createCallbacks = () => ({
 });
 
 describe("CodexSessionService with shared app-server", () => {
+  it("names a new thread after the Telegram topic it belongs to", async () => {
+    const client = new FakeClient();
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "thread/start") {
+        return { thread: { id: "thread-new", status: { type: "idle" } } };
+      }
+      return {};
+    });
+
+    await CodexSessionService.create(
+      createConfig(),
+      { topicName: "MIR-6319 · оплата не проходит" },
+      { client, turnManager: new FakeTurnManager() },
+    );
+
+    expect(client.request).toHaveBeenCalledWith("thread/name/set", {
+      threadId: "thread-new",
+      name: "MIR-6319 · оплата не проходит",
+    });
+  });
+
+  it("starts a thread even when naming it fails", async () => {
+    const client = new FakeClient();
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "thread/start") {
+        return { thread: { id: "thread-new", status: { type: "idle" } } };
+      }
+      throw new Error("name rejected");
+    });
+
+    const session = await CodexSessionService.create(
+      createConfig(),
+      { topicName: "какое-то имя" },
+      { client, turnManager: new FakeTurnManager() },
+    );
+
+    expect(session.getInfo().threadId).toBe("thread-new");
+  });
+
+  it("leaves the thread unnamed when the context has no topic name", async () => {
+    const client = new FakeClient();
+    client.request.mockResolvedValue({ thread: { id: "thread-new", status: { type: "idle" } } });
+
+    await CodexSessionService.create(
+      createConfig(),
+      undefined,
+      { client, turnManager: new FakeTurnManager() },
+    );
+
+    expect(client.request).not.toHaveBeenCalledWith("thread/name/set", expect.anything());
+  });
+
   it("resumes an existing thread through the shared app-server client", async () => {
     const client = new FakeClient();
     client.request.mockResolvedValue({
       thread: { id: "thread-existing", status: { type: "idle" } },
       cwd: "/workspace/existing",
-      model: "gpt-5.6-sol",
+      model: "glm-5.3",
+      modelProvider: "zai",
       approvalPolicy: "never",
       sandbox: { type: "workspaceWrite" },
       reasoningEffort: "high",
@@ -80,7 +151,8 @@ describe("CodexSessionService with shared app-server", () => {
       expect.objectContaining({
         threadId: "thread-existing",
         workspace: "/workspace/existing",
-        model: "gpt-5.6-sol",
+        model: "glm-5.3",
+        modelProvider: "zai",
         reasoningEffort: "high",
       }),
     );
@@ -118,7 +190,7 @@ describe("CodexSessionService with shared app-server", () => {
       input: [
         {
           type: "text",
-          text: "Файл сохранён в /workspace/inbox/report.csv\n\nПроверь файл",
+          text: "Проверь файл\n\nФайл сохранён в /workspace/inbox/report.csv",
           text_elements: [],
         },
         { type: "localImage", path: "/workspace/inbox/chart.png" },
@@ -154,13 +226,14 @@ describe("CodexSessionService with shared app-server", () => {
       { client, turnManager },
     );
 
-    const info = await session.newThread("/workspace/new", "gpt-5.6-sol");
+    const info = await session.newThread("/workspace/new", "glm-53");
 
     expect(client.request).toHaveBeenCalledWith(
       "thread/start",
       expect.objectContaining({
         cwd: "/workspace/new",
-        model: "gpt-5.6-sol",
+        model: "glm-5.3",
+        modelProvider: "zai",
         approvalPolicy: "never",
         sandbox: "workspace-write",
         serviceName: "telecodex",

@@ -6,6 +6,7 @@ import type { CodexPromptInput } from "./codex-session.js";
 import type { TelegramContextKey } from "./context-key.js";
 
 export type TelegramJobState =
+  | "awaiting-model"
   | "waiting"
   | "active"
   | "delivering"
@@ -21,6 +22,9 @@ export interface PersistentTelegramJob {
   threadId: string | null;
   turnId?: string;
   input: CodexPromptInput;
+  selectionToken?: string;
+  modelChoiceId?: string;
+  cleanupInbox?: { workspace: string; turnId: string };
   state: TelegramJobState;
   sentPartKeys: string[];
   createdAt: number;
@@ -30,7 +34,7 @@ export interface PersistentTelegramJob {
 export type NewTelegramJob = Pick<
   PersistentTelegramJob,
   "contextKey" | "chatId" | "messageThreadId" | "threadId" | "input"
->;
+> & Pick<Partial<PersistentTelegramJob>, "modelChoiceId" | "cleanupInbox">;
 
 export class TelegramJobStore {
   private readonly jobs = new Map<string, PersistentTelegramJob>();
@@ -72,11 +76,70 @@ export class TelegramJobStore {
     return structuredClone(job);
   }
 
+  list(): PersistentTelegramJob[] {
+    return [...this.jobs.values()].map((job) => structuredClone(job));
+  }
+
   listRecoverable(): PersistentTelegramJob[] {
     return [...this.jobs.values()]
       .filter((job) => job.state === "waiting" || job.state === "active" || job.state === "delivering")
       .sort((left, right) => left.createdAt - right.createdAt)
       .map((job) => structuredClone(job));
+  }
+
+  awaitModelSelection(id: string): PersistentTelegramJob {
+    const job = this.requireJob(id);
+    if (job.state !== "waiting" && job.state !== "awaiting-model") {
+      throw new Error(`Telegram job ${id} cannot await model selection from state ${job.state}`);
+    }
+    job.state = "awaiting-model";
+    job.selectionToken ??= randomUUID().replaceAll("-", "").slice(0, 12);
+    job.updatedAt = this.now();
+    this.persist();
+    return structuredClone(job);
+  }
+
+  findAwaitingModel(
+    selectionToken: string,
+    contextKey: TelegramContextKey,
+  ): PersistentTelegramJob | undefined {
+    const job = [...this.jobs.values()].find(
+      (candidate) =>
+        candidate.state === "awaiting-model" &&
+        candidate.selectionToken === selectionToken &&
+        candidate.contextKey === contextKey,
+    );
+    return job ? structuredClone(job) : undefined;
+  }
+
+  listAwaitingModel(): PersistentTelegramJob[] {
+    return [...this.jobs.values()]
+      .filter((job) => job.state === "awaiting-model")
+      .sort((left, right) => left.createdAt - right.createdAt)
+      .map((job) => structuredClone(job));
+  }
+
+  selectModel(
+    selectionToken: string,
+    contextKey: TelegramContextKey,
+    modelChoiceId: string,
+    threadId: string,
+  ): PersistentTelegramJob {
+    const job = [...this.jobs.values()].find(
+      (candidate) =>
+        candidate.state === "awaiting-model" &&
+        candidate.selectionToken === selectionToken &&
+        candidate.contextKey === contextKey,
+    );
+    if (!job) throw new Error("Invalid or expired model selection");
+
+    job.state = "waiting";
+    job.modelChoiceId = modelChoiceId;
+    job.threadId = threadId;
+    delete job.selectionToken;
+    job.updatedAt = this.now();
+    this.persist();
+    return structuredClone(job);
   }
 
   hasPart(id: string, partKey: string): boolean {

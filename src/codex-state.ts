@@ -6,9 +6,14 @@ export interface CodexThreadRecord {
   title: string;
   cwd: string;
   model: string | null;
+  modelProvider: string | null;
   createdAt: Date;
   updatedAt: Date;
   firstUserMessage: string;
+}
+
+export interface RecentCodexThreadRecord extends CodexThreadRecord {
+  source: string;
 }
 
 export interface CodexModelRecord {
@@ -42,9 +47,11 @@ type ThreadRow = {
   title: unknown;
   cwd: unknown;
   model: unknown;
+  model_provider: unknown;
   created_at: unknown;
   updated_at: unknown;
   first_user_message: unknown;
+  source?: unknown;
 };
 
 type WorkspaceRow = {
@@ -84,7 +91,7 @@ export function findLatestDatabase(): string | null {
 export function listThreads(limit = 20): CodexThreadRecord[] {
   return withDatabase((db) => {
     const query = db.prepare(`
-      SELECT id, title, cwd, model, created_at, updated_at, first_user_message
+      SELECT id, title, cwd, model, model_provider, created_at, updated_at, first_user_message
       FROM threads
       WHERE (archived = 0 OR archived IS NULL)
       ORDER BY updated_at DESC
@@ -99,7 +106,7 @@ export function listThreads(limit = 20): CodexThreadRecord[] {
 export function listUserThreads(limit = 100): CodexThreadRecord[] {
   return withDatabase((db) => {
     const query = db.prepare(`
-      SELECT id, title, cwd, model, created_at, updated_at, first_user_message
+      SELECT id, title, cwd, model, model_provider, created_at, updated_at, first_user_message
       FROM threads
       WHERE (archived = 0 OR archived IS NULL)
         AND source = 'vscode'
@@ -113,11 +120,34 @@ export function listUserThreads(limit = 100): CodexThreadRecord[] {
   }) ?? [];
 }
 
+export function listRecentRootThreads(
+  since: Date,
+  limit = 100,
+): RecentCodexThreadRecord[] {
+  return withDatabase((db) => {
+    const query = db.prepare(`
+      SELECT id, title, cwd, model, model_provider, created_at, updated_at, first_user_message, source
+      FROM threads
+      WHERE (archived = 0 OR archived IS NULL)
+        AND updated_at >= ?
+        AND (source IS NULL OR source NOT LIKE '%"subagent"%')
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `);
+
+    const rows = query.all(Math.floor(since.getTime() / 1000), limit) as ThreadRow[];
+    return rows.map((row) => ({
+      ...mapThreadRow(row),
+      source: sourceLabel(row.source),
+    }));
+  }) ?? [];
+}
+
 export function getThread(id: string): CodexThreadRecord | null {
   return (
     withDatabase((db) => {
       const query = db.prepare(`
-        SELECT id, title, cwd, model, created_at, updated_at, first_user_message
+        SELECT id, title, cwd, model, model_provider, created_at, updated_at, first_user_message
         FROM threads
         WHERE archived = 0 AND id = ?
         LIMIT 1
@@ -179,6 +209,7 @@ function mapThreadRow(row: ThreadRow): CodexThreadRecord {
     title: typeof row.title === "string" ? row.title : "",
     cwd: typeof row.cwd === "string" ? row.cwd : "",
     model: typeof row.model === "string" ? row.model : null,
+    modelProvider: typeof row.model_provider === "string" ? row.model_provider : null,
     createdAt: fromUnixSeconds(row.created_at),
     updatedAt: fromUnixSeconds(row.updated_at),
     firstUserMessage: typeof row.first_user_message === "string" ? row.first_user_message : "",
@@ -187,6 +218,22 @@ function mapThreadRow(row: ThreadRow): CodexThreadRecord {
 
 function fromUnixSeconds(value: unknown): Date {
   return typeof value === "number" ? new Date(value * 1000) : new Date(0);
+}
+
+function sourceLabel(value: unknown): string {
+  if (typeof value !== "string" || !value) return "?";
+  if (value === "vscode") return "vscode";
+  if (value === "exec") return "cli";
+  if (value === "appServer") return "app-server";
+
+  try {
+    const parsed = JSON.parse(value) as { custom?: unknown };
+    if (parsed.custom === "telecodex") return "телеграм";
+    if (typeof parsed.custom === "string" && parsed.custom) return parsed.custom;
+  } catch {
+    // Older Codex versions stored the source as a plain string.
+  }
+  return "?";
 }
 
 function withDatabase<T>(fn: (db: DatabaseInstance) => T): T | null {

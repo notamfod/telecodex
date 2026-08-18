@@ -11,7 +11,9 @@ import {
   buildTicketPrompt,
   describeSource,
   extractTicketKey,
+  groupTicketsByWorkspace,
   hasAttachment,
+  ticketActionButtons,
   ticketHeading,
   groupBurst,
   ticketTopicName,
@@ -114,6 +116,40 @@ describe("ticketHeading", () => {
 
   it("uses the internal number alone when the text carried no key", () => {
     expect(ticketHeading({ id: 7 })).toBe("Тикет #7");
+  });
+});
+
+describe("ticketActionButtons", () => {
+  it("offers launch and resolution for a new ticket", () => {
+    expect(ticketActionButtons({ id: 7 })).toEqual([
+      { label: "▶️ Запустить разбор", callbackData: "ticket_start:7" },
+      { label: "✅ Решён", callbackData: "ticket_done:7" },
+    ]);
+  });
+
+  it("keeps only resolution after analysis starts", () => {
+    expect(ticketActionButtons({ id: 7, startedAt: 123 })).toEqual([
+      { label: "✅ Решён", callbackData: "ticket_done:7" },
+    ]);
+  });
+
+  it("offers no actions for a resolved ticket", () => {
+    expect(ticketActionButtons({ id: 7, resolvedAt: 456 })).toEqual([]);
+  });
+});
+
+describe("groupTicketsByWorkspace", () => {
+  it("groups tickets by workspace while preserving ticket order", () => {
+    const tickets = [
+      { id: 2, workspace: "/srv/billing" },
+      { id: 1, workspace: "/srv/storefront" },
+      { id: 3, workspace: "/srv/billing" },
+    ];
+
+    expect(groupTicketsByWorkspace(tickets)).toEqual([
+      { workspace: "/srv/billing", tickets: [tickets[0], tickets[2]] },
+      { workspace: "/srv/storefront", tickets: [tickets[1]] },
+    ]);
   });
 });
 
@@ -323,6 +359,68 @@ describe("InboxStore", () => {
     store.markStarted(ticket.id, 1_786_000_000);
 
     expect(new InboxStore(file).getTicket(ticket.id)?.startedAt).toBe(1_786_000_000);
+  });
+
+  it("persists resolution across restarts and keeps the first resolution time", () => {
+    const file = storePath();
+    const store = new InboxStore(file);
+    const ticket = store.createTicket({
+      inboxContextKey: "-100123:5",
+      workTopicId: 512,
+      workspace: settings.workspace,
+      prompt: "prompt",
+      source: "источник неизвестен",
+    });
+
+    expect(store.markResolved(ticket.id, 1_786_000_000)).toBe(true);
+    expect(store.markResolved(ticket.id, 1_786_000_999)).toBe(false);
+    expect(new InboxStore(file).getTicket(ticket.id)?.resolvedAt).toBe(1_786_000_000);
+  });
+
+  it("lists only unresolved tickets in stable oldest-first order", () => {
+    const store = new InboxStore(storePath());
+    const first = store.createTicket({
+      inboxContextKey: "-100123:5",
+      workTopicId: 512,
+      workspace: settings.workspace,
+      prompt: "first",
+      source: "источник неизвестен",
+    }, 2_000);
+    const second = store.createTicket({
+      inboxContextKey: "-100123:5",
+      workTopicId: 513,
+      workspace: settings.workspace,
+      prompt: "second",
+      source: "источник неизвестен",
+    }, 1_000);
+    store.createTicket({
+      inboxContextKey: "-100123:9",
+      workTopicId: 514,
+      workspace: "/srv/projects/storefront",
+      prompt: "third",
+      source: "источник неизвестен",
+    }, 1_000);
+    store.markResolved(first.id, 3_000);
+
+    expect(store.listUnresolved().map((ticket) => ticket.prompt)).toEqual(["second", "third"]);
+    expect(store.listUnresolved("-100123:5").map((ticket) => ticket.id)).toEqual([second.id]);
+  });
+
+  it("reopens a resolved ticket and persists the change", () => {
+    const file = storePath();
+    const store = new InboxStore(file);
+    const ticket = store.createTicket({
+      inboxContextKey: "-100123:5",
+      workTopicId: 512,
+      workspace: settings.workspace,
+      prompt: "prompt",
+      source: "источник неизвестен",
+    });
+    store.markResolved(ticket.id, 1_786_000_000);
+
+    expect(store.reopen(ticket.id)).toBe(true);
+    expect(store.reopen(ticket.id)).toBe(false);
+    expect(new InboxStore(file).listUnresolved().map((entry) => entry.id)).toEqual([ticket.id]);
   });
 
   it("finds the ticket a topic belongs to, which is how /done knows the key", () => {

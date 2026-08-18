@@ -58,7 +58,9 @@ import {
   describeSource,
   extractTicketKey,
   hasAttachment,
+  groupTicketsByWorkspace,
   groupBurst,
+  ticketActionButtons,
   ticketHeading,
   ticketTopicName,
   type Ticket,
@@ -229,6 +231,14 @@ function jiraPanelKeyboard(rows: JiraPanelButton[][]): InlineKeyboard {
       }
     }
     keyboard.row();
+  }
+  return keyboard;
+}
+
+function ticketKeyboard(ticket: Pick<Ticket, "id" | "startedAt" | "resolvedAt">): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const button of ticketActionButtons(ticket)) {
+    keyboard.text(button.label, button.callbackData);
   }
   return keyboard;
 }
@@ -1988,6 +1998,35 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     await safeReply(ctx, escapeHTML(inboxUsage), { fallbackText: inboxUsage });
   });
 
+  bot.command("tickets", async (ctx) => {
+    const unresolved = inbox.listUnresolved();
+    if (unresolved.length === 0) {
+      const text = "Открытых тикетов нет.";
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+
+    const lines = ["<b>Открытые тикеты</b>"];
+    for (const group of groupTicketsByWorkspace(unresolved)) {
+      lines.push("", `📁 <code>${escapeHTML(group.workspace)}</code>`);
+      for (const ticket of group.tickets) {
+        const chatId = parseContextKey(ticket.inboxContextKey).chatId;
+        const label = escapeHTML(ticketHeading(ticket));
+        const started = ticket.startedAt === undefined ? "" : " · разбор запущен";
+        lines.push(
+          ticket.workTopicId
+            ? `• <a href="${topicUrl(chatId, ticket.workTopicId)}">${label}</a>${started}`
+            : `• ${label}${started}`,
+        );
+      }
+    }
+
+    const html = lines.join("\n");
+    await safeReply(ctx, html, {
+      fallbackText: unresolved.map((ticket) => ticketHeading(ticket)).join("\n"),
+    });
+  });
+
   const ticketTextOf = (group: InboxItem[]): string =>
     group
       .map((item) => item.text)
@@ -2113,7 +2152,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     await sendTextMessage(bot.api, first.chatId, card, {
       messageThreadId: topic.message_thread_id,
       fallbackText: `${ticketHeading(ticket)}. Источник: ${source}`,
-      replyMarkup: new InlineKeyboard().text("▶️ Запустить разбор", `ticket_start:${ticket.id}`),
+      replyMarkup: ticketKeyboard(ticket),
     });
 
     await forwardAttachments(group, topic.message_thread_id, ticket.id);
@@ -2230,11 +2269,40 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     await ctx.answerCallbackQuery({ text: "Запускаю разбор..." });
     inbox.markStarted(ticket.id);
     try {
-      await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+      await ctx.editMessageReplyMarkup({ reply_markup: ticketKeyboard(inbox.getTicket(ticket.id)!) });
     } catch {
       // The card may already have lost its keyboard; nothing to undo.
     }
     await handleUserPrompt(ctx, contextKey, ctx.chat!.id, session, ticket.prompt);
+  });
+
+  bot.callbackQuery(/^ticket_done:(\d+)$/, async (ctx) => {
+    const ticketId = Number.parseInt(ctx.match?.[1] ?? "", 10);
+    const ticket = Number.isNaN(ticketId) ? undefined : inbox.getTicket(ticketId);
+    if (!ticket) {
+      await ctx.answerCallbackQuery({ text: "Тикет не найден" });
+      return;
+    }
+    if (!inbox.markResolved(ticket.id)) {
+      await ctx.answerCallbackQuery({ text: "Тикет уже отмечен решённым" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Тикет решён" });
+    try {
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+    } catch {
+      // The card may already have lost its keyboard; nothing to undo.
+    }
+
+    const inboxContext = parseContextKey(ticket.inboxContextKey);
+    const url = topicUrl(inboxContext.chatId, ticket.workTopicId);
+    const text = `✅ <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a> решён.`;
+    await sendTextMessage(bot.api, inboxContext.chatId, text, {
+      messageThreadId: inboxContext.messageThreadId,
+      fallbackText: `${ticketHeading(ticket)} решён: ${url}`,
+    });
+    await bot.api.closeForumTopic(inboxContext.chatId, ticket.workTopicId);
   });
 
   const recipeMutes = new RecipeMutes(RECIPE_MUTES_PATH);
@@ -2308,7 +2376,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     await sendTextMessage(bot.api, chatId, card, {
       messageThreadId: topic.message_thread_id,
       fallbackText: finding.description,
-      replyMarkup: new InlineKeyboard().text("\u25B6\uFE0F Запустить разбор", `ticket_start:${ticket.id}`),
+      replyMarkup: ticketKeyboard(ticket),
     });
 
     const url = topicUrl(chatId, topic.message_thread_id);
@@ -2714,9 +2782,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           await sendTextMessage(bot.api, chatId, renderJiraTaskCardHTML(task), {
             messageThreadId: topicId,
             fallbackText: `${task.key}: ${task.summary}`,
-            replyMarkup: new InlineKeyboard()
-              .text("▶️ Запустить разбор", `ticket_start:${ticket.id}`)
-              .url("Открыть в Jira", task.url),
+            replyMarkup: ticketKeyboard(ticket).url("Открыть в Jira", task.url),
           });
         },
       });
@@ -3829,6 +3895,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "projects", description: "Topics grouped by project" },
     { command: "jira", description: "Open Jira sprint and filters" },
     { command: "inbox", description: "Turn this topic into a ticket inbox" },
+    { command: "tickets", description: "List unresolved inbox tickets" },
     { command: "mr", description: "Open merge requests, tap to review" },
     { command: "retry", description: "Resend the last prompt" },
     { command: "abort", description: "Cancel current operation" },

@@ -52,6 +52,39 @@ export function ticketHeading(ticket: { id: number; externalKey?: string }): str
   return ticket.externalKey ? formatKey(ticket.externalKey) : `Тикет #${ticket.id}`;
 }
 
+export function ticketActionButtons(
+  ticket: Pick<Ticket, "id" | "startedAt" | "resolvedAt">,
+): Array<{ label: string; callbackData: string }> {
+  if (ticket.resolvedAt !== undefined) {
+    return [];
+  }
+
+  const buttons = [];
+  if (ticket.startedAt === undefined) {
+    buttons.push({ label: "▶️ Запустить разбор", callbackData: `ticket_start:${ticket.id}` });
+  }
+  buttons.push({ label: "✅ Решён", callbackData: `ticket_done:${ticket.id}` });
+  return buttons;
+}
+
+export function groupTicketsByWorkspace<T extends { workspace: string }>(
+  tickets: T[],
+): Array<{ workspace: string; tickets: T[] }> {
+  const groups = new Map<string, T[]>();
+  for (const ticket of tickets) {
+    const group = groups.get(ticket.workspace);
+    if (group) {
+      group.push(ticket);
+    } else {
+      groups.set(ticket.workspace, [ticket]);
+    }
+  }
+  return [...groups].map(([workspace, groupedTickets]) => ({
+    workspace,
+    tickets: groupedTickets,
+  }));
+}
+
 export function ticketTopicName(id: number, text: string): string {
   const key = extractTicketKey(text);
   const label = key ? formatKey(key) : `#${id}`;
@@ -252,6 +285,7 @@ export interface Ticket {
   source: string;
   createdAt: number;
   startedAt?: number;
+  resolvedAt?: number;
 }
 
 interface InboxFile {
@@ -352,6 +386,36 @@ export class InboxStore {
     }
     ticket.startedAt = now;
     this.save();
+  }
+
+  markResolved(id: number, now = Date.now()): boolean {
+    const ticket = this.data.tickets[String(id)];
+    if (!ticket || ticket.resolvedAt !== undefined) {
+      return false;
+    }
+    ticket.resolvedAt = now;
+    this.save();
+    return true;
+  }
+
+  reopen(id: number): boolean {
+    const ticket = this.data.tickets[String(id)];
+    if (!ticket || ticket.resolvedAt === undefined) {
+      return false;
+    }
+    delete ticket.resolvedAt;
+    this.save();
+    return true;
+  }
+
+  listUnresolved(inboxContextKey?: string): Ticket[] {
+    return Object.values(this.data.tickets)
+      .filter(
+        (ticket) =>
+          ticket.resolvedAt === undefined
+          && (inboxContextKey === undefined || ticket.inboxContextKey === inboxContextKey),
+      )
+      .sort((left, right) => left.createdAt - right.createdAt || left.id - right.id);
   }
 
   private load(): void {

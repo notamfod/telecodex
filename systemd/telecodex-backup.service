@@ -1,0 +1,12 @@
+[Unit]
+Description=Back up TeleCodex runtime state
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/Documents/Codex/2026-08-07-hermes/telecodex
+Environment=HOME=/root
+ExecStart=/root/Documents/Codex/2026-08-07-hermes/telecodex/scripts/backup-state.sh
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true

@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up TeleCodex runtime state daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 Europe/Moscow
+Persistent=true
+Unit=telecodex-backup.service
+
+[Install]
+WantedBy=timers.target

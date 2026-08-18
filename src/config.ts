@@ -26,6 +26,12 @@ export interface JiraPanelConfig {
   clientPath: string;
 }
 
+export interface JiraCommentConfig {
+  server: string;
+  login: string;
+  token: string;
+}
+
 export interface TeleCodexConfig {
   telegramBotToken: string;
   telegramAllowedUserIds: number[];
@@ -59,6 +65,7 @@ export interface TeleCodexConfig {
   telegramMaxActiveTopics: number;
   telegramProgressHeartbeatMs: number;
   jiraPanel?: JiraPanelConfig;
+  jiraComment?: JiraCommentConfig;
 }
 
 export function loadConfig(): TeleCodexConfig {
@@ -152,6 +159,11 @@ export function loadConfig(): TeleCodexConfig {
     optionalString(process.env.JIRA_PANEL_TOPIC_ID),
     optionalString(process.env.JIRA_CLIENT_PATH),
   );
+  const jiraComment = parseJiraCommentConfig(
+    optionalString(process.env.JIRA_COMMENT_SERVER),
+    optionalString(process.env.JIRA_COMMENT_LOGIN),
+    optionalString(process.env.JIRA_COMMENT_TOKEN),
+  );
 
   return {
     telegramBotToken,
@@ -185,7 +197,22 @@ export function loadConfig(): TeleCodexConfig {
     telegramMaxActiveTopics,
     telegramProgressHeartbeatMs,
     jiraPanel,
+    jiraComment,
   };
+}
+
+function parseJiraCommentConfig(
+  server: string | undefined,
+  login: string | undefined,
+  token: string | undefined,
+): JiraCommentConfig | undefined {
+  if (!server && !login && !token) return undefined;
+  if (!server || !login || !token) {
+    throw new Error(
+      "JIRA_COMMENT_SERVER, JIRA_COMMENT_LOGIN, and JIRA_COMMENT_TOKEN must be configured together",
+    );
+  }
+  return { server, login, token };
 }
 
 /**

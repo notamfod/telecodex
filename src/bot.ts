@@ -103,6 +103,13 @@ import {
 } from "./model-picker.js";
 import { JiraClient } from "./jira-client.js";
 import {
+  JiraCommentClient,
+  buildJiraComment,
+  canPostTicketToJira,
+  readTicketAnswer,
+  saveTicketAnswer,
+} from "./jira-comment.js";
+import {
   openJiraTaskThread,
   parseJiraTaskCallback,
   renderJiraTaskCardHTML,
@@ -191,6 +198,7 @@ interface PromptDispatchOptions {
   cleanupInbox?: { workspace: string; turnId: string };
   requireModelSelection?: boolean;
   transformFinalText?: (text: string) => string | Promise<string>;
+  afterFinalResponse?: (text: string, job: PersistentTelegramJob) => void | Promise<void>;
 }
 
 type RenderedText = {
@@ -380,6 +388,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     { processing: boolean; switching: boolean; transcribing: boolean }
   >();
   const inbox = new InboxStore(path.join(config.workspace, ".telecodex", "inbox.json"));
+  const jiraComment = config.jiraComment
+    ? new JiraCommentClient(config.jiraComment)
+    : undefined;
+  const pendingJiraPosts = new Set<number>();
   const gitlab =
     config.gitlabUrl && config.gitlabToken
       ? new GitLabClient(config.gitlabUrl, config.gitlabToken)
@@ -447,6 +459,40 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         }
       }
       return extracted.text;
+    };
+  };
+
+  const ticketPromptOptions = (messageThreadId?: number): PromptDispatchOptions => {
+    const ticket = messageThreadId ? inbox.findTicketByTopic(messageThreadId) : undefined;
+    return {
+      transformFinalText: ticketFinalTextTransformer(messageThreadId),
+      afterFinalResponse: ticket
+        ? async (text, job) => {
+            await saveTicketAnswer(config.workspace, ticket.id, text);
+            const current = inbox.getTicket(ticket.id);
+            if (
+              !jiraComment
+              || !current
+              || !canPostTicketToJira(current)
+              || jobStore.hasPart(job.id, "jira-confirm")
+            ) {
+              return;
+            }
+            const inboxContext = parseContextKey(current.inboxContextKey);
+            const keyboard = new InlineKeyboard().text("📤 В Jira", `jira_post:${current.id}`);
+            await sendTextMessage(
+              bot.api,
+              inboxContext.chatId,
+              `<b>Результат анализа сохранён.</b> Отправить в ${escapeHTML(current.externalKey!)}?`,
+              {
+                messageThreadId: current.workTopicId,
+                fallbackText: `Результат анализа сохранён. Отправить в ${current.externalKey}?`,
+                replyMarkup: keyboard,
+              },
+            );
+            jobStore.markPartSent(job.id, "jira-confirm");
+          }
+        : undefined,
     };
   };
 
@@ -812,15 +858,20 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           ? `**⛔ Ход остановлен хуком \`${hookBlock.eventName}\`**\n\n${hookBlock.reason}`
           : "**✅ Done**";
         await deliverRenderedChunks(splitMarkdownForTelegram(emptyTurnText));
-        return;
+      } else {
+        const chunks = splitMarkdownForTelegram(finalText);
+        if (!(chunks.length > 1 && (await deliverMarkdownDocument(finalText)))) {
+          await deliverRenderedChunks(chunks, finalText);
+        }
       }
 
-      const chunks = splitMarkdownForTelegram(finalText);
-      if (chunks.length > 1 && (await deliverMarkdownDocument(finalText))) {
-        return;
+      if (options.afterFinalResponse) {
+        try {
+          await options.afterFinalResponse(transformedText, persistentJob);
+        } catch (error) {
+          console.warn("Ticket post-processing failed:", friendlyErrorText(error));
+        }
       }
-
-      await deliverRenderedChunks(chunks, finalText);
     };
 
     const deliverGeneratedImages = async (): Promise<void> => {
@@ -2633,9 +2684,59 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     } catch {
       // The card may already have lost its keyboard; nothing to undo.
     }
-    await handleUserPrompt(ctx, contextKey, ctx.chat!.id, session, ticket.prompt, undefined, {
-      transformFinalText: ticketFinalTextTransformer(ticket.workTopicId),
-    });
+    await handleUserPrompt(
+      ctx,
+      contextKey,
+      ctx.chat!.id,
+      session,
+      ticket.prompt,
+      undefined,
+      ticketPromptOptions(ticket.workTopicId),
+    );
+  });
+
+  bot.callbackQuery(/^jira_post:(\d+)$/, async (ctx) => {
+    const ticketId = Number.parseInt(ctx.match?.[1] ?? "", 10);
+    const ticket = Number.isNaN(ticketId) ? undefined : inbox.getTicket(ticketId);
+    const inboxContext = ticket ? parseContextKey(ticket.inboxContextKey) : undefined;
+    const callbackTopicId = ctx.callbackQuery.message?.message_thread_id;
+    if (
+      !ticket
+      || !inboxContext
+      || ctx.chat?.id !== inboxContext.chatId
+      || callbackTopicId !== ticket.workTopicId
+    ) {
+      await ctx.answerCallbackQuery({ text: "Тикет не найден" });
+      return;
+    }
+    if (!jiraComment || !canPostTicketToJira(ticket)) {
+      await ctx.answerCallbackQuery({ text: ticket.jiraCommentPostedAt ? "Уже отправлено" : "Jira не настроена" });
+      if (ticket.jiraCommentPostedAt) {
+        await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+      }
+      return;
+    }
+    if (pendingJiraPosts.has(ticket.id)) {
+      await ctx.answerCallbackQuery({ text: "Отправка уже идёт" });
+      return;
+    }
+
+    pendingJiraPosts.add(ticket.id);
+    await ctx.answerCallbackQuery({ text: "Отправляю в Jira..." });
+    try {
+      const answer = await readTicketAnswer(config.workspace, ticket.id);
+      const url = topicUrl(inboxContext.chatId, ticket.workTopicId);
+      await jiraComment.postComment(ticket.externalKey!, buildJiraComment(answer, url));
+      inbox.markJiraCommentPosted(ticket.id);
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+      const text = `✅ Комментарий отправлен в ${ticket.externalKey}.`;
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+    } catch (error) {
+      const text = `Не удалось отправить комментарий в Jira: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+    } finally {
+      pendingJiraPosts.delete(ticket.id);
+    }
   });
 
   bot.callbackQuery(/^ticket_done:(\d+)$/, async (ctx) => {
@@ -3470,8 +3571,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         released.input,
         released,
         {
+          ...ticketPromptOptions(released.messageThreadId),
           requireModelSelection: false,
-          transformFinalText: ticketFinalTextTransformer(released.messageThreadId),
         },
       );
     } catch (error) {
@@ -4082,8 +4183,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           job.input,
           job,
           {
+            ...ticketPromptOptions(job.messageThreadId),
             requireModelSelection: false,
-            transformFinalText: ticketFinalTextTransformer(job.messageThreadId),
           },
         );
       } catch (error) {

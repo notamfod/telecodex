@@ -35,6 +35,12 @@ const KEY_PATTERNS = [
   /(?:^|\s)#(\d+)\b/,
 ];
 
+const JIRA_ISSUE_KEY_PATTERN = /^[A-Z][A-Z0-9]{1,15}-\d+$/;
+
+export function isJiraIssueKey(value: string): boolean {
+  return JIRA_ISSUE_KEY_PATTERN.test(value.toUpperCase());
+}
+
 /** Below this a line is a header like "💬 #240 Comments" rather than a title. */
 const MIN_MEANINGFUL_LENGTH = 15;
 
@@ -359,6 +365,7 @@ export interface Ticket {
   resolvedAt?: number;
   supersedesId?: number;
   topicTitle?: string;
+  jiraCommentPostedAt?: number;
 }
 
 interface InboxFile {
@@ -536,6 +543,16 @@ export class InboxStore {
       return false;
     }
     ticket.resolvedAt = now;
+    this.save();
+    return true;
+  }
+
+  markJiraCommentPosted(id: number, now = Date.now()): boolean {
+    const ticket = this.data.tickets[String(id)];
+    if (!ticket || ticket.jiraCommentPostedAt !== undefined) {
+      return false;
+    }
+    ticket.jiraCommentPostedAt = now;
     this.save();
     return true;
   }

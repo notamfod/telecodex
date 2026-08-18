@@ -489,6 +489,23 @@ describe("InboxStore", () => {
     expect(new InboxStore(file).getTicket(ticket.id)?.resolvedAt).toBe(1_786_000_000);
   });
 
+  it("persists the first successful Jira comment time", () => {
+    const file = storePath();
+    const store = new InboxStore(file);
+    const ticket = store.createTicket({
+      inboxContextKey: "-100123:5",
+      externalKey: "MIR-123",
+      workTopicId: 512,
+      workspace: settings.workspace,
+      prompt: "prompt",
+      source: "источник неизвестен",
+    });
+
+    expect(store.markJiraCommentPosted(ticket.id, 1_786_000_000)).toBe(true);
+    expect(store.markJiraCommentPosted(ticket.id, 1_786_000_999)).toBe(false);
+    expect(new InboxStore(file).getTicket(ticket.id)?.jiraCommentPostedAt).toBe(1_786_000_000);
+  });
+
   it("lists only unresolved tickets in stable oldest-first order", () => {
     const store = new InboxStore(storePath());
     const first = store.createTicket({

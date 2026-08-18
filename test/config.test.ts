@@ -37,6 +37,9 @@ describe("loadConfig", () => {
     delete process.env.JIRA_PANEL_CHAT_ID;
     delete process.env.JIRA_PANEL_TOPIC_ID;
     delete process.env.JIRA_CLIENT_PATH;
+    delete process.env.JIRA_COMMENT_SERVER;
+    delete process.env.JIRA_COMMENT_LOGIN;
+    delete process.env.JIRA_COMMENT_TOKEN;
     delete process.env.container;
   });
 
@@ -123,6 +126,7 @@ describe("loadConfig", () => {
       telegramProgressHeartbeatMs: 120_000,
       statusBoardIntervalMs: 30_000,
       jiraPanel: undefined,
+      jiraComment: undefined,
     });
   });
 
@@ -175,6 +179,7 @@ describe("loadConfig", () => {
     expect(config.telegramProgressHeartbeatMs).toBe(120_000);
     expect(config.workspace).toBe(process.cwd());
     expect(config.jiraPanel).toBeUndefined();
+    expect(config.jiraComment).toBeUndefined();
   });
 
   it("parses the Jira panel topic and executable", () => {
@@ -200,6 +205,25 @@ describe("loadConfig", () => {
 
     expect(() => loadConfig()).toThrow(
       "JIRA_PANEL_CHAT_ID and JIRA_PANEL_TOPIC_ID must be configured together",
+    );
+  });
+
+  it("parses Jira comment credentials only as a complete set", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.JIRA_COMMENT_SERVER = "https://jira.example.test";
+    process.env.JIRA_COMMENT_LOGIN = "agent";
+    process.env.JIRA_COMMENT_TOKEN = "token";
+
+    expect(loadConfig().jiraComment).toEqual({
+      server: "https://jira.example.test",
+      login: "agent",
+      token: "token",
+    });
+
+    delete process.env.JIRA_COMMENT_TOKEN;
+    expect(() => loadConfig()).toThrow(
+      "JIRA_COMMENT_SERVER, JIRA_COMMENT_LOGIN, and JIRA_COMMENT_TOKEN must be configured together",
     );
   });
 

@@ -32,6 +32,16 @@ describe("TeleCodex command menu", () => {
       { command: "usage", description: "Token usage by project" },
     ]));
   });
+
+  it("registers /sentry for manual bridge runs", async () => {
+    const setMyCommands = vi.fn().mockResolvedValue(undefined);
+
+    await registerCommands({ api: { setMyCommands } } as never);
+
+    expect(setMyCommands).toHaveBeenCalledWith(expect.arrayContaining([
+      { command: "sentry", description: "Import unseen Sentry issues" },
+    ]));
+  });
 });
 
 describe("usage report", () => {

@@ -109,8 +109,8 @@ export function groupTicketsByWorkspace<T extends { workspace: string }>(
   }));
 }
 
-export function ticketTopicName(id: number, text: string): string {
-  const key = extractTicketKey(text);
+export function ticketTopicName(id: number, text: string, externalKey?: string): string {
+  const key = externalKey ?? extractTicketKey(text);
   const label = key ? formatKey(key) : `#${id}`;
   const summary = ticketSummary(text, key);
 

@@ -40,6 +40,12 @@ describe("loadConfig", () => {
     delete process.env.JIRA_COMMENT_SERVER;
     delete process.env.JIRA_COMMENT_LOGIN;
     delete process.env.JIRA_COMMENT_TOKEN;
+    delete process.env.SENTRY_URL;
+    delete process.env.SENTRY_TOKEN;
+    delete process.env.SENTRY_ORG;
+    delete process.env.SENTRY_BRIDGE_MAP_JSON;
+    delete process.env.SENTRY_BRIDGE_INTERVAL_SECONDS;
+    delete process.env.SENTRY_BRIDGE_LIMIT;
     delete process.env.container;
   });
 
@@ -127,6 +133,7 @@ describe("loadConfig", () => {
       statusBoardIntervalMs: 30_000,
       jiraPanel: undefined,
       jiraComment: undefined,
+      sentryBridge: undefined,
     });
   });
 
@@ -180,6 +187,7 @@ describe("loadConfig", () => {
     expect(config.workspace).toBe(process.cwd());
     expect(config.jiraPanel).toBeUndefined();
     expect(config.jiraComment).toBeUndefined();
+    expect(config.sentryBridge).toBeUndefined();
   });
 
   it("parses the Jira panel topic and executable", () => {
@@ -224,6 +232,48 @@ describe("loadConfig", () => {
     delete process.env.JIRA_COMMENT_TOKEN;
     expect(() => loadConfig()).toThrow(
       "JIRA_COMMENT_SERVER, JIRA_COMMENT_LOGIN, and JIRA_COMMENT_TOKEN must be configured together",
+    );
+  });
+
+  it("parses a complete Sentry bridge configuration", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.SENTRY_URL = "https://sentry.example.test";
+    process.env.SENTRY_TOKEN = "token";
+    process.env.SENTRY_ORG = "mircli";
+    process.env.SENTRY_BRIDGE_MAP_JSON = JSON.stringify({
+      "mir-back": { inboxContextKey: "-100123:537", workspace: "/work/mircli" },
+    });
+    process.env.SENTRY_BRIDGE_INTERVAL_SECONDS = "300";
+    process.env.SENTRY_BRIDGE_LIMIT = "2";
+
+    expect(loadConfig().sentryBridge).toEqual({
+      baseUrl: "https://sentry.example.test",
+      token: "token",
+      org: "mircli",
+      mappings: {
+        "mir-back": { inboxContextKey: "-100123:537", workspace: "/work/mircli" },
+      },
+      intervalMs: 300_000,
+      limit: 2,
+    });
+  });
+
+  it("rejects partial or too-frequent Sentry bridge configuration", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.SENTRY_URL = "https://sentry.example.test";
+
+    expect(() => loadConfig()).toThrow("Sentry bridge credentials and map must be configured together");
+
+    process.env.SENTRY_TOKEN = "token";
+    process.env.SENTRY_ORG = "mircli";
+    process.env.SENTRY_BRIDGE_MAP_JSON = JSON.stringify({
+      "mir-back": { inboxContextKey: "-100123:537", workspace: "/work/mircli" },
+    });
+    process.env.SENTRY_BRIDGE_INTERVAL_SECONDS = "299";
+    expect(() => loadConfig()).toThrow(
+      "SENTRY_BRIDGE_INTERVAL_SECONDS must be an integer of at least 300",
     );
   });
 

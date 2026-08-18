@@ -92,6 +92,12 @@ describe("ticketTopicName with a source key", () => {
       "#9 Оплата не проходит по карте",
     );
   });
+
+  it("uses an explicit Sentry short id even when it has multiple dashes", () => {
+    expect(ticketTopicName(9, "Checkout failed in API", "MIR-BACK-2")).toBe(
+      "MIR-BACK-2 Checkout failed in API",
+    );
+  });
 });
 
 describe("hasAttachment", () => {

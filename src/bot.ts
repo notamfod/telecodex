@@ -130,6 +130,12 @@ import {
 import { buildFixPrompt, fingerprintFinding, fixTopicName } from "./recipes.js";
 import { parseRecipes, RECIPE_CONFIG_PATH } from "./recipe-config.js";
 import { SessionRegistry } from "./session-registry.js";
+import {
+  SentryBridge,
+  renderSentryTicketText,
+  type SentryIssue,
+  type SentryBridgeTarget,
+} from "./sentry-bridge.js";
 import { listHostThreads } from "./host-threads.js";
 import {
   buildStatusSnapshot,
@@ -227,6 +233,7 @@ export interface TeleCodexBot extends Bot<Context> {
   recoverPendingJobs(): Promise<void>;
   statusBoard?: StatusBoard;
   jiraPanel?: JiraPanel;
+  sentryBridge?: SentryBridge;
 }
 
 function boardKeyboard(buttons: BoardButton[]): InlineKeyboard | undefined {
@@ -2310,6 +2317,34 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
   });
 
+  bot.command("sentry", async (ctx) => {
+    if (!bot.sentryBridge) {
+      const text = "Sentry bridge не настроен.";
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+    const rawHours = String(ctx.match ?? "").trim();
+    const hours = rawHours ? Number(rawHours) : 24;
+    if (!Number.isInteger(hours) || hours < 1 || hours > 720) {
+      await safeReply(ctx, "Использование: <code>/sentry [hours]</code>, от 1 до 720", {
+        fallbackText: "Использование: /sentry [hours], от 1 до 720",
+      });
+      return;
+    }
+    const result = await bot.sentryBridge.run(hours);
+    const lines = [
+      `<b>Sentry за ${hours} ч.</b>`,
+      `Получено: ${result.fetched}`,
+      `Создано тикетов: ${result.created}`,
+      `Уже обработано: ${result.skipped}`,
+      result.failures.length
+        ? `Ошибки: ${escapeHTML(result.failures.join("; "))}`
+        : "Ошибок нет.",
+    ];
+    const plain = lines.map((line) => line.replace(/<[^>]+>/g, ""));
+    await safeReply(ctx, lines.join("\n"), { fallbackText: plain.join("\n") });
+  });
+
   bot.command("title", async (ctx) => {
     const chatId = ctx.chat?.id;
     const messageThreadId = ctx.message?.message_thread_id;
@@ -2426,6 +2461,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       skipDuplicateCheck?: boolean;
       supersedesId?: number;
       continueTicketId?: number;
+      externalKeyOverride?: string;
+      sourceOverride?: string;
     } = {},
   ): Promise<void> => {
     const [first] = group;
@@ -2438,8 +2475,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
 
     const text = ticketTextOf(group);
-    const source = describeSource(first.message);
-    const externalKey = extractTicketKey(text);
+    const source = options.sourceOverride ?? describeSource(first.message);
+    const externalKey = options.externalKeyOverride ?? extractTicketKey(text);
 
     if (externalKey && !options.skipDuplicateCheck) {
       const candidates = inbox.listTicketsByKey(first.contextKey, externalKey);
@@ -2493,7 +2530,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       supersedesId: options.supersedesId,
     });
 
-    const topicName = ticketTopicName(pendingTicket.id, text);
+    const topicName = ticketTopicName(pendingTicket.id, text, pendingTicket.externalKey);
     const topic = await bot.api.createForumTopic(
       first.chatId,
       topicName,
@@ -2568,6 +2605,46 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }
     }
   };
+
+  const createSentryTicket = async (
+    issue: SentryIssue,
+    target: SentryBridgeTarget,
+    project: string,
+  ): Promise<void> => {
+    const settings = inbox.get(target.inboxContextKey);
+    if (!settings) {
+      throw new Error(`Inbox ${target.inboxContextKey} is not configured`);
+    }
+    if (settings.workspace !== target.workspace) {
+      throw new Error(
+        `Inbox ${target.inboxContextKey} workspace mismatch: ${settings.workspace}`,
+      );
+    }
+    const parsed = parseContextKey(target.inboxContextKey);
+    if (!parsed.messageThreadId || !Number.isFinite(parsed.chatId)) {
+      throw new Error(`Inbox ${target.inboxContextKey} is not a forum topic`);
+    }
+    await createTicket([{
+      contextKey: target.inboxContextKey,
+      chatId: parsed.chatId,
+      messageId: 0,
+      hasAttachment: false,
+      text: renderSentryTicketText(issue),
+      message: {},
+    }], {
+      skipDuplicateCheck: true,
+      externalKeyOverride: issue.shortId,
+      sourceOverride: `Sentry project ${project}`,
+    });
+  };
+
+  if (config.sentryBridge) {
+    bot.sentryBridge = new SentryBridge({
+      ...config.sentryBridge,
+      statePath: path.join(config.workspace, ".telecodex", "sentry-bridge.json"),
+      createTicket: createSentryTicket,
+    });
+  }
 
   const askHowToSplit = async (groups: InboxItem[][]): Promise<void> => {
     const first = groups[0]?.[0];
@@ -4366,6 +4443,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "inbox", description: "Turn this topic into a ticket inbox" },
     { command: "tickets", description: "List unresolved inbox tickets" },
     { command: "usage", description: "Token usage by project" },
+    { command: "sentry", description: "Import unseen Sentry issues" },
     { command: "title", description: "Rename the current ticket topic" },
     { command: "mr", description: "Open merge requests, tap to review" },
     { command: "retry", description: "Resend the last prompt" },

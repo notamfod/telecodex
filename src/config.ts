@@ -32,6 +32,20 @@ export interface JiraCommentConfig {
   token: string;
 }
 
+export interface SentryBridgeTargetConfig {
+  inboxContextKey: string;
+  workspace: string;
+}
+
+export interface SentryBridgeConfig {
+  baseUrl: string;
+  token: string;
+  org: string;
+  mappings: Record<string, SentryBridgeTargetConfig>;
+  intervalMs: number;
+  limit: number;
+}
+
 export interface TeleCodexConfig {
   telegramBotToken: string;
   telegramAllowedUserIds: number[];
@@ -66,6 +80,7 @@ export interface TeleCodexConfig {
   telegramProgressHeartbeatMs: number;
   jiraPanel?: JiraPanelConfig;
   jiraComment?: JiraCommentConfig;
+  sentryBridge?: SentryBridgeConfig;
 }
 
 export function loadConfig(): TeleCodexConfig {
@@ -164,6 +179,14 @@ export function loadConfig(): TeleCodexConfig {
     optionalString(process.env.JIRA_COMMENT_LOGIN),
     optionalString(process.env.JIRA_COMMENT_TOKEN),
   );
+  const sentryBridge = parseSentryBridgeConfig(
+    optionalString(process.env.SENTRY_URL),
+    optionalString(process.env.SENTRY_TOKEN),
+    optionalString(process.env.SENTRY_ORG),
+    optionalString(process.env.SENTRY_BRIDGE_MAP_JSON),
+    optionalString(process.env.SENTRY_BRIDGE_INTERVAL_SECONDS),
+    optionalString(process.env.SENTRY_BRIDGE_LIMIT),
+  );
 
   return {
     telegramBotToken,
@@ -198,6 +221,65 @@ export function loadConfig(): TeleCodexConfig {
     telegramProgressHeartbeatMs,
     jiraPanel,
     jiraComment,
+    sentryBridge,
+  };
+}
+
+function parseSentryBridgeConfig(
+  baseUrl: string | undefined,
+  token: string | undefined,
+  org: string | undefined,
+  mapJson: string | undefined,
+  intervalSeconds: string | undefined,
+  limitRaw: string | undefined,
+): SentryBridgeConfig | undefined {
+  if (!baseUrl && !token && !org && !mapJson) return undefined;
+  if (!baseUrl || !token || !org || !mapJson) {
+    throw new Error("Sentry bridge credentials and map must be configured together");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(mapJson);
+  } catch {
+    throw new Error("SENTRY_BRIDGE_MAP_JSON must be valid JSON");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("SENTRY_BRIDGE_MAP_JSON must be an object keyed by Sentry project");
+  }
+  const mappings: Record<string, SentryBridgeTargetConfig> = {};
+  for (const [project, rawTarget] of Object.entries(value)) {
+    if (!project || !rawTarget || typeof rawTarget !== "object" || Array.isArray(rawTarget)) {
+      throw new Error(`Invalid Sentry bridge mapping for ${project || "(empty project)"}`);
+    }
+    const target = rawTarget as Record<string, unknown>;
+    if (
+      typeof target.inboxContextKey !== "string"
+      || !/^-?\d+:\d+$/.test(target.inboxContextKey)
+      || typeof target.workspace !== "string"
+      || !target.workspace
+    ) {
+      throw new Error(`Invalid Sentry bridge mapping for ${project}`);
+    }
+    mappings[project] = {
+      inboxContextKey: target.inboxContextKey,
+      workspace: target.workspace,
+    };
+  }
+  if (Object.keys(mappings).length === 0) {
+    throw new Error("SENTRY_BRIDGE_MAP_JSON must contain at least one project");
+  }
+  return {
+    baseUrl,
+    token,
+    org,
+    mappings,
+    intervalMs: parseIntegerSetting(
+      "SENTRY_BRIDGE_INTERVAL_SECONDS",
+      intervalSeconds,
+      900,
+      300,
+    ) * 1000,
+    limit: parseIntegerSetting("SENTRY_BRIDGE_LIMIT", limitRaw, 5, 1),
   };
 }
 

@@ -67,6 +67,13 @@ try {
     await bot.jiraPanel.openSafely();
     console.log(`Jira panel: configured for ${config.jiraPanel.chatId}:${config.jiraPanel.topicId}`);
   }
+
+  if (bot.sentryBridge && config.sentryBridge) {
+    bot.sentryBridge.start();
+    console.log(
+      `Sentry bridge: ${Object.keys(config.sentryBridge.mappings).length} project(s), every ${config.sentryBridge.intervalMs / 1000}s`,
+    );
+  }
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`Failed to start TeleCodex: ${message}`);
@@ -84,6 +91,7 @@ const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
   console.log(`Received ${signal}, shutting down TeleCodex...`);
   topicSynchronizer?.stop();
   bot?.statusBoard?.stop();
+  bot?.sentryBridge?.stop();
   const stoppedCleanly = runner
     ? await Promise.race([
         runner.stop().then(() => true, () => false),

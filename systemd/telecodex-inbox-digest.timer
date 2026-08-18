@@ -1,0 +1,10 @@
+[Unit]
+Description=Send the TeleCodex inbox digest on weekday mornings
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:00:00 Europe/Moscow
+Persistent=true
+Unit=telecodex-inbox-digest.service
+
+[Install]
+WantedBy=timers.target

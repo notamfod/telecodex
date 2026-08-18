@@ -1,0 +1,15 @@
+[Unit]
+Description=Send the TeleCodex morning inbox digest
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/Documents/Codex/2026-08-07-hermes/telecodex
+Environment=HOME=/root
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /root/Documents/Codex/2026-08-07-hermes/telecodex/dist/inbox-digest-cli.js
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true

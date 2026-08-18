@@ -22,6 +22,12 @@ export const DEFAULT_TICKET_TEMPLATE = [
   "только диагностика и предложение. Если данных не хватает, перечисли, что нужно уточнить.",
 ].join("\n");
 
+export const TOPIC_NAMING_INSTRUCTION = [
+  "Первой строкой ответа выведи:",
+  "TOPIC: <краткое название проблемы до 40 символов>",
+  "После пустой строки продолжи основной разбор.",
+].join("\n");
+
 /** Ordered by how much each form can be trusted to be a real ticket reference. */
 const KEY_PATTERNS = [
   /\/issues\/(\d+)\b/i,
@@ -202,7 +208,10 @@ export function buildTicketPrompt(
   template: string,
   values: { source: string; message: string },
 ): string {
-  return template.split("{source}").join(values.source).split("{message}").join(values.message);
+  const rendered = template
+    .split("{source}").join(values.source)
+    .split("{message}").join(values.message);
+  return `${rendered}\n\n${TOPIC_NAMING_INSTRUCTION}`;
 }
 
 export type InboxTemplateCommand =
@@ -336,6 +345,7 @@ export interface Ticket {
   startedAt?: number;
   resolvedAt?: number;
   supersedesId?: number;
+  topicTitle?: string;
 }
 
 interface InboxFile {
@@ -467,6 +477,16 @@ export class InboxStore {
     }
     ticket.startedAt = now;
     this.save();
+  }
+
+  setTopicTitle(id: number, topicTitle: string): boolean {
+    const ticket = this.data.tickets[String(id)];
+    if (!ticket) {
+      return false;
+    }
+    ticket.topicTitle = topicTitle;
+    this.save();
+    return true;
   }
 
   markResolved(id: number, now = Date.now()): boolean {

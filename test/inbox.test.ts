@@ -209,7 +209,8 @@ describe("buildTicketPrompt", () => {
       message: "Оплата падает",
     });
 
-    expect(prompt).toBe("From Мария К.: Оплата падает");
+    expect(prompt).toContain("From Мария К.: Оплата падает");
+    expect(prompt).toContain("TOPIC: <краткое название проблемы до 40 символов>");
   });
 
   it("keeps the request text out of the instruction section of the default template", () => {
@@ -416,6 +417,21 @@ describe("InboxStore", () => {
     store.markStarted(ticket.id, 1_786_000_000);
 
     expect(new InboxStore(file).getTicket(ticket.id)?.startedAt).toBe(1_786_000_000);
+  });
+
+  it("persists the generated topic title", () => {
+    const file = storePath();
+    const store = new InboxStore(file);
+    const ticket = store.createTicket({
+      inboxContextKey: "-100123:5",
+      workTopicId: 512,
+      workspace: settings.workspace,
+      prompt: "prompt",
+      source: "источник неизвестен",
+    });
+
+    expect(store.setTopicTitle(ticket.id, "Ошибка оплаты")).toBe(true);
+    expect(new InboxStore(file).getTicket(ticket.id)?.topicTitle).toBe("Ошибка оплаты");
   });
 
   it("persists resolution across restarts and keeps the first resolution time", () => {

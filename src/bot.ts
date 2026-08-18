@@ -142,6 +142,7 @@ import {
   TopicActivityIndicator,
   topicIconChangeFromMessage,
 } from "./topic-activity.js";
+import { extractTopicRename, renamedTicketTopic } from "./topic-naming.js";
 import {
   finalChunkThreadKeyboard,
   parseCodexThreadCallback,
@@ -179,6 +180,7 @@ type TextOptions = {
 interface PromptDispatchOptions {
   cleanupInbox?: { workspace: string; turnId: string };
   requireModelSelection?: boolean;
+  transformFinalText?: (text: string) => string | Promise<string>;
 }
 
 type RenderedText = {
@@ -396,6 +398,42 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   const promptTails = new Map<TelegramContextKey, Promise<void>>();
   const activeJobIds = new Map<TelegramContextKey, string>();
 
+  const ticketFinalTextTransformer = (
+    messageThreadId?: number,
+  ): PromptDispatchOptions["transformFinalText"] => {
+    const ticket = messageThreadId ? inbox.findTicketByTopic(messageThreadId) : undefined;
+    if (!ticket || ticket.topicTitle !== undefined) {
+      return undefined;
+    }
+
+    return async (text) => {
+      const extracted = extractTopicRename(text);
+      if (!extracted) {
+        return text;
+      }
+      const current = inbox.getTicket(ticket.id);
+      if (!current || current.topicTitle !== undefined) {
+        return extracted.text;
+      }
+
+      const inboxContext = parseContextKey(current.inboxContextKey);
+      const topicName = renamedTicketTopic(current, extracted.title);
+      try {
+        await bot.api.editForumTopic(inboxContext.chatId, current.workTopicId, {
+          name: topicName,
+        });
+        inbox.setTopicTitle(current.id, extracted.title);
+      } catch (error) {
+        if (/TOPIC_NOT_MODIFIED/i.test(formatError(error))) {
+          inbox.setTopicTitle(current.id, extracted.title);
+        } else {
+          console.warn(`Failed to rename ticket topic ${current.id}:`, formatError(error));
+        }
+      }
+      return extracted.text;
+    };
+  };
+
   registry.onRemove((key) => {
     contextBusy.delete(key);
     pendingLaunchPicks.delete(key);
@@ -595,6 +633,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     session: CodexSessionService,
     userInput: CodexPromptInput,
     persistentJob: PersistentTelegramJob,
+    options: PromptDispatchOptions,
   ): Promise<void> => {
     if (jobStore.get(persistentJob.id)?.state === "aborted") return;
     const parsed = parseContextKey(contextKey);
@@ -746,7 +785,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
 
       stopTyping();
 
-      const finalText = buildFinalResponseText(accumulatedText);
+      const transformedText = options.transformFinalText
+        ? await options.transformFinalText(accumulatedText)
+        : accumulatedText;
+      const finalText = buildFinalResponseText(transformedText);
       if (!finalText) {
         // A hook that blocked the prompt ends the turn as a success with nothing
         // in it, so an empty turn is the only chance to report the block.
@@ -1081,7 +1123,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           if (canWriteFiles) {
             await ensureOutDir(outDir);
           }
-          await executeUserPrompt(ctx, contextKey, chatId, session, input, persistentJob);
+          await executeUserPrompt(ctx, contextKey, chatId, session, input, persistentJob, options);
         } finally {
           if (activeJobIds.get(contextKey) === persistentJob.id) activeJobIds.delete(contextKey);
           try {
@@ -2077,6 +2119,37 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     });
   });
 
+  bot.command("title", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const messageThreadId = ctx.message?.message_thread_id;
+    const ticket = messageThreadId ? inbox.findTicketByTopic(messageThreadId) : undefined;
+    if (!chatId || !messageThreadId || !ticket) {
+      const text = "Команда /title работает только внутри топика тикета.";
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+
+    const requested = (ctx.message?.text ?? "").replace(/^\/title(?:@\w+)?\s*/, "").trim();
+    const extracted = extractTopicRename(`TOPIC: ${requested}\n\n`);
+    if (!extracted) {
+      const text = "Укажи безопасное непустое название: /title <текст>";
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+
+    const topicName = renamedTicketTopic(ticket, extracted.title);
+    try {
+      await bot.api.editForumTopic(chatId, messageThreadId, { name: topicName });
+    } catch (error) {
+      if (!/TOPIC_NOT_MODIFIED/i.test(formatError(error))) {
+        throw error;
+      }
+    }
+    inbox.setTopicTitle(ticket.id, extracted.title);
+    const text = `Топик переименован: ${topicName}`;
+    await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+  });
+
   const ticketTextOf = (group: InboxItem[]): string =>
     group
       .map((item) => item.text)
@@ -2398,7 +2471,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     } catch {
       // The card may already have lost its keyboard; nothing to undo.
     }
-    await handleUserPrompt(ctx, contextKey, ctx.chat!.id, session, ticket.prompt);
+    await handleUserPrompt(ctx, contextKey, ctx.chat!.id, session, ticket.prompt, undefined, {
+      transformFinalText: ticketFinalTextTransformer(ticket.workTopicId),
+    });
   });
 
   bot.callbackQuery(/^ticket_done:(\d+)$/, async (ctx) => {
@@ -3232,7 +3307,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         session,
         released.input,
         released,
-        { requireModelSelection: false },
+        {
+          requireModelSelection: false,
+          transformFinalText: ticketFinalTextTransformer(released.messageThreadId),
+        },
       );
     } catch (error) {
       await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
@@ -3841,7 +3919,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           session,
           job.input,
           job,
-          { requireModelSelection: false },
+          {
+            requireModelSelection: false,
+            transformFinalText: ticketFinalTextTransformer(job.messageThreadId),
+          },
         );
       } catch (error) {
         if (job.state === "active" && isTopicActivityEligible(job.messageThreadId)) {
@@ -4021,6 +4102,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "jira", description: "Open Jira sprint and filters" },
     { command: "inbox", description: "Turn this topic into a ticket inbox" },
     { command: "tickets", description: "List unresolved inbox tickets" },
+    { command: "title", description: "Rename the current ticket topic" },
     { command: "mr", description: "Open merge requests, tap to review" },
     { command: "retry", description: "Resend the last prompt" },
     { command: "abort", description: "Cancel current operation" },

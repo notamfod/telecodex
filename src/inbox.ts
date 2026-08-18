@@ -67,6 +67,18 @@ export function ticketActionButtons(
   return buttons;
 }
 
+export function duplicateTicketButtons(
+  decisionId: number,
+): Array<{ label: string; callbackData: string }> {
+  return [
+    {
+      label: "♻️ Продолжить старый тикет",
+      callbackData: `ticket_dup:${decisionId}:reuse`,
+    },
+    { label: "🆕 Новый тикет", callbackData: `ticket_dup:${decisionId}:new` },
+  ];
+}
+
 export function groupTicketsByWorkspace<T extends { workspace: string }>(
   tickets: T[],
 ): Array<{ workspace: string; tickets: T[] }> {
@@ -286,6 +298,7 @@ export interface Ticket {
   createdAt: number;
   startedAt?: number;
   resolvedAt?: number;
+  supersedesId?: number;
 }
 
 interface InboxFile {
@@ -347,6 +360,23 @@ export class InboxStore {
     this.save();
   }
 
+  continueTicket(
+    id: number,
+    input: { workTopicId: number; prompt: string; source: string },
+  ): Ticket | undefined {
+    const ticket = this.data.tickets[String(id)];
+    if (!ticket) {
+      return undefined;
+    }
+    ticket.workTopicId = input.workTopicId;
+    ticket.prompt = [ticket.prompt, "", "--- продолжение обращения ---", input.prompt].join("\n");
+    ticket.source = input.source;
+    delete ticket.startedAt;
+    delete ticket.resolvedAt;
+    this.save();
+    return structuredClone(ticket);
+  }
+
   /**
    * The ticket already tracking this source key in this inbox.
    *
@@ -355,6 +385,10 @@ export class InboxStore {
    * in billing and "#240" in storefront are unrelated.
    */
   findTicketByKey(inboxContextKey: string, externalKey: string): Ticket | undefined {
+    return this.listTicketsByKey(inboxContextKey, externalKey)[0];
+  }
+
+  listTicketsByKey(inboxContextKey: string, externalKey: string): Ticket[] {
     const key = externalKey.toUpperCase();
     return Object.values(this.data.tickets)
       .filter(
@@ -362,7 +396,7 @@ export class InboxStore {
           ticket.inboxContextKey === inboxContextKey &&
           ticket.externalKey?.toUpperCase() === key,
       )
-      .sort((a, b) => b.id - a.id)[0];
+      .sort((a, b) => b.id - a.id);
   }
 
   /** The ticket whose work topic this is, so a command typed inside it knows the key. */

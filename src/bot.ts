@@ -56,6 +56,7 @@ import {
   InboxStore,
   buildTicketPrompt,
   describeSource,
+  duplicateTicketButtons,
   extractTicketKey,
   hasAttachment,
   groupTicketsByWorkspace,
@@ -243,6 +244,14 @@ function ticketKeyboard(ticket: Pick<Ticket, "id" | "startedAt" | "resolvedAt">)
   return keyboard;
 }
 
+function duplicateTicketKeyboard(decisionId: number): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const button of duplicateTicketButtons(decisionId)) {
+    keyboard.text(button.label, button.callbackData).row();
+  }
+  return keyboard;
+}
+
 function promptText(input: CodexPromptInput): string {
   return typeof input === "string" ? input : input.text ?? "";
 }
@@ -362,6 +371,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   let nextDoneDraftId = 1;
   const pendingBatches = new Map<string, InboxItem[][]>();
   let nextBatchId = 1;
+  /** Duplicate choices intentionally expire on restart instead of guessing a branch. */
+  const pendingDuplicateDecisions = new Map<
+    number,
+    { group: InboxItem[]; previousTicketId: number }
+  >();
+  let nextDuplicateDecisionId = 1;
   const pendingProjectPicks = new Map<TelegramContextKey, string[]>();
   const pendingProjectButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingProjectSessionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
@@ -2088,7 +2103,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     );
   };
 
-  const createTicket = async (group: InboxItem[]): Promise<void> => {
+  const createTicket = async (
+    group: InboxItem[],
+    options: {
+      skipDuplicateCheck?: boolean;
+      supersedesId?: number;
+      continueTicketId?: number;
+    } = {},
+  ): Promise<void> => {
     const [first] = group;
     if (!first) {
       return;
@@ -2102,27 +2124,55 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     const source = describeSource(first.message);
     const externalKey = extractTicketKey(text);
 
-    // A repeat forward about the same issue belongs in the topic that already
-    // tracks it, unless that topic has since been deleted.
-    const existing = externalKey
-      ? inbox.findTicketByKey(first.contextKey, externalKey)
-      : undefined;
-    if (existing?.workTopicId && (await topicIsAlive(first.chatId, existing.workTopicId))) {
-      await appendToTicket(existing, group, text, source);
-      return;
+    if (externalKey && !options.skipDuplicateCheck) {
+      const candidates = inbox.listTicketsByKey(first.contextKey, externalKey);
+      for (const candidate of candidates) {
+        if (candidate.resolvedAt !== undefined || !candidate.workTopicId) {
+          continue;
+        }
+        const live = await topicIsAlive(first.chatId, candidate.workTopicId).catch(() => false);
+        if (live) {
+          await appendToTicket(candidate, group, text, source);
+          return;
+        }
+      }
+
+      const previous = candidates[0];
+      if (previous) {
+        const decisionId = nextDuplicateDecisionId++;
+        pendingDuplicateDecisions.set(decisionId, { group, previousTicketId: previous.id });
+        const message = [
+          `Нашёл ${ticketHeading(previous)}, но активного рабочего топика у него нет.`,
+          "Продолжить старый тикет или завести новый?",
+        ].join("\n");
+        await sendTextMessage(bot.api, first.chatId, escapeHTML(message), {
+          messageThreadId: parseContextKey(first.contextKey).messageThreadId,
+          fallbackText: message,
+          replyMarkup: duplicateTicketKeyboard(decisionId),
+        });
+        return;
+      }
     }
 
-    const ticket = inbox.createTicket({
+    const prompt = buildTicketPrompt(settings.template, { source, message: text });
+    const continuedTicket = options.continueTicketId
+      ? inbox.getTicket(options.continueTicketId)
+      : undefined;
+    if (options.continueTicketId && !continuedTicket) {
+      throw new Error(`Ticket ${options.continueTicketId} no longer exists`);
+    }
+    const pendingTicket = continuedTicket ?? inbox.createTicket({
       inboxContextKey: first.contextKey,
       externalKey,
       workTopicId: 0,
       workspace: settings.workspace,
       launchProfileId: settings.launchProfileId,
-      prompt: buildTicketPrompt(settings.template, { source, message: text }),
+      prompt,
       source,
+      supersedesId: options.supersedesId,
     });
 
-    const topicName = ticketTopicName(ticket.id, text);
+    const topicName = ticketTopicName(pendingTicket.id, text);
     const topic = await bot.api.createForumTopic(
       first.chatId,
       topicName,
@@ -2135,7 +2185,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       topic.message_thread_id,
       settings.iconCustomEmojiId ?? null,
     );
-    inbox.attachTopic(ticket.id, topic.message_thread_id);
+    const ticket = continuedTicket
+      ? inbox.continueTicket(continuedTicket.id, {
+          workTopicId: topic.message_thread_id,
+          prompt,
+          source,
+        })!
+      : pendingTicket;
+    if (!continuedTicket) {
+      inbox.attachTopic(ticket.id, topic.message_thread_id);
+    }
     registry.setContextDefaults(
       contextKeyFromMessage(first.chatId, topic.message_thread_id),
       { workspace: settings.workspace, launchProfileId: settings.launchProfileId, topicName },
@@ -2145,9 +2204,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       `🎫 <b>${escapeHTML(ticketHeading(ticket))}</b>`,
       `Источник: ${escapeHTML(source)}`,
       `Проект: <code>${escapeHTML(settings.workspace)}</code>`,
+      ticket.supersedesId
+        ? `Предыдущий: ${escapeHTML(ticketHeading(inbox.getTicket(ticket.supersedesId) ?? { id: ticket.supersedesId }))}`
+        : undefined,
       "",
       escapeHTML(text || "(без текста, см. пересланные сообщения ниже)"),
-    ].join("\n");
+    ].filter((line): line is string => line !== undefined).join("\n");
 
     await sendTextMessage(bot.api, first.chatId, card, {
       messageThreadId: topic.message_thread_id,
@@ -2161,7 +2223,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     await sendTextMessage(
       bot.api,
       first.chatId,
-      `Заведён тикет <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a>.`,
+      `${continuedTicket ? "Тикет продолжен" : "Заведён тикет"} <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a>.`,
       {
         messageThreadId: parseContextKey(first.contextKey).messageThreadId,
         fallbackText: `${ticketHeading(ticket)}: ${url}`,
@@ -2242,6 +2304,34 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       choice === "one" ? "Завожу один тикет..." : `Завожу тикетов: ${batches.length}...`,
     );
     await createTicketsSequentially(batches);
+  });
+
+  bot.callbackQuery(/^ticket_dup:(\d+):(reuse|new)$/, async (ctx) => {
+    const decisionId = Number.parseInt(ctx.match?.[1] ?? "", 10);
+    const choice = ctx.match?.[2];
+    const pending = Number.isNaN(decisionId)
+      ? undefined
+      : pendingDuplicateDecisions.get(decisionId);
+    if (!pending || (choice !== "reuse" && choice !== "new")) {
+      await ctx.answerCallbackQuery({ text: "Выбор устарел, перешли сообщение заново" });
+      return;
+    }
+    pendingDuplicateDecisions.delete(decisionId);
+
+    await ctx.answerCallbackQuery({
+      text: choice === "reuse" ? "Продолжаю тикет..." : "Создаю новый тикет...",
+    });
+    try {
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+    } catch {
+      // The decision message may already have lost its keyboard.
+    }
+    await createTicket(pending.group, {
+      skipDuplicateCheck: true,
+      ...(choice === "reuse"
+        ? { continueTicketId: pending.previousTicketId }
+        : { supersedesId: pending.previousTicketId }),
+    });
   });
 
   bot.callbackQuery(/^ticket_start:(\d+)$/, async (ctx) => {

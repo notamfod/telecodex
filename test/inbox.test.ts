@@ -10,6 +10,7 @@ import {
   DEFAULT_TICKET_TEMPLATE,
   buildTicketPrompt,
   describeSource,
+  duplicateTicketButtons,
   extractTicketKey,
   groupTicketsByWorkspace,
   hasAttachment,
@@ -135,6 +136,15 @@ describe("ticketActionButtons", () => {
 
   it("offers no actions for a resolved ticket", () => {
     expect(ticketActionButtons({ id: 7, resolvedAt: 456 })).toEqual([]);
+  });
+});
+
+describe("duplicateTicketButtons", () => {
+  it("offers an explicit continuation or a superseding ticket", () => {
+    expect(duplicateTicketButtons(12)).toEqual([
+      { label: "♻️ Продолжить старый тикет", callbackData: "ticket_dup:12:reuse" },
+      { label: "🆕 Новый тикет", callbackData: "ticket_dup:12:new" },
+    ]);
   });
 });
 
@@ -423,6 +433,37 @@ describe("InboxStore", () => {
     expect(new InboxStore(file).listUnresolved().map((entry) => entry.id)).toEqual([ticket.id]);
   });
 
+  it("reattaches an old ticket as a fresh continuation", () => {
+    const file = storePath();
+    const store = new InboxStore(file);
+    const ticket = store.createTicket({
+      inboxContextKey: "-100123:5",
+      workTopicId: 512,
+      workspace: settings.workspace,
+      prompt: "old prompt",
+      source: "старый источник",
+    });
+    store.markStarted(ticket.id, 1_000);
+    store.markResolved(ticket.id, 2_000);
+
+    const continued = store.continueTicket(ticket.id, {
+      workTopicId: 700,
+      prompt: "new prompt",
+      source: "новый источник",
+    });
+
+    expect(continued).toEqual(expect.objectContaining({
+      id: ticket.id,
+      workTopicId: 700,
+      source: "новый источник",
+    }));
+    expect(continued?.prompt).toContain("old prompt");
+    expect(continued?.prompt).toContain("new prompt");
+    expect(continued?.startedAt).toBeUndefined();
+    expect(continued?.resolvedAt).toBeUndefined();
+    expect(new InboxStore(file).getTicket(ticket.id)).toEqual(continued);
+  });
+
   it("finds the ticket a topic belongs to, which is how /done knows the key", () => {
     const store = new InboxStore(storePath());
     const ticket = store.createTicket({
@@ -528,6 +569,49 @@ describe("InboxStore", () => {
     const second = store.createTicket({ ...shared, workTopicId: 600 });
 
     expect(store.findTicketByKey("-100123:5", "MIR-6319")?.id).toBe(second.id);
+  });
+
+  it("lists all matching tickets newest first, including resolved candidates", () => {
+    const store = new InboxStore(storePath());
+    const shared = {
+      externalKey: "MIR-6319",
+      inboxContextKey: "-100123:5",
+      workspace: settings.workspace,
+      prompt: "prompt",
+      source: "источник неизвестен",
+    };
+    const first = store.createTicket({ ...shared, workTopicId: 512 });
+    const second = store.createTicket({ ...shared, workTopicId: 600 });
+    store.markResolved(second.id, 3_000);
+
+    expect(store.listTicketsByKey("-100123:5", "mir-6319").map((ticket) => ticket.id)).toEqual([
+      second.id,
+      first.id,
+    ]);
+  });
+
+  it("persists which previous ticket a new one supersedes", () => {
+    const file = storePath();
+    const store = new InboxStore(file);
+    const previous = store.createTicket({
+      externalKey: "MIR-6319",
+      inboxContextKey: "-100123:5",
+      workTopicId: 512,
+      workspace: settings.workspace,
+      prompt: "old",
+      source: "источник неизвестен",
+    });
+    const next = store.createTicket({
+      externalKey: "MIR-6319",
+      inboxContextKey: "-100123:5",
+      workTopicId: 600,
+      workspace: settings.workspace,
+      prompt: "new",
+      source: "источник неизвестен",
+      supersedesId: previous.id,
+    });
+
+    expect(new InboxStore(file).getTicket(next.id)?.supersedesId).toBe(previous.id);
   });
 
   it("still finds the ticket after a restart", () => {

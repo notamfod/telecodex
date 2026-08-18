@@ -61,9 +61,11 @@ import {
   hasAttachment,
   groupTicketsByWorkspace,
   groupBurst,
+  parseInboxTemplateCommand,
   ticketActionButtons,
   ticketHeading,
   ticketTopicName,
+  validateTicketTemplate,
   type Ticket,
 } from "./inbox.js";
 import {
@@ -1952,6 +1954,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     "/inbox on [путь] — сделать этот топик инбоксом",
     "/inbox off — выключить",
     "/inbox status — показать настройки",
+    "/inbox template — показать шаблон",
+    "/inbox template set <текст> — изменить шаблон",
+    "/inbox template reset — вернуть шаблон по умолчанию",
   ].join("\n");
 
   bot.command("inbox", async (ctx) => {
@@ -1963,6 +1968,36 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     const args = (ctx.message?.text ?? "").replace(/^\/inbox(?:@\w+)?\s*/, "").trim();
     const [action, ...rest] = args.split(/\s+/);
     const settings = inbox.get(contextKey);
+    const templateCommand = parseInboxTemplateCommand(args);
+
+    if (templateCommand) {
+      if (!settings) {
+        const text = "Сначала включи этот инбокс: /inbox on [путь]";
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+        return;
+      }
+      if (templateCommand.action === "show") {
+        await safeReply(ctx, `<b>Шаблон тикета:</b>\n<pre>${escapeHTML(settings.template)}</pre>`, {
+          fallbackText: `Шаблон тикета:\n${settings.template}`,
+        });
+        return;
+      }
+
+      const template = templateCommand.action === "reset"
+        ? DEFAULT_TICKET_TEMPLATE
+        : templateCommand.template;
+      const validationError = validateTicketTemplate(template);
+      if (validationError) {
+        await safeReply(ctx, escapeHTML(validationError), { fallbackText: validationError });
+        return;
+      }
+      inbox.setTemplate(contextKey, template);
+      const text = templateCommand.action === "reset"
+        ? "Шаблон тикета сброшен."
+        : "Шаблон тикета обновлён.";
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
 
     if (action === "off") {
       const text = inbox.disable(contextKey)

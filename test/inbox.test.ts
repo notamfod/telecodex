@@ -14,10 +14,12 @@ import {
   extractTicketKey,
   groupTicketsByWorkspace,
   hasAttachment,
+  parseInboxTemplateCommand,
   ticketActionButtons,
   ticketHeading,
   groupBurst,
   ticketTopicName,
+  validateTicketTemplate,
 } from "../src/inbox.js";
 
 describe("ticketTopicName", () => {
@@ -225,6 +227,37 @@ describe("buildTicketPrompt", () => {
   });
 });
 
+describe("inbox template commands", () => {
+  it("parses show, reset, and set with literal newlines", () => {
+    expect(parseInboxTemplateCommand("template")).toEqual({ action: "show" });
+    expect(parseInboxTemplateCommand("template reset")).toEqual({ action: "reset" });
+    expect(parseInboxTemplateCommand("template set Источник: {source}\\n{message}")).toEqual({
+      action: "set",
+      template: "Источник: {source}\n{message}",
+    });
+  });
+
+  it("does not consume unrelated inbox commands", () => {
+    expect(parseInboxTemplateCommand("status")).toBeUndefined();
+    expect(parseInboxTemplateCommand("template remove")).toBeUndefined();
+  });
+});
+
+describe("validateTicketTemplate", () => {
+  it("accepts the required placeholder and supported optional placeholders", () => {
+    expect(validateTicketTemplate("{source}\n{message}\n{projectContext}")).toBeUndefined();
+  });
+
+  it("rejects empty templates and templates without the message", () => {
+    expect(validateTicketTemplate("   ")).toContain("пустым");
+    expect(validateTicketTemplate("Источник: {source}")).toContain("{message}");
+  });
+
+  it("rejects unknown placeholders", () => {
+    expect(validateTicketTemplate("{message}\n{token}")).toContain("{token}");
+  });
+});
+
 describe("groupBurst", () => {
   it("treats an album as one logical message", () => {
     const groups = groupBurst([
@@ -327,6 +360,20 @@ describe("InboxStore", () => {
     store.disable("-100123:5");
 
     expect(new InboxStore(file).get("-100123:5")).toBeUndefined();
+  });
+
+  it("updates only the template and persists it", () => {
+    const file = storePath();
+    const store = new InboxStore(file);
+    store.enable("-100123:5", { ...settings, iconCustomEmojiId: "emoji-id" });
+
+    expect(store.setTemplate("-100123:5", "Новый шаблон: {message}")).toBe(true);
+    expect(new InboxStore(file).get("-100123:5")).toEqual({
+      ...settings,
+      iconCustomEmojiId: "emoji-id",
+      template: "Новый шаблон: {message}",
+    });
+    expect(store.setTemplate("-100123:9", "{message}")).toBe(false);
   });
 
   it("never reuses a ticket number, even after a restart", () => {

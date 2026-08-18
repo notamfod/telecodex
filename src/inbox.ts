@@ -205,6 +205,43 @@ export function buildTicketPrompt(
   return template.split("{source}").join(values.source).split("{message}").join(values.message);
 }
 
+export type InboxTemplateCommand =
+  | { action: "show" }
+  | { action: "set"; template: string }
+  | { action: "reset" };
+
+export function parseInboxTemplateCommand(input: string): InboxTemplateCommand | undefined {
+  const trimmed = input.trim();
+  if (trimmed === "template") {
+    return { action: "show" };
+  }
+  if (trimmed === "template reset") {
+    return { action: "reset" };
+  }
+  const set = /^template\s+set(?:\s+([\s\S]*))?$/.exec(trimmed);
+  if (set) {
+    return { action: "set", template: (set[1] ?? "").replaceAll("\\n", "\n") };
+  }
+  return undefined;
+}
+
+export function validateTicketTemplate(template: string): string | undefined {
+  if (!template.trim()) {
+    return "Шаблон не может быть пустым.";
+  }
+  if (!template.includes("{message}")) {
+    return "Шаблон должен содержать {message}.";
+  }
+
+  const allowed = new Set(["message", "source", "projectContext"]);
+  for (const match of template.matchAll(/\{([^{}]+)\}/g)) {
+    if (!allowed.has(match[1])) {
+      return `Неизвестный placeholder: {${match[1]}}.`;
+    }
+  }
+  return undefined;
+}
+
 /**
  * Splits one burst of forwarded messages into logical ones.
  *
@@ -338,6 +375,16 @@ export class InboxStore {
       return false;
     }
     delete this.data.inboxes[contextKey];
+    this.save();
+    return true;
+  }
+
+  setTemplate(contextKey: string, template: string): boolean {
+    const settings = this.data.inboxes[contextKey];
+    if (!settings) {
+      return false;
+    }
+    settings.template = template;
     this.save();
     return true;
   }

@@ -213,6 +213,27 @@ describe("buildTicketPrompt", () => {
     expect(prompt).toContain("TOPIC: <краткое название проблемы до 40 символов>");
   });
 
+  it("replaces an explicit project context placeholder", () => {
+    const prompt = buildTicketPrompt("{message}\n{projectContext}", {
+      source: "source",
+      message: "problem",
+      projectContext: "Repository: /srv/project",
+    });
+
+    expect(prompt).toContain("problem\nRepository: /srv/project");
+    expect(prompt).not.toContain("{projectContext}");
+  });
+
+  it("appends a delimited project context block when the template has no placeholder", () => {
+    const prompt = buildTicketPrompt("{message}", {
+      source: "source",
+      message: "problem",
+      projectContext: "Jira project: MIR",
+    });
+
+    expect(prompt).toContain("--- контекст проекта ---\nJira project: MIR\n--- конец контекста проекта ---");
+  });
+
   it("keeps the request text out of the instruction section of the default template", () => {
     const prompt = buildTicketPrompt(DEFAULT_TICKET_TEMPLATE, {
       source: "Мария К.",
@@ -375,6 +396,24 @@ describe("InboxStore", () => {
       template: "Новый шаблон: {message}",
     });
     expect(store.setTemplate("-100123:9", "{message}")).toBe(false);
+  });
+
+  it("stores project context and realm without changing other inbox settings", () => {
+    const file = storePath();
+    const store = new InboxStore(file);
+    store.enable("-100123:5", settings);
+
+    expect(store.setProjectContext("-100123:5", "Local context")).toBe(true);
+    expect(store.setRealm("-100123:5", "mircli")).toBe(true);
+    expect(new InboxStore(file).get("-100123:5")).toEqual({
+      ...settings,
+      projectContext: "Local context",
+      realm: "mircli",
+    });
+
+    expect(store.setProjectContext("-100123:5", undefined)).toBe(true);
+    expect(store.setRealm("-100123:5", undefined)).toBe(true);
+    expect(new InboxStore(file).get("-100123:5")).toEqual(settings);
   });
 
   it("never reuses a ticket number, even after a restart", () => {

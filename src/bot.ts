@@ -66,8 +66,13 @@ import {
   ticketHeading,
   ticketTopicName,
   validateTicketTemplate,
+  type InboxSettings,
   type Ticket,
 } from "./inbox.js";
+import {
+  isSafeProjectContext,
+  loadDofboxRealmContext,
+} from "./project-context.js";
 import {
   ensureThreadTopic,
   findLiveBoundTopic,
@@ -1999,6 +2004,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     "/inbox template — показать шаблон",
     "/inbox template set <текст> — изменить шаблон",
     "/inbox template reset — вернуть шаблон по умолчанию",
+    "/inbox context — показать контекст проекта",
+    "/inbox context set <текст> — изменить контекст",
+    "/inbox context reset — очистить контекст",
+    "/inbox realm <имя|off> — подключить безопасный контекст dofbox",
   ].join("\n");
 
   bot.command("inbox", async (ctx) => {
@@ -2041,6 +2050,72 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       return;
     }
 
+    if (action === "context") {
+      if (!settings) {
+        const text = "Сначала включи этот инбокс: /inbox on [путь]";
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+        return;
+      }
+      const contextSet = /^context\s+set(?:\s+([\s\S]*))?$/.exec(args);
+      if (contextSet) {
+        const projectContext = (contextSet[1] ?? "").replaceAll("\\n", "\n").trim();
+        if (!isSafeProjectContext(projectContext)) {
+          const text = "Контекст пуст или содержит секретные данные.";
+          await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+          return;
+        }
+        inbox.setProjectContext(contextKey, projectContext);
+        const text = "Контекст проекта обновлён.";
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+        return;
+      }
+      if (rest[0] === "reset") {
+        inbox.setProjectContext(contextKey, undefined);
+        const text = "Контекст проекта очищен.";
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+        return;
+      }
+      if (rest.length === 0) {
+        const projectContext = settings.projectContext ?? "(не задан)";
+        await safeReply(ctx, `<b>Контекст проекта:</b>\n<pre>${escapeHTML(projectContext)}</pre>`, {
+          fallbackText: `Контекст проекта:\n${projectContext}`,
+        });
+        return;
+      }
+      await safeReply(ctx, escapeHTML(inboxUsage), { fallbackText: inboxUsage });
+      return;
+    }
+
+    if (action === "realm") {
+      if (!settings) {
+        const text = "Сначала включи этот инбокс: /inbox on [путь]";
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+        return;
+      }
+      const realmName = rest[0];
+      if (realmName === "off") {
+        inbox.setRealm(contextKey, undefined);
+        const text = "Dofbox realm отключён.";
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+        return;
+      }
+      if (!realmName || rest.length !== 1) {
+        await safeReply(ctx, escapeHTML(inboxUsage), { fallbackText: inboxUsage });
+        return;
+      }
+      try {
+        const preview = loadDofboxRealmContext(realmName);
+        inbox.setRealm(contextKey, realmName);
+        await safeReply(ctx, `<b>Dofbox realm:</b> <code>${escapeHTML(realmName)}</code>\n<pre>${escapeHTML(preview)}</pre>`, {
+          fallbackText: `Dofbox realm: ${realmName}\n${preview}`,
+        });
+      } catch (error) {
+        const text = `Не удалось загрузить realm ${realmName}: ${friendlyErrorText(error)}`;
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      }
+      return;
+    }
+
     if (action === "off") {
       const text = inbox.disable(contextKey)
         ? "Инбокс выключен, сообщения снова идут в сессию этого топика."
@@ -2053,6 +2128,19 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       const workspace = rest.join(" ").trim() || registry.listContexts().find(
         (entry) => entry.contextKey === contextKey,
       )?.workspace || config.workspace;
+      let projectContext = settings?.projectContext;
+      try {
+        const contextFile = (await readFile(path.join(workspace, ".telecodex", "context.md"), "utf8")).trim();
+        if (contextFile && isSafeProjectContext(contextFile)) {
+          projectContext = contextFile;
+        } else if (contextFile) {
+          console.warn(`Skipped secret-bearing project context for ${workspace}`);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          console.warn(`Failed to load project context for ${workspace}:`, friendlyErrorText(error));
+        }
+      }
       inbox.enable(contextKey, {
         workspace,
         // A ticket topic is a working topic: same profile as one opened by hand,
@@ -2060,6 +2148,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         launchProfileId: config.defaultLaunchProfileId,
         template: settings?.template ?? DEFAULT_TICKET_TEMPLATE,
         iconCustomEmojiId: settings?.iconCustomEmojiId,
+        projectContext,
+        realm: settings?.realm,
       });
       const html = [
         "<b>Инбокс включён.</b>",
@@ -2156,6 +2246,24 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       .filter(Boolean)
       .join("\n\n")
       .trim();
+
+  const projectContextForTicket = (settings: InboxSettings): string | undefined => {
+    const parts: string[] = [];
+    if (settings.projectContext && isSafeProjectContext(settings.projectContext)) {
+      parts.push(settings.projectContext);
+    }
+    if (settings.realm) {
+      try {
+        const realmContext = loadDofboxRealmContext(settings.realm);
+        if (realmContext) {
+          parts.push(realmContext);
+        }
+      } catch (error) {
+        console.warn(`Failed to load dofbox realm ${settings.realm}:`, friendlyErrorText(error));
+      }
+    }
+    return parts.length ? parts.join("\n\n") : undefined;
+  };
 
   /** Only attachments are worth forwarding; the card already quotes the text. */
   const forwardAttachments = async (
@@ -2262,7 +2370,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }
     }
 
-    const prompt = buildTicketPrompt(settings.template, { source, message: text });
+    const prompt = buildTicketPrompt(settings.template, {
+      source,
+      message: text,
+      projectContext: projectContextForTicket(settings),
+    });
     const continuedTicket = options.continueTicketId
       ? inbox.getTicket(options.continueTicketId)
       : undefined;

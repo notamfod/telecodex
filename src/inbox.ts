@@ -206,11 +206,22 @@ export function hasAttachment(message: Record<string, unknown>): boolean {
 
 export function buildTicketPrompt(
   template: string,
-  values: { source: string; message: string },
+  values: { source: string; message: string; projectContext?: string },
 ): string {
-  const rendered = template
+  const hasContextPlaceholder = template.includes("{projectContext}");
+  let rendered = template
     .split("{source}").join(values.source)
-    .split("{message}").join(values.message);
+    .split("{message}").join(values.message)
+    .split("{projectContext}").join(values.projectContext ?? "");
+  if (values.projectContext && !hasContextPlaceholder) {
+    rendered = [
+      rendered,
+      "",
+      "--- контекст проекта ---",
+      values.projectContext,
+      "--- конец контекста проекта ---",
+    ].join("\n");
+  }
   return `${rendered}\n\n${TOPIC_NAMING_INSTRUCTION}`;
 }
 
@@ -328,6 +339,8 @@ export interface InboxSettings {
   workspace: string;
   launchProfileId?: string;
   template: string;
+  projectContext?: string;
+  realm?: string;
   /** Custom emoji id from getForumTopicIconStickers; marks topics this inbox spawns. */
   iconCustomEmojiId?: string;
 }
@@ -395,6 +408,34 @@ export class InboxStore {
       return false;
     }
     settings.template = template;
+    this.save();
+    return true;
+  }
+
+  setProjectContext(contextKey: string, projectContext?: string): boolean {
+    const settings = this.data.inboxes[contextKey];
+    if (!settings) {
+      return false;
+    }
+    if (projectContext) {
+      settings.projectContext = projectContext;
+    } else {
+      delete settings.projectContext;
+    }
+    this.save();
+    return true;
+  }
+
+  setRealm(contextKey: string, realm?: string): boolean {
+    const settings = this.data.inboxes[contextKey];
+    if (!settings) {
+      return false;
+    }
+    if (realm) {
+      settings.realm = realm;
+    } else {
+      delete settings.realm;
+    }
     this.save();
     return true;
   }

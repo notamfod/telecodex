@@ -87,6 +87,7 @@ export class SentryBridge {
     }
 
     const result: SentryBridgeResult = { fetched: 0, created: 0, skipped: 0, failures: [] };
+    let attempts = 0;
     for (const [project, target] of Object.entries(this.options.mappings)) {
       let issues: SentryIssue[];
       try {
@@ -101,7 +102,8 @@ export class SentryBridge {
           result.skipped += 1;
           continue;
         }
-        if (result.created >= this.options.limit) continue;
+        if (attempts >= this.options.limit) continue;
+        attempts += 1;
         try {
           await this.options.createTicket(issue, target, project);
           state.seen[issue.id] = now;
@@ -140,7 +142,8 @@ export class SentryBridge {
       statsPeriod: `${hours}h`,
     });
     const baseUrl = this.options.baseUrl.replace(/\/+$/, "");
-    const url = `${baseUrl}/api/0/projects/${encodeURIComponent(this.options.org)}/${encodeURIComponent(project)}/issues/?${query}`;
+    const apiBaseUrl = baseUrl.endsWith("/api/0") ? baseUrl : `${baseUrl}/api/0`;
+    const url = `${apiBaseUrl}/projects/${encodeURIComponent(this.options.org)}/${encodeURIComponent(project)}/issues/?${query}`;
     const response = await this.fetchImpl(url, {
       headers: { Authorization: `Bearer ${this.options.token}` },
     });

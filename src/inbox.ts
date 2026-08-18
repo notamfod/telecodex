@@ -465,6 +465,16 @@ export class InboxStore {
     this.save();
   }
 
+  removeUnattachedTicket(id: number): boolean {
+    const ticket = this.data.tickets[String(id)];
+    if (!ticket || ticket.workTopicId !== 0) {
+      return false;
+    }
+    delete this.data.tickets[String(id)];
+    this.save();
+    return true;
+  }
+
   continueTicket(
     id: number,
     input: { workTopicId: number; prompt: string; source: string },

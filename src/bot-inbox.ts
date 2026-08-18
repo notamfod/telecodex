@@ -105,6 +105,7 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): InboxHan
   const pendingJiraPosts = new Set<number>();
   let nextBatchId = 1;
   let nextDuplicateDecisionId = 1;
+  let lastSentryTicketAt = 0;
 
   const ticketKeyboard = (ticket: Pick<Ticket, "id" | "startedAt" | "resolvedAt">): InlineKeyboard => {
     const keyboard = new InlineKeyboard();
@@ -201,7 +202,13 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): InboxHan
       supersedesId: options.supersedesId,
     });
     const topicName = ticketTopicName(pending.id, text, pending.externalKey);
-    const topic = await bot.api.createForumTopic(first.chatId, topicName, settings.iconCustomEmojiId ? { icon_custom_emoji_id: settings.iconCustomEmojiId } : undefined);
+    let topic;
+    try {
+      topic = await bot.api.createForumTopic(first.chatId, topicName, settings.iconCustomEmojiId ? { icon_custom_emoji_id: settings.iconCustomEmojiId } : undefined);
+    } catch (error) {
+      if (!continued) inbox.removeUnattachedTicket(pending.id);
+      throw error;
+    }
     topicActivity.rememberIdleIcon(first.chatId, topic.message_thread_id, settings.iconCustomEmojiId ?? null);
     const ticket = continued
       ? inbox.continueTicket(continued.id, { workTopicId: topic.message_thread_id, prompt, source })!
@@ -254,6 +261,14 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): InboxHan
     if (settings.workspace !== target.workspace) throw new Error(`Inbox ${target.inboxContextKey} workspace mismatch: ${settings.workspace}`);
     const parsed = parseContextKey(target.inboxContextKey);
     if (!parsed.messageThreadId || !Number.isFinite(parsed.chatId)) throw new Error(`Inbox ${target.inboxContextKey} is not a forum topic`);
+    for (const existing of inbox.listTicketsByKey(target.inboxContextKey, issue.shortId)) {
+      if (existing.workTopicId && await deps.topicIsAlive(parsed.chatId, existing.workTopicId).catch(() => false)) {
+        return;
+      }
+    }
+    const waitMs = INBOX_TOPIC_PAUSE_MS - (Date.now() - lastSentryTicketAt);
+    if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    lastSentryTicketAt = Date.now();
     await createTicket([{ contextKey: target.inboxContextKey, chatId: parsed.chatId, messageId: 0, hasAttachment: false, text: renderSentryTicketText(issue), message: {} }], {
       skipDuplicateCheck: true,
       externalKeyOverride: issue.shortId,

@@ -768,4 +768,28 @@ describe("InboxStore", () => {
 
     expect(new InboxStore(file).getTicket(ticket.id)?.workTopicId).toBe(512);
   });
+
+  it("rolls back only a ticket that never received a work topic", () => {
+    const file = storePath();
+    const store = new InboxStore(file);
+    const unattached = store.createTicket({
+      inboxContextKey: "-100123:5",
+      workTopicId: 0,
+      workspace: settings.workspace,
+      prompt: "prompt",
+      source: "Sentry project mir-back",
+    });
+    const attached = store.createTicket({
+      inboxContextKey: "-100123:5",
+      workTopicId: 512,
+      workspace: settings.workspace,
+      prompt: "prompt",
+      source: "Sentry project mir-back",
+    });
+
+    expect(store.removeUnattachedTicket(unattached.id)).toBe(true);
+    expect(store.removeUnattachedTicket(attached.id)).toBe(false);
+    expect(new InboxStore(file).getTicket(unattached.id)).toBeUndefined();
+    expect(new InboxStore(file).getTicket(attached.id)).toBeDefined();
+  });
 });

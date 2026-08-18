@@ -39,8 +39,8 @@ describe("SentryBridge", () => {
 
     const result = await bridge.run(24);
 
-    expect(fetchImpl.mock.calls[0]?.[0]).toContain(
-      "/api/0/projects/mircli/mir-back/issues/?query=is%3Aunresolved&sort=freq&statsPeriod=24h",
+    expect(fetchImpl.mock.calls[0]?.[0]).toBe(
+      "https://sentry.example.test/api/0/projects/mircli/mir-back/issues/?query=is%3Aunresolved&sort=freq&statsPeriod=24h",
     );
     expect(createTicket).toHaveBeenCalledWith(
       issue,
@@ -119,9 +119,28 @@ describe("SentryBridge", () => {
     expect(createTicket).toHaveBeenCalledTimes(1);
   });
 
+  it("counts failed creation attempts against the per-run limit", async () => {
+    const issues = Array.from({ length: 10 }, (_, index) => ({
+      ...issue,
+      id: String(2_000 + index),
+      shortId: `MIR-BACK-${index}`,
+    }));
+    const createTicket = vi.fn().mockRejectedValue(new Error("Telegram rate limit"));
+    const bridge = createBridge({
+      limit: 5,
+      fetchImpl: vi.fn().mockResolvedValue(Response.json(issues)),
+      createTicket,
+    });
+
+    const result = await bridge.run();
+
+    expect(createTicket).toHaveBeenCalledTimes(5);
+    expect(result.failures).toHaveLength(5);
+  });
+
   function createBridge(overrides: Partial<ConstructorParameters<typeof SentryBridge>[0]> = {}) {
     return new SentryBridge({
-      baseUrl: "https://sentry.example.test",
+      baseUrl: "https://sentry.example.test/api/0",
       token: "token",
       org: "mircli",
       mappings: {

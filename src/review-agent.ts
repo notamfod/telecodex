@@ -74,9 +74,13 @@ export function keepFindingsOnChangedLines(
   findings: Finding[],
   changedLines: Map<string, Set<number>>,
 ): Finding[] {
-  return findings.filter((finding) =>
+  const changed = findings.filter((finding) =>
     finding.line === undefined || changedLines.get(finding.file)?.has(finding.line) === true
   );
+  if (findings.length > 0 && changed.length === 0) {
+    throw new Error("invalid review output: every finding line is outside the reviewed diff");
+  }
+  return changed;
 }
 
 export function parseStrictReviewOutput(output: string): Finding[] {
@@ -176,8 +180,11 @@ export async function reviewPortfolioChunk(
     safe,
     changedLineMapFromDiff(await exactDiff(input)),
   );
-  if (changed.length !== safe.length) {
-    throw new Error("invalid review output: finding line is outside the reviewed diff");
+  if (changed.length < safe.length) {
+    console.warn(
+      `${input.project.name} chunk ${input.chunkIndex + 1}/${input.totalChunks}: `
+        + `discarded ${safe.length - changed.length} finding(s) outside the reviewed diff`,
+    );
   }
   return Promise.all(changed.map((finding) => enrichFindingMetadata(finding, {
     worktreePath: input.project.worktreePath,

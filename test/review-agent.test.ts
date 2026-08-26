@@ -88,6 +88,14 @@ describe("changed-line validation", () => {
 
     expect(keepFindingsOnChangedLines([finding(3), finding(9)], ranges)).toEqual([finding(3)]);
   });
+
+  it("rejects a chunk when every reported finding is outside the reviewed diff", () => {
+    const ranges = new Map([["src/a.ts", new Set([3, 4])]]);
+
+    expect(() => keepFindingsOnChangedLines([finding(9)], ranges)).toThrow(
+      /outside the reviewed diff/i,
+    );
+  });
 });
 
 describe("parseStrictReviewOutput", () => {

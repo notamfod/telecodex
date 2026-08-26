@@ -7,7 +7,6 @@ import { promisify } from "node:util";
 import {
   fingerprintFinding,
   parseFindings,
-  renderFindingHTML,
   renderRunHTML,
   triageFindings,
 } from "./recipes.js";
@@ -15,9 +14,10 @@ import {
   RECIPE_MUTES_PATH,
   RECIPE_STATE_PATH,
   RecipeMutes,
-  writePendingRun,
+  reservePendingRun,
 } from "./recipe-store.js";
-import type { Finding, Triage } from "./recipes.js";
+import type { PendingRun } from "./recipe-store.js";
+import type { Finding } from "./recipes.js";
 import { prepareDependencyReview } from "./dependency-review.js";
 import { runJiraFilterRecipe } from "./jira-recipe.js";
 import { runSentryTopRecipe } from "./sentry-recipe.js";
@@ -29,6 +29,8 @@ import {
   type ReviewRecipe,
 } from "./recipe-config.js";
 import { sendRecipeMessage } from "./recipe-telegram.js";
+import { deliverReviewDigest } from "./recipe-review-delivery.js";
+import { acquireRecipeRunLock } from "./recipe-run-lock.js";
 import {
   reviewPortfolioChunk,
   runCodexReadOnly,
@@ -66,6 +68,7 @@ interface State {
   nextRunId?: number;
   /** Fingerprints muted by hand during calibration; never reported again. */
   ignored?: string[];
+  pending?: Record<string, PendingRun>;
 }
 
 async function loadState(): Promise<State> {
@@ -107,43 +110,7 @@ async function firstBaseline(cwd: string, headSha: string): Promise<string> {
   return sha || (await git(cwd, ["rev-parse", `${headSha}~1`])).trim();
 }
 
-/**
- * One message per finding, each with its own buttons.
- *
- * A single message with twenty buttons cannot say which one was pressed once a
- * mute has to grey out just that finding.
- */
 type CodeReviewRecipe = ReviewRecipe | MircliReviewRecipe;
-
-async function deliverFindings(
-  recipe: CodeReviewRecipe,
-  project: string,
-  runId: number,
-  triage: Triage,
-  qualifyPath = true,
-): Promise<void> {
-  const notes = [
-    `${triage.fresh.length} ${triage.fresh.length === 1 ? "новая" : "новых"}`,
-    triage.repeated.length > 0 ? `повторов: ${triage.repeated.length}` : "",
-    triage.suppressed.length > 0 ? `заглушено: ${triage.suppressed.length}` : "",
-  ].filter(Boolean);
-
-  await sendRecipeMessage(
-    recipe,
-    `\u{1F50D} <b>${recipe.id}</b> \u00B7 ${project} \u00B7 ${notes.join(" \u00B7 ")}`,
-  );
-
-  for (const [index, finding] of triage.fresh.entries()) {
-    await sendRecipeMessage(recipe, renderFindingHTML(finding, qualifyPath ? project : undefined), {
-      inline_keyboard: [
-        [
-          { text: "\u{1F527} Тред-фикс", callback_data: `rfix:${runId}:${index}` },
-          { text: "\u{1F507} Игнорировать", callback_data: `rmute:${runId}:${index}` },
-        ],
-      ],
-    });
-  }
-}
 
 /** The shadow log is read by a human, so undo the Telegram markup and its escaping. */
 function toPlainText(html: string): string {
@@ -197,7 +164,7 @@ async function loadRecipes(): Promise<Recipe[]> {
   }
 }
 
-async function main(): Promise<void> {
+async function runRecipe(): Promise<void> {
   const id = process.argv[2];
   const recipes = await loadRecipes();
   const recipe = recipes.find((entry) => entry.id === id);
@@ -276,7 +243,6 @@ async function main(): Promise<void> {
       ),
     });
     let nextRunId = state.nextRunId ?? 1;
-    const pending: Array<{ runId: number; cwd: string; findings: Finding[] }> = [];
 
     for (const project of result.projects) {
       if (project.status === "failed") {
@@ -291,26 +257,27 @@ async function main(): Promise<void> {
       await writeShadow(recipe, project.name, stamp, triage.fresh, html);
       if (recipe.deliver && triage.shouldDeliver) {
         const runId = nextRunId++;
-        await deliverFindings(recipe, project.name, runId, triage);
-        pending.push({ runId, cwd: project.sourcePath, findings: triage.fresh });
+        reservePendingRun(STATE_PATH, runId, {
+          recipe: recipe.id,
+          cwd: project.sourcePath,
+          project: project.name,
+          repeatedCount: triage.repeated.length,
+          suppressedCount: triage.suppressed.length,
+          findings: triage.fresh,
+        });
+        await deliverReviewDigest(recipe, project.name, runId, triage);
       }
     }
 
+    const latestState = await loadState();
     await saveState({
-      ...state,
-      nextRunId,
+      ...latestState,
+      nextRunId: Math.max(latestState.nextRunId ?? 1, nextRunId),
       runs: {
-        ...state.runs,
+        ...latestState.runs,
         [recipe.id]: advancePortfolioState(previous, result.projects),
       },
     });
-    for (const item of pending) {
-      writePendingRun(STATE_PATH, item.runId, {
-        recipe: recipe.id,
-        cwd: item.cwd,
-        findings: item.findings,
-      });
-    }
     const reviewed = result.projects.filter((project) => project.status === "reviewed").length;
     const unchanged = result.projects.filter((project) => project.status === "unchanged").length;
     const failed = result.projects.filter((project) => project.status === "failed").length;
@@ -438,16 +405,27 @@ async function main(): Promise<void> {
   let runId: number | undefined;
   if (recipe.deliver && !probe && triage.shouldDeliver) {
     runId = state.nextRunId ?? 1;
-    await deliverFindings(recipe, project, runId, triage, recipe.kind !== "deps");
+    reservePendingRun(STATE_PATH, runId, {
+      recipe: recipe.id,
+      cwd: recipe.kind === "deps" ? recipe.cwd : reviewCwd,
+      project,
+      repeatedCount: triage.repeated.length,
+      suppressedCount: triage.suppressed.length,
+      findings: triage.fresh,
+    });
+    await deliverReviewDigest(recipe, project, runId, triage);
   }
 
   if (!probe) {
     const seen = [...(previous.seen ?? []), ...findings.map(fingerprintFinding)];
+    const latestState = await loadState();
     await saveState({
-      ...state,
-      nextRunId: runId === undefined ? state.nextRunId : runId + 1,
+      ...latestState,
+      nextRunId: runId === undefined
+        ? latestState.nextRunId
+        : Math.max(latestState.nextRunId ?? 1, runId + 1),
       runs: {
-        ...state.runs,
+        ...latestState.runs,
         [recipe.id]: {
           lastSha: head ?? previous.lastSha,
           seen: [...new Set(seen)].slice(-MAX_SEEN),
@@ -456,20 +434,20 @@ async function main(): Promise<void> {
     });
   }
 
-  // After saveState, so the fresh file is the one that gets the pending run.
-  if (runId !== undefined) {
-    writePendingRun(STATE_PATH, runId, {
-      recipe: recipe.id,
-      cwd: recipe.kind === "deps" ? recipe.cwd : reviewCwd,
-      findings: triage.fresh,
-    });
-  }
-
   console.log(
     `${recipe.id}: ${range} → ${triage.fresh.length} new, ${triage.repeated.length} repeated, ${triage.suppressed.length} muted` +
       (recipe.deliver ? "" : " (shadow, nothing sent)") +
       (probe ? " (probe, state untouched)" : ""),
   );
+}
+
+async function main(): Promise<void> {
+  const releaseLock = acquireRecipeRunLock(path.resolve(SHADOW_DIR, "recipe-run.lock"));
+  try {
+    await runRecipe();
+  } finally {
+    releaseLock();
+  }
 }
 
 main().catch((error) => {

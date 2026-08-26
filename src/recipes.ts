@@ -204,10 +204,10 @@ function truncate(text: string, limit: number): string {
   return text.length <= limit ? text : `${text.slice(0, limit - 1).trimEnd()}…`;
 }
 
-/** One finding as its own Telegram message, so it can carry its own buttons. */
+/** One review finding rendered as a reusable Telegram HTML block. */
 export function renderFindingHTML(finding: Finding, project?: string): string {
-  // Each finding is its own message, so the path has to say which repository it
-  // belongs to on its own; the batch header scrolls away.
+  // Some callers render findings without a project header, so they may qualify
+  // the path to keep the repository visible.
   const file =
     project && !finding.file.startsWith(`${project}/`) ? `${project}/${finding.file}` : finding.file;
   const location = finding.line === undefined ? file : `${file}:${finding.line}`;

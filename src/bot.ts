@@ -109,6 +109,12 @@ import {
   RecipeMutes,
   readPendingRun,
 } from "./recipe-store.js";
+import {
+  recipeDigestKeyboard,
+  recipeFindingDetailKeyboard,
+  renderRecipeDigestHTML,
+  renderRecipeFindingDetailHTML,
+} from "./recipe-review-digest.js";
 import { buildFixPrompt, fingerprintFinding, fixTopicName } from "./recipes.js";
 import { parseRecipes, RECIPE_CONFIG_PATH } from "./recipe-config.js";
 import { SessionRegistry } from "./session-registry.js";
@@ -2054,10 +2060,63 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   /** Findings the scheduled recipes delivered; index is the position in that batch. */
   const findingFromCallback = (match: string | RegExpMatchArray | undefined) => {
     const groups = typeof match === "string" ? undefined : match;
-    const run = readPendingRun(RECIPE_STATE_PATH, Number.parseInt(groups?.[1] ?? "", 10));
-    const finding = run?.findings[Number.parseInt(groups?.[2] ?? "", 10)];
-    return run && finding ? { run, finding } : undefined;
+    const runId = Number.parseInt(groups?.[1] ?? "", 10);
+    const index = Number.parseInt(groups?.[2] ?? "", 10);
+    const run = readPendingRun(RECIPE_STATE_PATH, runId);
+    const finding = run?.findings[index];
+    return run && finding ? { run, finding, runId, index } : undefined;
   };
+
+  const reviewProject = (run: { project?: string; cwd: string }): string =>
+    run.project ?? path.basename(run.cwd);
+
+  bot.callbackQuery(/^rnoop:(\d+)$/, async (ctx) => {
+    await ctx.answerCallbackQuery();
+  });
+
+  bot.callbackQuery(/^rpage:(\d+):(\d+)$/, async (ctx) => {
+    const groups = typeof ctx.match === "string" ? undefined : ctx.match;
+    const runId = Number.parseInt(groups?.[1] ?? "", 10);
+    const page = Number.parseInt(groups?.[2] ?? "", 10);
+    const run = readPendingRun(RECIPE_STATE_PATH, runId);
+    if (!run) {
+      await ctx.answerCallbackQuery({ text: "Находки больше не доступны" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(renderRecipeDigestHTML({
+      project: reviewProject(run),
+      findings: run.findings,
+      page,
+      repeatedCount: run.repeatedCount,
+      suppressedCount: run.suppressedCount,
+    }), {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      reply_markup: recipeDigestKeyboard(runId, run.findings, page),
+    });
+  });
+
+  bot.callbackQuery(/^rdetail:(\d+):(\d+)$/, async (ctx) => {
+    const found = findingFromCallback(ctx.match ?? undefined);
+    if (!found) {
+      await ctx.answerCallbackQuery({ text: "Находка больше не доступна" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(renderRecipeFindingDetailHTML(
+      reviewProject(found.run),
+      found.finding,
+      found.index,
+      found.run.findings.length,
+    ), {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      reply_markup: recipeFindingDetailKeyboard(found.runId, found.index),
+    });
+  });
 
   bot.callbackQuery(/^rmute:(\d+):(\d+)$/, async (ctx) => {
     const found = findingFromCallback(ctx.match ?? undefined);
@@ -2069,9 +2128,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     recipeMutes.add(fingerprintFinding(found.finding));
     await ctx.answerCallbackQuery({ text: "Заглушено, больше не покажу" });
     try {
-      await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+      await ctx.editMessageReplyMarkup({
+        reply_markup: recipeFindingDetailKeyboard(found.runId, found.index, true),
+      });
     } catch {
-      // The message may already have lost its keyboard; nothing to undo.
+      // The message may already have changed; the mute itself is persisted.
     }
   });
 

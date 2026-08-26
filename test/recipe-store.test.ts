@@ -1,10 +1,15 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { RecipeMutes, readPendingRun, writePendingRun } from "../src/recipe-store.js";
+import {
+  RecipeMutes,
+  readPendingRun,
+  reservePendingRun,
+  writePendingRun,
+} from "../src/recipe-store.js";
 import { parseFindings } from "../src/recipes.js";
 
 function statePath(): string {
@@ -34,6 +39,39 @@ describe("pending runs", () => {
     writePendingRun(file, 7, { recipe: "migration-audit", cwd: "/repo/mir-back", findings });
 
     expect(readPendingRun(file, 7)?.cwd).toBe("/repo/mir-back");
+  });
+
+  it("keeps digest context for pagination after the runner exits", () => {
+    const file = statePath();
+    writePendingRun(file, 7, {
+      recipe: "daily-diff-review",
+      cwd: "/repo/mir-survey",
+      project: "mir-survey",
+      repeatedCount: 3,
+      suppressedCount: 2,
+      findings,
+    });
+
+    expect(readPendingRun(file, 7)).toMatchObject({
+      project: "mir-survey",
+      repeatedCount: 3,
+      suppressedCount: 2,
+    });
+  });
+
+  it("reserves the next run id in the same write as its callback state", () => {
+    const file = statePath();
+    reservePendingRun(file, 7, {
+      recipe: "daily-diff-review",
+      cwd: "/repo/mir-survey",
+      project: "mir-survey",
+      findings,
+    });
+
+    expect(JSON.parse(readFileSync(file, "utf8"))).toMatchObject({
+      nextRunId: 8,
+      pending: { "7": { project: "mir-survey" } },
+    });
   });
 
   it("has nothing for a run id it never stored", () => {

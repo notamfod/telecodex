@@ -20,6 +20,10 @@ export interface PendingRun {
   recipe: string;
   /** The repository the findings are about; a fix thread starts here. */
   cwd: string;
+  /** Human-readable project name used by the interactive review digest. */
+  project?: string;
+  repeatedCount?: number;
+  suppressedCount?: number;
   findings: Finding[];
 }
 
@@ -53,14 +57,34 @@ export function writePendingRun(filePath: string, runId: number, run: PendingRun
     filePath,
     {},
   );
-  const pending = { ...state.pending, [String(runId)]: run };
+  writeJson(filePath, { ...state, pending: boundedPending(state.pending, runId, run) });
+}
+
+/** Reserve an id and its callback payload before Telegram can expose buttons for it. */
+export function reservePendingRun(filePath: string, runId: number, run: PendingRun): void {
+  const state = readJson<
+    Record<string, unknown> & { nextRunId?: number; pending?: Record<string, PendingRun> }
+  >(filePath, {});
+  writeJson(filePath, {
+    ...state,
+    nextRunId: Math.max(state.nextRunId ?? 1, runId + 1),
+    pending: boundedPending(state.pending, runId, run),
+  });
+}
+
+function boundedPending(
+  current: Record<string, PendingRun> | undefined,
+  runId: number,
+  run: PendingRun,
+): Record<string, PendingRun> {
+  const pending = { ...current, [String(runId)]: run };
 
   // Bound the file: only the most recent runs keep working buttons.
   const trimmed = Object.entries(pending)
     .sort(([a], [b]) => Number(b) - Number(a))
     .slice(0, MAX_PENDING_RUNS);
 
-  writeJson(filePath, { ...state, pending: Object.fromEntries(trimmed) });
+  return Object.fromEntries(trimmed);
 }
 
 /**

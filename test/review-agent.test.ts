@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildReviewChunkPrompt,
   changedLineMapFromDiff,
+  codexStdio,
   keepFindingsOnChangedLines,
   parseStrictReviewOutput,
 } from "../src/review-agent.js";
@@ -50,6 +51,12 @@ describe("buildReviewChunkPrompt", () => {
 
     expect(prompt).toContain("'src/a; touch escaped'");
     expect(prompt).not.toContain("-- src/a; touch escaped");
+  });
+});
+
+describe("codexStdio", () => {
+  it("keeps prompts and source diffs out of the service journal", () => {
+    expect(codexStdio()).toEqual(["pipe", "ignore", "ignore"]);
   });
 });
 

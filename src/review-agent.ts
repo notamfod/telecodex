@@ -11,6 +11,10 @@ import { MAX_FINDINGS, parseFindings, type Finding } from "./recipes.js";
 const CODEX_TIMEOUT_MS = 20 * 60 * 1000;
 const exec = promisify(execFile);
 
+export function codexStdio(): ["pipe", "ignore", "ignore"] {
+  return ["pipe", "ignore", "ignore"];
+}
+
 function shellQuote(value: string): string {
   return /^[A-Za-z0-9_./@:+-]+$/.test(value)
     ? value
@@ -128,7 +132,7 @@ export function runCodexReadOnly(
   args.push("-");
 
   return new Promise((resolve, reject) => {
-    const child = spawn("codex", args, { stdio: ["pipe", "inherit", "inherit"] });
+    const child = spawn("codex", args, { stdio: codexStdio() });
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`codex exec exceeded ${CODEX_TIMEOUT_MS / 60000} minutes`));

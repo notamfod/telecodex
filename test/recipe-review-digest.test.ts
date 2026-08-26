@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  mutedRecipeFindingIndices,
   recipeDigestKeyboard,
   recipeFindingDetailKeyboard,
   renderRecipeDigestHTML,
   renderRecipeFindingDetailHTML,
 } from "../src/recipe-review-digest.js";
-import type { Finding } from "../src/recipes.js";
+import { fingerprintFinding, type Finding } from "../src/recipes.js";
 
 function findings(count = 12): Finding[] {
   return Array.from({ length: count }, (_, index) => ({
@@ -56,18 +57,33 @@ describe("recipe review digest", () => {
     expect(html).toContain("Описание 10");
     expect(html).not.toContain("Описание 5");
     expect(html).not.toContain("Описание 11");
-    expect(keyboard.inline_keyboard.slice(0, 5).map((row) => row[0]?.callback_data)).toEqual([
-      "rdetail:16:5",
-      "rdetail:16:6",
-      "rdetail:16:7",
-      "rdetail:16:8",
-      "rdetail:16:9",
+    expect(keyboard.inline_keyboard[0]).toEqual([
+      { text: "6 · P2 · category-6", callback_data: "rdetail:16:5" },
+      { text: "🔧", callback_data: "rfix:16:5" },
+      { text: "🔇", callback_data: "rdmute:16:5" },
     ]);
+    expect(keyboard.inline_keyboard.slice(0, 5).every((row) => row.length === 3)).toBe(true);
     expect(keyboard.inline_keyboard.at(-1)?.map((button) => button.callback_data)).toEqual([
       "rpage:16:0",
       "rnoop:16",
       "rpage:16:2",
     ]);
+  });
+
+  it("marks only a muted digest row and keeps its detail and fix actions", () => {
+    const all = findings();
+    const muted = mutedRecipeFindingIndices(all, [fingerprintFinding(all[5]!)]);
+    const keyboard = recipeDigestKeyboard(16, all, 1, muted);
+
+    expect(keyboard.inline_keyboard[0]).toEqual([
+      { text: "6 · P2 · category-6", callback_data: "rdetail:16:5" },
+      { text: "🔧", callback_data: "rfix:16:5" },
+      { text: "✅", callback_data: "rnoop:16" },
+    ]);
+    expect(keyboard.inline_keyboard[1]?.[2]).toEqual({
+      text: "🔇",
+      callback_data: "rdmute:16:6",
+    });
   });
 
   it("renders one selected finding and keeps its actions in the same message", () => {

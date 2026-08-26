@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   RecipeMutes,
@@ -123,6 +123,14 @@ describe("RecipeMutes", () => {
     mutes.add("dup");
 
     expect(mutes.list()).toEqual(["dup"]);
+  });
+
+  it("reports when a mute cannot be persisted", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(new RecipeMutes("/dev/null/recipe-mutes.json").add("blocked")).toBe(false);
+
+    warn.mockRestore();
   });
 
   it("reports an unreadable file as no mutes rather than failing the run", () => {

@@ -100,18 +100,20 @@ export class RecipeMutes {
     return readJson<{ ignored?: string[] }>(this.filePath, {}).ignored ?? [];
   }
 
-  add(fingerprint: string): void {
+  add(fingerprint: string): boolean {
     const ignored = this.list();
     if (ignored.includes(fingerprint)) {
-      return;
+      return true;
     }
     try {
       writeJson(this.filePath, { ignored: [...ignored, fingerprint] });
+      return true;
     } catch (error) {
       console.warn(
         "Failed to persist recipe mute:",
         error instanceof Error ? error.message : String(error),
       );
+      return false;
     }
   }
 }

@@ -110,12 +110,14 @@ import {
   readPendingRun,
 } from "./recipe-store.js";
 import {
+  RECIPE_DIGEST_PAGE_SIZE,
+  mutedRecipeFindingIndices,
   recipeDigestKeyboard,
   recipeFindingDetailKeyboard,
   renderRecipeDigestHTML,
   renderRecipeFindingDetailHTML,
 } from "./recipe-review-digest.js";
-import { buildFixPrompt, fingerprintFinding, fixTopicName } from "./recipes.js";
+import { buildFixPrompt, fingerprintFinding, fixTopicName, type Finding } from "./recipes.js";
 import { parseRecipes, RECIPE_CONFIG_PATH } from "./recipe-config.js";
 import { SessionRegistry } from "./session-registry.js";
 import type { SentryBridge } from "./sentry-bridge.js";
@@ -2070,6 +2072,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   const reviewProject = (run: { project?: string; cwd: string }): string =>
     run.project ?? path.basename(run.cwd);
 
+  const mutedIndices = (run: { findings: Finding[] }): Set<number> =>
+    mutedRecipeFindingIndices(run.findings, recipeMutes.list());
+
   bot.callbackQuery(/^rnoop:(\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
   });
@@ -2094,7 +2099,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }), {
       parse_mode: "HTML",
       link_preview_options: { is_disabled: true },
-      reply_markup: recipeDigestKeyboard(runId, run.findings, page),
+      reply_markup: recipeDigestKeyboard(runId, run.findings, page, mutedIndices(run)),
     });
   });
 
@@ -2114,7 +2119,41 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     ), {
       parse_mode: "HTML",
       link_preview_options: { is_disabled: true },
-      reply_markup: recipeFindingDetailKeyboard(found.runId, found.index),
+      reply_markup: recipeFindingDetailKeyboard(
+        found.runId,
+        found.index,
+        mutedIndices(found.run).has(found.index),
+      ),
+    });
+  });
+
+  bot.callbackQuery(/^rdmute:(\d+):(\d+)$/, async (ctx) => {
+    const found = findingFromCallback(ctx.match ?? undefined);
+    if (!found) {
+      await ctx.answerCallbackQuery({ text: "Находка больше не доступна" });
+      return;
+    }
+
+    if (!recipeMutes.add(fingerprintFinding(found.finding))) {
+      await ctx.answerCallbackQuery({ text: "Не удалось сохранить заглушение" });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: "Заглушено, больше не покажу" });
+    await ctx.editMessageText(renderRecipeDigestHTML({
+      project: reviewProject(found.run),
+      findings: found.run.findings,
+      page: Math.floor(found.index / RECIPE_DIGEST_PAGE_SIZE),
+      repeatedCount: found.run.repeatedCount,
+      suppressedCount: found.run.suppressedCount,
+    }), {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      reply_markup: recipeDigestKeyboard(
+        found.runId,
+        found.run.findings,
+        Math.floor(found.index / RECIPE_DIGEST_PAGE_SIZE),
+        mutedIndices(found.run),
+      ),
     });
   });
 
@@ -2125,7 +2164,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       return;
     }
 
-    recipeMutes.add(fingerprintFinding(found.finding));
+    if (!recipeMutes.add(fingerprintFinding(found.finding))) {
+      await ctx.answerCallbackQuery({ text: "Не удалось сохранить заглушение" });
+      return;
+    }
     await ctx.answerCallbackQuery({ text: "Заглушено, больше не покажу" });
     try {
       await ctx.editMessageReplyMarkup({

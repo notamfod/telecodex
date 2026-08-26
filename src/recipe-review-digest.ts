@@ -1,5 +1,5 @@
 import { escapeHTML } from "./format.js";
-import { renderFindingHTML, type Finding } from "./recipes.js";
+import { fingerprintFinding, renderFindingHTML, type Finding } from "./recipes.js";
 
 export const RECIPE_DIGEST_PAGE_SIZE = 5;
 const TELEGRAM_MESSAGE_LIMIT = 4096;
@@ -52,6 +52,17 @@ function prioritySummary(findings: Finding[]): string {
     counts.set(label, (counts.get(label) ?? 0) + 1);
   }
   return [...counts.entries()].map(([label, count]) => `${label}: ${count}`).join(" · ");
+}
+
+export function mutedRecipeFindingIndices(
+  findings: Finding[],
+  mutedFingerprints: Iterable<string>,
+): Set<number> {
+  const muted = new Set(mutedFingerprints);
+  return new Set(
+    findings.flatMap((finding, index) =>
+      muted.has(fingerprintFinding(finding)) ? [index] : []),
+  );
 }
 
 function boundedEscaped(text: string, limit: number): string {
@@ -125,13 +136,20 @@ export function recipeDigestKeyboard(
   runId: number,
   findings: Finding[],
   page: number,
+  mutedIndices: ReadonlySet<number> = new Set(),
 ): RecipeDigestKeyboard {
   const current = boundedPage(findings, page);
   const totalPages = pageCount(findings);
-  const rows = pageSlice(findings, current).map(({ finding, index }) => [{
-    text: `${index + 1} · ${finding.priority ?? finding.severity} · ${finding.category}`.slice(0, 60),
-    callback_data: `rdetail:${runId}:${index}`,
-  }]);
+  const rows = pageSlice(findings, current).map(({ finding, index }) => [
+    {
+      text: `${index + 1} · ${finding.priority ?? finding.severity} · ${finding.category}`.slice(0, 40),
+      callback_data: `rdetail:${runId}:${index}`,
+    },
+    { text: "🔧", callback_data: `rfix:${runId}:${index}` },
+    mutedIndices.has(index)
+      ? { text: "✅", callback_data: `rnoop:${runId}` }
+      : { text: "🔇", callback_data: `rdmute:${runId}:${index}` },
+  ]);
   if (totalPages > 1) {
     rows.push([
       ...(current > 0 ? [{ text: "←", callback_data: `rpage:${runId}:${current - 1}` }] : []),

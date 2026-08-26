@@ -1,12 +1,11 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
 import {
   fingerprintFinding,
-  keepExistingFiles,
   parseFindings,
   renderFindingHTML,
   renderRunHTML,
@@ -19,23 +18,30 @@ import {
   writePendingRun,
 } from "./recipe-store.js";
 import type { Finding, Triage } from "./recipes.js";
-import {
-  bumpKind,
-  composerDirectDependencies,
-  escapeGoModulePath,
-  latestStable,
-  parseGoMod,
-  renderDepsTable,
-} from "./deps.js";
-import type { DepRequirement, DepUpdate, Ecosystem } from "./deps.js";
+import { prepareDependencyReview } from "./dependency-review.js";
 import { runJiraFilterRecipe } from "./jira-recipe.js";
+import { runSentryTopRecipe } from "./sentry-recipe.js";
 import {
   RECIPE_CONFIG_PATH,
   parseRecipes,
+  type MircliReviewRecipe,
   type Recipe,
   type ReviewRecipe,
 } from "./recipe-config.js";
 import { sendRecipeMessage } from "./recipe-telegram.js";
+import {
+  reviewPortfolioChunk,
+  runCodexReadOnly,
+} from "./review-agent.js";
+import { enrichFindingMetadata, keepSafeReviewFindings } from "./review-metadata.js";
+import {
+  advancePortfolioState,
+  chunkChangedFiles,
+  projectStateFor,
+  runReviewPortfolio,
+  type PortfolioReviewState,
+} from "./review-portfolio.js";
+import { prepareReviewWorktree } from "./review-worktree.js";
 
 /**
  * Scheduled review recipes.
@@ -49,15 +55,10 @@ const run = promisify(execFile);
 
 const STATE_PATH = RECIPE_STATE_PATH;
 const SHADOW_DIR = ".telecodex/recipes";
-const DIFF_LIMIT = 60_000;
-const CODEX_TIMEOUT_MS = 20 * 60 * 1000;
 /** Keep the seen-set bounded; a fingerprint older than this many entries may re-alert. */
 const MAX_SEEN = 500;
 
-interface RecipeState {
-  lastSha?: string;
-  seen?: string[];
-}
+type RecipeState = PortfolioReviewState;
 
 interface State {
   runs?: Record<string, RecipeState>;
@@ -95,56 +96,15 @@ async function git(cwd: string, args: string[]): Promise<string> {
  * which is empty on a host that fetches sporadically, and silently yields an
  * empty range instead of an error.
  */
-async function firstBaseline(recipe: ReviewRecipe): Promise<string> {
-  const since = await git(recipe.cwd, [
+async function firstBaseline(cwd: string, headSha: string): Promise<string> {
+  const since = await git(cwd, [
     "rev-list",
     "-1",
     "--before=24 hours ago",
-    recipe.baseRef,
+    headSha,
   ]);
   const sha = since.trim();
-  return sha || (await git(recipe.cwd, ["rev-parse", `${recipe.baseRef}~1`])).trim();
-}
-
-function runCodex(recipe: ReviewRecipe, prompt: string, outputFile: string): Promise<void> {
-  // The monorepo root is a folder of repositories, not a repository itself.
-  const args = [
-    "exec",
-    "--ephemeral",
-    "--skip-git-repo-check",
-    "-C",
-    recipe.cwd,
-    "-s",
-    "read-only",
-    "-o",
-    outputFile,
-  ];
-  if (recipe.model) {
-    args.push("-m", recipe.model);
-  }
-  args.push("-");
-
-  return new Promise((resolve, reject) => {
-    const child = spawn("codex", args, { stdio: ["pipe", "inherit", "inherit"] });
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error(`codex exec exceeded ${CODEX_TIMEOUT_MS / 60000} minutes`));
-    }, CODEX_TIMEOUT_MS);
-
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`codex exec exited with ${code}`));
-      }
-    });
-    child.stdin.end(prompt);
-  });
+  return sha || (await git(cwd, ["rev-parse", `${headSha}~1`])).trim();
 }
 
 /**
@@ -153,21 +113,28 @@ function runCodex(recipe: ReviewRecipe, prompt: string, outputFile: string): Pro
  * A single message with twenty buttons cannot say which one was pressed once a
  * mute has to grey out just that finding.
  */
-async function deliverFindings(recipe: ReviewRecipe, runId: number, triage: Triage): Promise<void> {
+type CodeReviewRecipe = ReviewRecipe | MircliReviewRecipe;
+
+async function deliverFindings(
+  recipe: CodeReviewRecipe,
+  project: string,
+  runId: number,
+  triage: Triage,
+  qualifyPath = true,
+): Promise<void> {
   const notes = [
     `${triage.fresh.length} ${triage.fresh.length === 1 ? "новая" : "новых"}`,
     triage.repeated.length > 0 ? `повторов: ${triage.repeated.length}` : "",
     triage.suppressed.length > 0 ? `заглушено: ${triage.suppressed.length}` : "",
   ].filter(Boolean);
 
-  const project = path.basename(recipe.cwd);
   await sendRecipeMessage(
     recipe,
     `\u{1F50D} <b>${recipe.id}</b> \u00B7 ${project} \u00B7 ${notes.join(" \u00B7 ")}`,
   );
 
   for (const [index, finding] of triage.fresh.entries()) {
-    await sendRecipeMessage(recipe, renderFindingHTML(finding, project), {
+    await sendRecipeMessage(recipe, renderFindingHTML(finding, qualifyPath ? project : undefined), {
       inline_keyboard: [
         [
           { text: "\u{1F527} Тред-фикс", callback_data: `rfix:${runId}:${index}` },
@@ -191,14 +158,15 @@ function toPlainText(html: string): string {
 
 /** During calibration the findings land here so false positives can be muted by hand. */
 async function writeShadow(
-  recipe: ReviewRecipe,
+  recipe: CodeReviewRecipe,
+  project: string,
   stamp: string,
   findings: Finding[],
   html: string,
 ): Promise<void> {
   await mkdir(SHADOW_DIR, { recursive: true });
   const lines = [
-    `## ${stamp}`,
+    `## ${stamp} · ${project}`,
     "",
     toPlainText(html),
     "",
@@ -207,115 +175,11 @@ async function writeShadow(
     "",
     "",
   ];
-  await appendFile(path.join(SHADOW_DIR, `${recipe.id}.shadow.md`), lines.join("\n"), "utf8");
-}
-
-const REGISTRY_TIMEOUT_MS = 15_000;
-const REGISTRY_CONCURRENCY = 8;
-
-async function fetchJson(url: string): Promise<Record<string, unknown> | undefined> {
-  try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(REGISTRY_TIMEOUT_MS) });
-    return response.ok ? ((await response.json()) as Record<string, unknown>) : undefined;
-  } catch {
-    // One unreachable package must not take the whole weekly run down.
-    return undefined;
-  }
-}
-
-async function latestComposerVersion(name: string): Promise<string | undefined> {
-  const body = await fetchJson(`https://repo.packagist.org/p2/${name}.json`);
-  const packages = (body?.packages ?? {}) as Record<string, Array<{ version?: string }>>;
-  const versions = packages[name];
-  return Array.isArray(versions)
-    ? latestStable(versions.map((entry) => String(entry.version ?? "")).filter(Boolean))
-    : undefined;
-}
-
-async function latestGoVersion(module: string): Promise<string | undefined> {
-  const body = await fetchJson(`https://proxy.golang.org/${escapeGoModulePath(module)}/@latest`);
-  const version = body?.Version;
-  // An untagged module answers with a pseudo-version; suggesting one is noise.
-  return typeof version === "string" && !version.includes("-") ? version : undefined;
-}
-
-async function mapLimit<T, R>(
-  items: T[],
-  limit: number,
-  worker: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let cursor = 0;
-  await Promise.all(
-    Array.from({ length: Math.min(limit, items.length) }, async () => {
-      while (cursor < items.length) {
-        const index = cursor;
-        cursor += 1;
-        results[index] = await worker(items[index]);
-      }
-    }),
+  await appendFile(
+    path.join(SHADOW_DIR, `${recipe.id}-${project}.shadow.md`),
+    lines.join("\n"),
+    "utf8",
   );
-  return results;
-}
-
-/**
- * Direct requirements across the monorepo.
- *
- * Neither composer nor go is installed on this host, so the manifests are read
- * from the checkout: Laravel services keep theirs in `<service>/src`, Go ones in
- * `<service>/app`.
- */
-async function collectRequirements(
-  root: string,
-): Promise<Array<DepRequirement & { ecosystem: Ecosystem }>> {
-  const found: Array<DepRequirement & { ecosystem: Ecosystem }> = [];
-  const entries = await readdir(root, { withFileTypes: true });
-
-  for (const entry of entries.filter((candidate) => candidate.isDirectory())) {
-    const composerJson = path.join(root, entry.name, "src/composer.json");
-    const composerLock = path.join(root, entry.name, "src/composer.lock");
-    if (existsSync(composerJson) && existsSync(composerLock)) {
-      found.push(
-        ...composerDirectDependencies(
-          JSON.parse(await readFile(composerJson, "utf8")),
-          JSON.parse(await readFile(composerLock, "utf8")),
-        ).map((dep) => ({ ...dep, ecosystem: "composer" as const })),
-      );
-    }
-
-    const goMod = path.join(root, entry.name, "app/go.mod");
-    if (existsSync(goMod)) {
-      found.push(
-        ...parseGoMod(await readFile(goMod, "utf8")).map((dep) => ({
-          ...dep,
-          ecosystem: "go" as const,
-        })),
-      );
-    }
-  }
-
-  // Several Go services share dependencies; one row per package is enough.
-  const unique = new Map(found.map((dep) => [`${dep.ecosystem}:${dep.name}`, dep]));
-  return [...unique.values()];
-}
-
-async function buildDepsTable(recipe: ReviewRecipe): Promise<string> {
-  const requirements = await collectRequirements(recipe.cwd);
-  console.log(`${recipe.id}: checking ${requirements.length} direct dependencies`);
-
-  const updates = await mapLimit(requirements, REGISTRY_CONCURRENCY, async (requirement) => {
-    const latest =
-      requirement.ecosystem === "composer"
-        ? await latestComposerVersion(requirement.name)
-        : await latestGoVersion(requirement.name);
-    if (!latest) {
-      return undefined;
-    }
-    const bump = bumpKind(requirement.current, latest);
-    return bump === "none" ? undefined : ({ ...requirement, latest, bump } as DepUpdate);
-  });
-
-  return renderDepsTable(updates.filter((update): update is DepUpdate => update !== undefined));
 }
 
 /** Which recipes exist is deployment-specific, so it comes from a file. */
@@ -366,7 +230,9 @@ async function main(): Promise<void> {
     }
     const result = await runJiraFilterRecipe(
       recipe,
-      (html, replyMarkup) => sendRecipeMessage(recipe, html, replyMarkup),
+      async (html, replyMarkup) => {
+        await sendRecipeMessage(recipe, html, replyMarkup);
+      },
     );
     console.log(
       `${recipe.id}: ${result.total} total, ${result.delivered} new, ${result.repeated} repeated`,
@@ -374,44 +240,162 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (recipe.kind === "sentry-top") {
+    if (probe) {
+      throw new Error(`${recipe.id} has no commit range; --from does not apply`);
+    }
+    const result = await runSentryTopRecipe(
+      recipe,
+      async (html, replyMarkup) => {
+        await sendRecipeMessage(recipe, html, replyMarkup);
+      },
+    );
+    console.log(
+      `${recipe.id}: ${result.total} total, ${result.delivered} delivered, ${result.suppressed} noise suppressed`,
+    );
+    return;
+  }
+
   const stamp = new Date().toISOString();
   const state = await loadState();
   const previous = state.runs?.[recipe.id] ?? {};
-  const template = (await readFile(recipe.promptFile, "utf8")).replaceAll("{{CWD}}", recipe.cwd);
+  const template = await readFile(recipe.promptFile, "utf8");
+  const ignored = [...(state.ignored ?? []), ...new RecipeMutes(RECIPE_MUTES_PATH).list()];
+
+  if (recipe.kind === "mircli-review") {
+    if (probe) {
+      throw new Error(`${recipe.id} reviews multiple repositories; --from does not apply`);
+    }
+    const outputRoot = path.join(SHADOW_DIR, "output", recipe.id);
+    const result = await runReviewPortfolio(recipe, previous, {
+      reviewChunk: (input) => reviewPortfolioChunk(
+        template,
+        recipe.model,
+        outputRoot,
+        input,
+      ),
+    });
+    let nextRunId = state.nextRunId ?? 1;
+    const pending: Array<{ runId: number; cwd: string; findings: Finding[] }> = [];
+
+    for (const project of result.projects) {
+      if (project.status === "failed") {
+        console.error(`${recipe.id}/${project.name}: ${project.error}`);
+        continue;
+      }
+      const triage = triageFindings(project.findings, {
+        seen: projectStateFor(previous, project.name).seen ?? [],
+        ignored,
+      });
+      const html = renderRunHTML({ recipe: `${recipe.id}/${project.name}`, ...triage });
+      await writeShadow(recipe, project.name, stamp, triage.fresh, html);
+      if (recipe.deliver && triage.shouldDeliver) {
+        const runId = nextRunId++;
+        await deliverFindings(recipe, project.name, runId, triage);
+        pending.push({ runId, cwd: project.sourcePath, findings: triage.fresh });
+      }
+    }
+
+    await saveState({
+      ...state,
+      nextRunId,
+      runs: {
+        ...state.runs,
+        [recipe.id]: advancePortfolioState(previous, result.projects),
+      },
+    });
+    for (const item of pending) {
+      writePendingRun(STATE_PATH, item.runId, {
+        recipe: recipe.id,
+        cwd: item.cwd,
+        findings: item.findings,
+      });
+    }
+    const reviewed = result.projects.filter((project) => project.status === "reviewed").length;
+    const unchanged = result.projects.filter((project) => project.status === "unchanged").length;
+    const failed = result.projects.filter((project) => project.status === "failed").length;
+    console.log(
+      `${recipe.id}: ${reviewed} reviewed, ${unchanged} unchanged, ${failed} failed`,
+    );
+    return;
+  }
 
   let prompt: string;
   let head: string | undefined;
   let range: string;
+  let findings: Finding[];
+  let project = path.basename(recipe.cwd);
+  let reviewCwd = recipe.cwd;
 
   if (recipe.kind === "deps") {
     if (probe) {
       throw new Error(`${recipe.id} has no commit range; --from does not apply`);
     }
-    prompt = template.replace("{{DEPS}}", await buildDepsTable(recipe));
+    const prepared = await prepareDependencyReview(recipe);
+    reviewCwd = recipe.worktreeRoot;
+    prompt = template
+      .replaceAll("{{CWD}}", recipe.worktreeRoot)
+      .replace("{{DEPS}}", prepared.table);
     range = "зависимости";
+    const outputFile = path.join(SHADOW_DIR, `${recipe.id}.last-message.txt`);
+    await mkdir(SHADOW_DIR, { recursive: true });
+    await runCodexReadOnly(reviewCwd, recipe.model, prompt, outputFile);
+    const parsed = parseFindings(await readFile(outputFile, "utf8"));
+    const safe = keepSafeReviewFindings(
+      parsed,
+      recipe.worktreeRoot,
+      parsed.map((finding) => finding.file),
+    ).filter((finding) => existsSync(path.join(recipe.worktreeRoot, finding.file)));
+    findings = [];
+    for (const finding of safe) {
+      const [projectName, ...relativeParts] = finding.file.split("/");
+      const preparedProject = prepared.projects.find((entry) => entry.name === projectName);
+      if (!preparedProject || relativeParts.length === 0) continue;
+      const enriched = await enrichFindingMetadata(
+        { ...finding, file: relativeParts.join("/") },
+        {
+          worktreePath: preparedProject.worktreePath,
+          headSha: preparedProject.headSha,
+        },
+      );
+      findings.push({ ...enriched, file: finding.file });
+    }
   } else {
-    await git(recipe.cwd, ["fetch", "origin", "--quiet"]);
-    head = (await git(recipe.cwd, ["rev-parse", recipe.baseRef])).trim();
-    const from = probe
-      ? (await git(recipe.cwd, ["rev-parse", probe])).trim()
-      : previous.lastSha ?? (await firstBaseline(recipe));
+    const prepared = await prepareReviewWorktree(
+      { name: project, sourcePath: recipe.cwd },
+      recipe.worktreeRoot,
+    );
+    reviewCwd = prepared.worktreePath;
+    head = prepared.headSha;
+    let from = probe
+      ? (await git(reviewCwd, ["rev-parse", probe])).trim()
+      : previous.lastSha;
+    if (from) {
+      try {
+        await git(reviewCwd, ["merge-base", "--is-ancestor", from, head]);
+      } catch {
+        from = undefined;
+      }
+    }
+    from ??= await firstBaseline(reviewCwd, head);
 
     if (from === head) {
-      console.log(`${recipe.id}: no new commits on ${recipe.baseRef}`);
+      console.log(`${recipe.id}: no new commits on origin/main`);
       return;
     }
 
     range = `${from}..${head}`;
-    const commits = await git(recipe.cwd, ["log", "--oneline", "--no-merges", range]);
-    const diffArgs = ["diff", range];
+    const diffArgs = ["-c", "core.quotePath=false", "diff", "--name-only", "-z", range];
     if (recipe.paths.length > 0) {
       diffArgs.push("--", ...recipe.paths);
     }
-    const rawDiff = await git(recipe.cwd, diffArgs);
+    const changedFiles = (await git(reviewCwd, diffArgs))
+      .split("\0")
+      .filter(Boolean);
 
     // A run with nothing to look at must still advance the pointer, or the same
     // empty range is re-examined every morning.
-    if (!rawDiff.trim()) {
+    if (changedFiles.length === 0) {
       if (!probe) {
         await saveState({
           ...state,
@@ -422,44 +406,39 @@ async function main(): Promise<void> {
       return;
     }
 
-    const diff =
-      rawDiff.length > DIFF_LIMIT
-        ? `${rawDiff.slice(0, DIFF_LIMIT)}\n\n[дифф обрезан на ${DIFF_LIMIT} символах]`
-        : rawDiff;
-
-    prompt = template
-      .replace("{{COMMITS}}", commits.trim() || "(нет коммитов)")
-      .replace("{{DIFF}}", diff);
-  }
-
-  const outputFile = path.join(SHADOW_DIR, `${recipe.id}.last-message.txt`);
-  await mkdir(SHADOW_DIR, { recursive: true });
-  await runCodex(recipe, prompt, outputFile);
-
-  const parsed = parseFindings(await readFile(outputFile, "utf8"));
-  const findings = keepExistingFiles(parsed, (file) =>
-    existsSync(path.join(recipe.cwd, file)),
-  );
-  if (findings.length < parsed.length) {
-    console.log(
-      `${recipe.id}: dropped ${parsed.length - findings.length} finding(s) naming files outside the checkout`,
-    );
+    findings = [];
+    const chunks = chunkChangedFiles(changedFiles);
+    for (const [chunkIndex, files] of chunks.entries()) {
+      findings.push(...await reviewPortfolioChunk(
+        template,
+        recipe.model,
+        path.join(SHADOW_DIR, "output", recipe.id),
+        {
+          project: prepared,
+          baseSha: from,
+          headSha: head,
+          files,
+          chunkIndex,
+          totalChunks: chunks.length,
+        },
+      ));
+    }
+    prompt = "";
   }
   const triage = triageFindings(findings, {
     seen: previous.seen ?? [],
-    // Hand-edited mutes live in recipes.json, button mutes in recipe-mutes.json.
-    ignored: [...(state.ignored ?? []), ...new RecipeMutes(RECIPE_MUTES_PATH).list()],
+    ignored,
   });
   const html = renderRunHTML({ recipe: recipe.id, ...triage });
 
   // The shadow log is the permanent record either way; delivery is on top of it.
-  await writeShadow(recipe, stamp, triage.fresh, html);
+  await writeShadow(recipe, project, stamp, triage.fresh, html);
 
   // A probe never posts: calibrating on history must not wake the topic up.
   let runId: number | undefined;
   if (recipe.deliver && !probe && triage.shouldDeliver) {
     runId = state.nextRunId ?? 1;
-    await deliverFindings(recipe, runId, triage);
+    await deliverFindings(recipe, project, runId, triage, recipe.kind !== "deps");
   }
 
   if (!probe) {
@@ -481,7 +460,7 @@ async function main(): Promise<void> {
   if (runId !== undefined) {
     writePendingRun(STATE_PATH, runId, {
       recipe: recipe.id,
-      cwd: recipe.cwd,
+      cwd: recipe.kind === "deps" ? recipe.cwd : reviewCwd,
       findings: triage.fresh,
     });
   }

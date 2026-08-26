@@ -6,7 +6,7 @@
  */
 
 export type Bump = "major" | "minor" | "patch" | "none";
-export type Ecosystem = "composer" | "go";
+export type Ecosystem = "composer" | "go" | "npm";
 
 export interface DepRequirement {
   name: string;
@@ -14,9 +14,63 @@ export interface DepRequirement {
 }
 
 export interface DepUpdate extends DepRequirement {
+  project: string;
+  manifest: string;
   latest: string;
   bump: Bump;
   ecosystem: Ecosystem;
+}
+
+export function npmDirectDependencies(
+  packageJson: {
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+  },
+  packageLock: { packages?: Record<string, { version?: string }> },
+): DepRequirement[] {
+  const direct = new Set([
+    ...Object.keys(packageJson.dependencies ?? {}),
+    ...Object.keys(packageJson.devDependencies ?? {}),
+  ]);
+  return [...direct].flatMap((name) => {
+    const current = packageLock.packages?.[`node_modules/${name}`]?.version;
+    return current ? [{ name, current }] : [];
+  });
+}
+
+export function yarnV1DirectDependencies(
+  packageJson: {
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+  },
+  yarnLock: string,
+): DepRequirement[] {
+  const resolved = new Map<string, string>();
+  let selectors: string[] = [];
+
+  for (const raw of yarnLock.split("\n")) {
+    if (raw && !/^\s/.test(raw) && raw.endsWith(":")) {
+      selectors = raw
+        .slice(0, -1)
+        .split(/,\s+/)
+        .map((selector) => selector.replace(/^"|"$/g, ""));
+      continue;
+    }
+    const version = /^\s+version\s+"([^"]+)"/.exec(raw)?.[1];
+    if (version) {
+      for (const selector of selectors) resolved.set(selector, version);
+      selectors = [];
+    }
+  }
+
+  const direct = new Map([
+    ...Object.entries(packageJson.dependencies ?? {}),
+    ...Object.entries(packageJson.devDependencies ?? {}),
+  ]);
+  return [...direct].flatMap(([name, constraint]) => {
+    const current = resolved.get(`${name}@${constraint}`);
+    return current ? [{ name, current }] : [];
+  });
 }
 
 const GO_IGNORED_DIRECTIVES = /^(module|go|toolchain|replace|exclude|retract)\b/;
@@ -73,12 +127,25 @@ export function escapeGoModulePath(module: string): string {
 }
 
 export function composerDirectDependencies(
-  composerJson: { require?: Record<string, string> },
-  composerLock: { packages?: Array<{ name: string; version: string }> },
+  composerJson: {
+    require?: Record<string, string>;
+    "require-dev"?: Record<string, string>;
+  },
+  composerLock: {
+    packages?: Array<{ name: string; version: string }>;
+    "packages-dev"?: Array<{ name: string; version: string }>;
+  },
 ): DepRequirement[] {
-  const locked = new Map((composerLock.packages ?? []).map((entry) => [entry.name, entry.version]));
+  const locked = new Map([
+    ...(composerLock.packages ?? []),
+    ...(composerLock["packages-dev"] ?? []),
+  ].map((entry) => [entry.name, entry.version]));
+  const direct = new Set([
+    ...Object.keys(composerJson.require ?? {}),
+    ...Object.keys(composerJson["require-dev"] ?? {}),
+  ]);
 
-  return Object.keys(composerJson.require ?? {})
+  return [...direct]
     // php itself and ext-* are platform requirements, not packages composer can bump.
     .filter((name) => name !== "php" && !name.startsWith("ext-") && name.includes("/"))
     .flatMap((name) => {
@@ -140,7 +207,7 @@ export function bumpKind(current: string, latest: string): Bump {
 }
 
 const BUMP_RANK: Record<Bump, number> = { major: 0, minor: 1, patch: 2, none: 3 };
-const ECOSYSTEM_ORDER: Ecosystem[] = ["composer", "go"];
+const ECOSYSTEM_ORDER: Ecosystem[] = ["composer", "go", "npm"];
 
 export function renderDepsTable(updates: DepUpdate[]): string {
   if (updates.length === 0) {
@@ -160,10 +227,10 @@ export function renderDepsTable(updates: DepUpdate[]): string {
       [
         `### ${ecosystem}`,
         "",
-        "| пакет | сейчас | последняя | скачок |",
-        "| --- | --- | --- | --- |",
+        "| проект | манифест | пакет | сейчас | последняя | скачок |",
+        "| --- | --- | --- | --- | --- | --- |",
         ...rows.map(
-          (row) => `| ${row.name} | ${row.current} | ${row.latest} | ${row.bump} |`,
+          (row) => `| ${row.project} | ${row.manifest} | ${row.name} | ${row.current} | ${row.latest} | ${row.bump} |`,
         ),
       ].join("\n"),
     ];

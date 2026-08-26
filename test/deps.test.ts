@@ -5,9 +5,65 @@ import {
   composerDirectDependencies,
   escapeGoModulePath,
   latestStable,
+  npmDirectDependencies,
+  yarnV1DirectDependencies,
   parseGoMod,
   renderDepsTable,
 } from "../src/deps.js";
+
+describe("npmDirectDependencies", () => {
+  it("keeps direct dependencies and resolved lockfile versions", () => {
+    expect(npmDirectDependencies(
+      { dependencies: { next: "^15.0.0", react: "^19.0.0" }, devDependencies: { vitest: "^3" } },
+      {
+        packages: {
+          "": { dependencies: { next: "^15.0.0", react: "^19.0.0" } },
+          "node_modules/next": { version: "15.4.1" },
+          "node_modules/react": { version: "19.1.0" },
+          "node_modules/vitest": { version: "3.2.4" },
+        },
+      },
+    )).toEqual([
+      { name: "next", current: "15.4.1" },
+      { name: "react", current: "19.1.0" },
+      { name: "vitest", current: "3.2.4" },
+    ]);
+  });
+
+  it("supports scoped packages", () => {
+    expect(npmDirectDependencies(
+      { dependencies: { "@sentry/nextjs": "^9" } },
+      { packages: { "node_modules/@sentry/nextjs": { version: "9.1.2" } } },
+    )).toEqual([{ name: "@sentry/nextjs", current: "9.1.2" }]);
+  });
+
+  it("includes direct development dependencies used by build and test projects", () => {
+    expect(npmDirectDependencies(
+      { devDependencies: { vitest: "^3" } },
+      { packages: { "node_modules/vitest": { version: "3.2.4" } } },
+    )).toEqual([{ name: "vitest", current: "3.2.4" }]);
+  });
+});
+
+describe("yarnV1DirectDependencies", () => {
+  it("resolves direct dependencies from a Yarn v1 lockfile", () => {
+    const lock = [
+      '"@scope/pkg@^2.0.0":',
+      '  version "2.3.1"',
+      "",
+      'react@^18.0.0, react@^18.2.0:',
+      '  version "18.3.1"',
+    ].join("\n");
+
+    expect(yarnV1DirectDependencies(
+      { dependencies: { "@scope/pkg": "^2.0.0", react: "^18.2.0" } },
+      lock,
+    )).toEqual([
+      { name: "@scope/pkg", current: "2.3.1" },
+      { name: "react", current: "18.3.1" },
+    ]);
+  });
+});
 
 describe("parseGoMod", () => {
   it("reads a require block", () => {
@@ -90,6 +146,13 @@ describe("composerDirectDependencies", () => {
   it("returns nothing when composer.json requires nothing", () => {
     expect(composerDirectDependencies({}, lock)).toEqual([]);
   });
+
+  it("includes direct require-dev packages from packages-dev", () => {
+    expect(composerDirectDependencies(
+      { "require-dev": { "phpunit/phpunit": "^11" } },
+      { "packages-dev": [{ name: "phpunit/phpunit", version: "11.5.0" }] },
+    )).toEqual([{ name: "phpunit/phpunit", current: "11.5.0" }]);
+  });
 });
 
 describe("escapeGoModulePath", () => {
@@ -162,9 +225,10 @@ describe("bumpKind", () => {
 
 describe("renderDepsTable", () => {
   const updates = [
-    { name: "laravel/framework", current: "v11.9.2", latest: "v12.0.1", bump: "major" as const, ecosystem: "composer" as const },
-    { name: "guzzlehttp/guzzle", current: "7.8.1", latest: "7.9.0", bump: "minor" as const, ecosystem: "composer" as const },
-    { name: "github.com/foo/bar", current: "v1.2.3", latest: "v1.2.9", bump: "patch" as const, ecosystem: "go" as const },
+    { project: "mir-back", manifest: "composer.json", name: "laravel/framework", current: "v11.9.2", latest: "v12.0.1", bump: "major" as const, ecosystem: "composer" as const },
+    { project: "mir-back", manifest: "composer.json", name: "guzzlehttp/guzzle", current: "7.8.1", latest: "7.9.0", bump: "minor" as const, ecosystem: "composer" as const },
+    { project: "mir-catalog-go", manifest: "go.mod", name: "github.com/foo/bar", current: "v1.2.3", latest: "v1.2.9", bump: "patch" as const, ecosystem: "go" as const },
+    { project: "mir-admin", manifest: "package-lock.json", name: "next", current: "15.4.1", latest: "16.0.0", bump: "major" as const, ecosystem: "npm" as const },
   ];
 
   it("lists every update with its versions", () => {
@@ -174,6 +238,9 @@ describe("renderDepsTable", () => {
     expect(table).toContain("v11.9.2");
     expect(table).toContain("v12.0.1");
     expect(table).toContain("github.com/foo/bar");
+    expect(table).toContain("mir-back");
+    expect(table).toContain("composer.json");
+    expect(table).toContain("### npm");
   });
 
   it("groups by ecosystem so the agent knows which registry to look at", () => {

@@ -3,12 +3,15 @@ import { escapeHTML } from "./format.js";
 /**
  * Machine-readable review findings.
  *
- * Scheduled recipes ask the agent for `FINDING|severity|file:line|category|text`
- * lines so a run can be diffed against the previous one. Anything the agent says
- * around those lines is prose for a human and is dropped here.
+ * Scheduled recipes ask the agent for
+ * `FINDING|priority|aspect|file:line|category|text` lines so a run can be diffed
+ * against the previous one. The legacy severity protocol remains parseable
+ * while deployed recipes migrate.
  */
 
 export type Severity = "critical" | "high" | "medium" | "low";
+export type ReviewPriority = "P0" | "P1" | "P2" | "P3";
+export type ReviewAspect = "performance" | "cleanliness" | "security" | "architecture";
 
 const SEVERITY_RANK: Record<Severity, number> = {
   critical: 0,
@@ -27,10 +30,27 @@ const MAX_DESCRIPTION_LENGTH = 220;
 
 export interface Finding {
   severity: Severity;
+  priority?: ReviewPriority;
+  aspect?: ReviewAspect;
   file: string;
   line?: number;
   category: string;
   description: string;
+  author?: string;
+  commitSha?: string;
+  commitUrl?: string;
+}
+
+const PRIORITY_SEVERITY: Record<ReviewPriority, Severity> = {
+  P0: "critical",
+  P1: "high",
+  P2: "medium",
+  P3: "low",
+};
+
+function toPriority(raw: string): ReviewPriority | undefined {
+  const value = raw.trim().toUpperCase();
+  return /^P[0-3]$/.test(value) ? value as ReviewPriority : undefined;
 }
 
 function toSeverity(raw: string): Severity {
@@ -55,6 +75,26 @@ function parseFinding(raw: string): Finding | undefined {
   const parts = line.slice(FINDING_PREFIX.length).split("|");
   if (parts.length < 4) {
     return undefined;
+  }
+
+  const priority = toPriority(parts[0]);
+  if (priority) {
+    if (parts.length < 5) return undefined;
+    const aspect = parts[1].trim() as ReviewAspect;
+    const category = parts[3].trim();
+    const description = parts.slice(4).join("|").trim();
+    if (!description || !category) return undefined;
+    if (!["performance", "cleanliness", "security", "architecture"].includes(aspect)) {
+      return undefined;
+    }
+    return {
+      priority,
+      aspect,
+      severity: PRIORITY_SEVERITY[priority],
+      ...splitLocation(parts[2]),
+      category,
+      description,
+    };
   }
 
   // The description is last and may itself contain the delimiter.
@@ -171,10 +211,25 @@ export function renderFindingHTML(finding: Finding, project?: string): string {
   const file =
     project && !finding.file.startsWith(`${project}/`) ? `${project}/${finding.file}` : finding.file;
   const location = finding.line === undefined ? file : `${file}:${finding.line}`;
-  return [
-    `${SEVERITY_MARK[finding.severity]} <b>${finding.severity}</b> · <code>${escapeHTML(location)}</code> · ${escapeHTML(finding.category)}`,
+  const label = finding.priority && finding.aspect
+    ? `[${finding.priority}][${finding.aspect}]`
+    : finding.severity;
+  const lines = [
+    `${SEVERITY_MARK[finding.severity]} <b>${escapeHTML(label)}</b> · <code>${escapeHTML(location)}</code> · ${escapeHTML(finding.category)}`,
     escapeHTML(truncate(finding.description, MAX_DESCRIPTION_LENGTH)),
-  ].join("\n");
+  ];
+  if (finding.author) {
+    lines.push(`Автор: ${escapeHTML(finding.author)}`);
+  }
+  if (finding.commitSha) {
+    const shortSha = escapeHTML(finding.commitSha.slice(0, 8));
+    lines.push(
+      finding.commitUrl
+        ? `Коммит: <a href="${escapeHTML(finding.commitUrl)}">${shortSha}</a>`
+        : `Коммит: <code>${shortSha}</code>`,
+    );
+  }
+  return lines.join("\n");
 }
 
 export function renderRunHTML(run: {

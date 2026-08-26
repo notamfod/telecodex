@@ -1,14 +1,11 @@
 {
   "recipes": [
     {
-      "id": "daily-diff-review",
-      "cwd": "/srv/projects/example/backend",
-      "baseRef": "origin/main",
-      "promptFile": "recipes/daily-diff-review.md",
-      "paths": [
-        "*.php",
-        "*.sql"
-      ],
+      "id": "daily-mircli-review",
+      "kind": "mircli-review",
+      "cwd": "/srv/projects/example",
+      "worktreeRoot": "/root/.cache/telecodex/review-worktrees/mircli",
+      "promptFile": "recipes/mircli-code-review.md",
       "deliver": {
         "chatId": -1001111111111,
         "messageThreadId": 42
@@ -18,7 +15,34 @@
       "id": "dependency-review",
       "kind": "deps",
       "cwd": "/srv/projects/example",
-      "promptFile": "recipes/dependency-review.md"
+      "baseRef": "origin/main",
+      "worktreeRoot": "/root/.cache/telecodex/review-worktrees/mircli",
+      "promptFile": "recipes/dependency-review.md",
+      "paths": []
+    },
+    {
+      "id": "migration-audit",
+      "kind": "diff",
+      "cwd": "/srv/projects/example/mir-back",
+      "baseRef": "origin/main",
+      "worktreeRoot": "/root/.cache/telecodex/review-worktrees/mircli",
+      "promptFile": "recipes/migration-audit.md",
+      "paths": [
+        "src/database/migrations/*.php"
+      ]
+    },
+    {
+      "id": "daily-sentry-top",
+      "kind": "sentry-top",
+      "cwd": "/srv/projects/example",
+      "dofboxConfigModule": "/opt/dofbox/src/utils/config.js",
+      "realm": "example",
+      "period": "24h",
+      "limit": 10,
+      "deliver": {
+        "chatId": -1001111111111,
+        "messageThreadId": 42
+      }
     },
     {
       "id": "hourly-jira-new-issues",

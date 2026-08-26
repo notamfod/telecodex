@@ -30,6 +30,22 @@ describe("parseFindings", () => {
     });
   });
 
+  it("parses the MirCli priority and aspect protocol", () => {
+    const [finding] = parseFindings(
+      "FINDING|P1|security|src/http.ts:24|idor|tenant ownership is not checked",
+    );
+
+    expect(finding).toMatchObject({
+      priority: "P1",
+      aspect: "security",
+      severity: "high",
+      file: "src/http.ts",
+      line: 24,
+      category: "idor",
+      description: "tenant ownership is not checked",
+    });
+  });
+
   it("ignores the prose the agent wraps around the machine-readable lines", () => {
     const findings = parseFindings(
       [
@@ -226,6 +242,24 @@ describe("renderFindingHTML", () => {
     expect(html).toContain("app/Jobs/Import.php:88");
     expect(html).toContain("dispatch-in-transaction");
     expect(html).toContain("dispatch внутри транзакции");
+  });
+
+  it("renders priority, aspect, author and a linked commit", () => {
+    const [reviewFinding] = parseFindings(
+      "FINDING|P1|architecture|src/service.ts:12|boundary|business rule is in the controller",
+    );
+    Object.assign(reviewFinding, {
+      author: "Иван Иванов",
+      commitSha: "abcdef123456",
+      commitUrl: "https://gitlab.mircli.ru/mircli-ru/apps/mir-back/-/commit/abcdef123456",
+    });
+
+    const html = renderFindingHTML(reviewFinding, "mir-back");
+
+    expect(html).toContain("[P1][architecture]");
+    expect(html).toContain("Автор: Иван Иванов");
+    expect(html).toContain('href="https://gitlab.mircli.ru/mircli-ru/apps/mir-back/-/commit/abcdef123456"');
+    expect(html).toContain("abcdef12");
   });
 
   it("escapes code quoted in the description", () => {

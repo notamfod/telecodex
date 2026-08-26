@@ -3,7 +3,12 @@ import { describe, expect, it } from "vitest";
 import { parseRecipes } from "../src/recipe-config.js";
 
 const minimal = {
-  recipes: [{ id: "daily", cwd: "/srv/project", promptFile: "recipes/daily.md" }],
+  recipes: [{
+    id: "daily",
+    cwd: "/srv/project",
+    worktreeRoot: "/var/cache/telecodex/reviews",
+    promptFile: "recipes/daily.md",
+  }],
 };
 
 describe("parseRecipes", () => {
@@ -13,6 +18,7 @@ describe("parseRecipes", () => {
     expect(recipe).toEqual({
       id: "daily",
       cwd: "/srv/project",
+      worktreeRoot: "/var/cache/telecodex/reviews",
       promptFile: "recipes/daily.md",
       baseRef: "",
       paths: [],
@@ -57,6 +63,66 @@ describe("parseRecipes", () => {
     };
 
     expect(parseRecipes(JSON.stringify(configured))).toEqual(configured.recipes);
+  });
+
+  it("parses a deterministic Sentry top recipe without review prompt fields", () => {
+    const configured = {
+      recipes: [
+        {
+          id: "daily-sentry-top",
+          kind: "sentry-top",
+          cwd: "/root/dev/Projects/mircli",
+          dofboxConfigModule: "/root/dev/bin/dofbox/src/utils/config.js",
+          realm: "mircli",
+          period: "24h",
+          limit: 10,
+          deliver: { chatId: -1003981282865, messageThreadId: 635 },
+        },
+      ],
+    };
+
+    expect(parseRecipes(JSON.stringify(configured))).toEqual(configured.recipes);
+  });
+
+  it("parses a portfolio review recipe for every first-level project", () => {
+    const configured = {
+      recipes: [{
+        id: "daily-mircli-review",
+        kind: "mircli-review",
+        cwd: "/root/dev/Projects/mircli",
+        worktreeRoot: "/root/.cache/telecodex/review-worktrees/mircli",
+        promptFile: "recipes/mircli-code-review.md",
+        deliver: { chatId: -1003981282865, messageThreadId: 635 },
+      }],
+    };
+
+    expect(parseRecipes(JSON.stringify(configured))).toEqual(configured.recipes);
+  });
+
+  it("requires an isolated worktree root for source review recipes", () => {
+    const configured = {
+      recipes: [{ id: "daily", cwd: "/srv/project", promptFile: "recipes/daily.md" }],
+    };
+
+    expect(() => parseRecipes(JSON.stringify(configured))).toThrow(/worktreeRoot/);
+  });
+
+  it("requires a delivery target for a Sentry top recipe", () => {
+    const configured = {
+      recipes: [
+        {
+          id: "daily-sentry-top",
+          kind: "sentry-top",
+          cwd: "/root/dev/Projects/mircli",
+          dofboxConfigModule: "/opt/dofbox/src/utils/config.js",
+          realm: "mircli",
+          period: "24h",
+          limit: 10,
+        },
+      ],
+    };
+
+    expect(() => parseRecipes(JSON.stringify(configured))).toThrow(/deliver/i);
   });
 
   it("requires a delivery target for a Jira filter recipe", () => {

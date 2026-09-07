@@ -29,6 +29,7 @@ function isClosedForumTopicError(error: unknown): boolean {
 export function createForumTopicLivenessProbe(options: ForumTopicLivenessOptions) {
   const now = options.now ?? Date.now;
   const timeoutMs = positiveInteger(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, "timeoutMs");
+  if (timeoutMs > 2_147_483_647) throw new Error("Invalid timeoutMs");
   const cacheTtlMs = positiveInteger(options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS, "cacheTtlMs");
   const cache = new Map<string, { readonly value: boolean; readonly expiresAt: number }>();
   const inFlight = new Map<string, SharedRequest>();

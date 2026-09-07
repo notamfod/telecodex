@@ -13,7 +13,7 @@ describe("forum topic liveness", () => {
 
   it("rejects invalid destinations and timing values", () => {
     const sendChatAction = vi.fn(async () => true);
-    for (const timeoutMs of [0, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    for (const timeoutMs of [0, 1.5, 2_147_483_648, Number.MAX_SAFE_INTEGER + 1]) {
       expect(() => createForumTopicLivenessProbe({ sendChatAction, timeoutMs }))
         .toThrow("Invalid timeoutMs");
     }
@@ -30,6 +30,14 @@ describe("forum topic liveness", () => {
       expect(() => probe({ chatId: -1001, messageThreadId }))
         .toThrow("Invalid Telegram topic id");
     }
+  });
+
+  it("accepts the maximum Node timer delay and a longer cache TTL", () => {
+    expect(() => createForumTopicLivenessProbe({
+      sendChatAction: vi.fn(async () => true),
+      timeoutMs: 2_147_483_647,
+      cacheTtlMs: 2_147_483_648,
+    })).not.toThrow();
   });
 
   it("uses an ephemeral typing action in the target topic", async () => {

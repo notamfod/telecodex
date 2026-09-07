@@ -89,6 +89,8 @@ import {
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, splitTelegramMarkdown } from "./format.js";
 import { createForumTopicLivenessProbe } from "./telegram-topic-liveness.js";
+import { createTelegramTopicLivenessApi, type TelegramTopicLivenessApi }
+  from "./telegram-topic-liveness-api.js";
 import { registerGuardianCallbacks } from "./guardian-bot-adapter.js";
 import { JiraClient } from "./jira-client.js";
 import {
@@ -394,6 +396,7 @@ export interface TeleCodexBot extends Bot<Context> {
 
 export interface TeleCodexBotOptions {
   readonly backgroundWriteGate?: Pick<TelegramBackgroundWriteGate, "run">;
+  readonly topicLivenessApi?: TelegramTopicLivenessApi;
 }
 
 export interface TelegramCanonicalJobRef {
@@ -3180,8 +3183,8 @@ export function createBot(
 
   /** Telegram sends no update when a forum topic is deleted. */
   const probeTopicLiveness = createForumTopicLivenessProbe({
-    sendChatAction: (chatId, action, requestOptions, signal) =>
-      bot.api.sendChatAction(chatId, action, requestOptions, signal as never),
+    sendChatAction: (options.topicLivenessApi
+      ?? createTelegramTopicLivenessApi(config.telegramBotToken)).sendChatAction,
   });
   const topicIsAlive = (chatId: number, messageThreadId: number): Promise<boolean> =>
     probeTopicLiveness({ chatId, messageThreadId });

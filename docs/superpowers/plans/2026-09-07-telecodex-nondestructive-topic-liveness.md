@@ -451,22 +451,60 @@ git commit -m "NO-TICKET fix: use nondestructive topic probes"
 
 - [ ] **Step 1: Write failing local-only collector tests**
 
-Replace the status binding tests in `test/bot-commands.test.ts` with a pure-projection contract:
+Replace the status binding tests in `test/bot-commands.test.ts` with pure-projection contracts that make the current registry snapshot authoritative:
 
 ```ts
-it("projects saved bindings without a Telegram lookup", () => {
-  const cache = new Map<string, number>([["cached", 40], ["gone", 39]]);
+it("invalidates a cached binding deleted from the registry", () => {
+  const cache = new Map<string, number>();
+  bindSavedStatusTopics([{ threadId: "A", messageThreadId: 42 }], cache);
+  const rows = [{ threadId: "A", messageThreadId: undefined }];
+
+  bindSavedStatusTopics(rows, cache);
+
+  expect(rows[0].messageThreadId).toBeUndefined();
+  expect(cache.has("A")).toBe(false);
+});
+
+it("moves a reassigned topic to its current registry owner", () => {
+  const cache = new Map<string, number>();
+  bindSavedStatusTopics([{ threadId: "A", messageThreadId: 42 }], cache);
   const rows = [
-    { threadId: "cached", messageThreadId: undefined },
-    { threadId: "stored", messageThreadId: 43 },
+    { threadId: "A", messageThreadId: undefined },
+    { threadId: "B", messageThreadId: 42 },
   ];
 
   bindSavedStatusTopics(rows, cache);
 
-  expect(rows.map((row) => row.messageThreadId)).toEqual([40, 43]);
-  expect(cache).toEqual(new Map([["cached", 40], ["stored", 43]]));
+  expect(rows.map((row) => row.messageThreadId)).toEqual([undefined, 42]);
+  expect(cache).toEqual(new Map([["B", 42]]));
+});
+
+it("replaces a binding changed for the same thread", () => {
+  const cache = new Map<string, number>();
+  bindSavedStatusTopics([{ threadId: "A", messageThreadId: 42 }], cache);
+  const rows = [{ threadId: "A", messageThreadId: 43 }];
+
+  bindSavedStatusTopics(rows, cache);
+
+  expect(rows[0].messageThreadId).toBe(43);
+  expect(cache).toEqual(new Map([["A", 43]]));
+});
+
+it("projects a defined binding across duplicate rows in the same snapshot", () => {
+  const cache = new Map<string, number>();
+  const rows = [
+    { threadId: "A", messageThreadId: undefined },
+    { threadId: "A", messageThreadId: 42 },
+  ];
+
+  bindSavedStatusTopics(rows, cache);
+
+  expect(rows.map((row) => row.messageThreadId)).toEqual([42, 42]);
+  expect(cache).toEqual(new Map([["A", 42]]));
 });
 ```
+
+These tests cover registry deletion, topic reassignment, same-thread replacement, and useful propagation within one snapshot. They must not retain a cached binding merely because an unbound row remains visible.
 
 Change the Dashboard collector test to call it three times and require the same local-only options every time:
 
@@ -495,7 +533,7 @@ TMPDIR=/var/tmp npx vitest run \
   test/status-board-lifecycle.test.ts
 ```
 
-Expected: FAIL because `bindSavedStatusTopics` and the local-only collector contract do not exist.
+Expected: FAIL if `bindSavedStatusTopics` retains stale bindings after registry deletion or topic reassignment, or if the local-only collector contract does not exist.
 
 - [ ] **Step 3: Make status-topic binding a synchronous projection**
 
@@ -506,16 +544,23 @@ export function bindSavedStatusTopics(
   rows: LiveStatusTopicRow[],
   cache: Map<string, number>,
 ): void {
-  const visibleThreadIds = new Set(rows.map((row) => row.threadId));
-  for (const threadId of cache.keys()) {
-    if (!visibleThreadIds.has(threadId)) cache.delete(threadId);
-  }
+  const currentBindings = new Map<string, number>();
   for (const row of rows) {
-    if (row.messageThreadId !== undefined) cache.set(row.threadId, row.messageThreadId);
+    if (row.messageThreadId !== undefined) {
+      currentBindings.set(row.threadId, row.messageThreadId);
+    }
+  }
+  for (const threadId of cache.keys()) {
+    if (!currentBindings.has(threadId)) cache.delete(threadId);
+  }
+  for (const [threadId, messageThreadId] of currentBindings) {
+    cache.set(threadId, messageThreadId);
   }
   for (const row of rows) row.messageThreadId = cache.get(row.threadId);
 }
 ```
+
+Defined bindings in the current snapshot are authoritative. A visible row without a current binding invalidates any cached value unless another row for the same thread defines the binding in that same snapshot.
 
 Remove `findLiveBoundTopic` from the `src/bot.ts` imports. Remove `validateTopicBindings` from `collectStatusSnapshot` options and replace the async background binding block with:
 
@@ -589,8 +634,10 @@ Expected: no matches.
 ```bash
 git add src/bot.ts src/dashboard-controller.ts src/status-board.ts \
   test/bot-commands.test.ts test/dashboard-controller.test.ts \
-  test/status-board-lifecycle.test.ts
-git commit -m "NO-TICKET fix: keep topic checks out of background refreshes"
+  test/status-board-lifecycle.test.ts \
+  docs/superpowers/specs/2026-09-07-telecodex-nondestructive-topic-liveness-design.md \
+  docs/superpowers/plans/2026-09-07-telecodex-nondestructive-topic-liveness.md
+git commit -m "NO-TICKET fix: invalidate stale topic links"
 ```
 
 ## Task 4: Review and verify the complete hotfix

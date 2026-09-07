@@ -13,17 +13,52 @@ import {
 import * as botModule from "../src/bot.js";
 
 describe("status board Telegram policy", () => {
-  it("projects saved bindings synchronously without a Telegram lookup", () => {
-    const cache = new Map<string, number>([["cached", 40], ["gone", 39]]);
-    const rows = [
-      { threadId: "cached", messageThreadId: undefined },
-      { threadId: "stored", messageThreadId: 43 },
-    ];
+  it("invalidates a cached binding deleted from the registry", () => {
+    const cache = new Map<string, number>();
+    bindSavedStatusTopics([{ threadId: "A", messageThreadId: 42 }], cache);
+    const rows = [{ threadId: "A", messageThreadId: undefined }];
 
     expect(bindSavedStatusTopics(rows, cache)).toBeUndefined();
+    expect(rows[0].messageThreadId).toBeUndefined();
+    expect(cache.has("A")).toBe(false);
+  });
 
-    expect(rows.map((row) => row.messageThreadId)).toEqual([40, 43]);
-    expect(cache).toEqual(new Map([["cached", 40], ["stored", 43]]));
+  it("moves a reassigned topic to its current registry owner", () => {
+    const cache = new Map<string, number>();
+    bindSavedStatusTopics([{ threadId: "A", messageThreadId: 42 }], cache);
+    const rows = [
+      { threadId: "A", messageThreadId: undefined },
+      { threadId: "B", messageThreadId: 42 },
+    ];
+
+    bindSavedStatusTopics(rows, cache);
+
+    expect(rows.map((row) => row.messageThreadId)).toEqual([undefined, 42]);
+    expect(cache).toEqual(new Map([["B", 42]]));
+  });
+
+  it("replaces a binding changed for the same thread", () => {
+    const cache = new Map<string, number>();
+    bindSavedStatusTopics([{ threadId: "A", messageThreadId: 42 }], cache);
+    const rows = [{ threadId: "A", messageThreadId: 43 }];
+
+    bindSavedStatusTopics(rows, cache);
+
+    expect(rows[0].messageThreadId).toBe(43);
+    expect(cache).toEqual(new Map([["A", 43]]));
+  });
+
+  it("projects a defined binding across duplicate rows in the same snapshot", () => {
+    const cache = new Map<string, number>();
+    const rows = [
+      { threadId: "A", messageThreadId: undefined },
+      { threadId: "A", messageThreadId: 42 },
+    ];
+
+    bindSavedStatusTopics(rows, cache);
+
+    expect(rows.map((row) => row.messageThreadId)).toEqual([42, 42]);
+    expect(cache).toEqual(new Map([["A", 42]]));
   });
 
   it("propagates a rate limit while removing the legacy board", async () => {

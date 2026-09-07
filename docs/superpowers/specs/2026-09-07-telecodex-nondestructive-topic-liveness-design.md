@@ -65,9 +65,10 @@ This preserves the recovery invariant: only `false`, never a transport failure, 
 
 Replace the Status Board binding helper's live lookup behavior with a pure registry/cache projection:
 
-- copy persisted bindings from the current snapshot into the display cache;
-- retain cached bindings for rows still visible;
-- remove cache entries for rows no longer visible;
+- treat defined registry bindings in the current snapshot as authoritative;
+- remove cached bindings for threads that are absent or currently have no registry binding, including after deletion or reassignment;
+- replace cached bindings when the current registry assigns a new topic to the same thread;
+- propagate a defined binding across duplicate rows for the same thread within the current snapshot;
 - do not call Telegram, regardless of the Status Board or Dashboard refresh cadence.
 
 The Dashboard collector no longer schedules ten-minute binding validation. Status Board health checks may still verify and maintain the Status Board's own topic and message; they must not probe work topics.
@@ -124,6 +125,8 @@ Use RED-GREEN-REFACTOR with focused tests for:
 - single-flight behavior for concurrent callers;
 - five-second result reuse and expiry;
 - absence of `reopenForumTopic` and `closeForumTopic` from the liveness adapter;
+- authoritative cache invalidation after registry deletion and topic reassignment;
+- replacement of a same-thread binding and propagation across duplicate rows in one snapshot;
 - zero Telegram liveness calls during repeated Status Board and Dashboard refreshes;
 - preserved explicit ticket-close and Status Board lifecycle behavior;
 - recovery proceeding only after a definitive missing result.

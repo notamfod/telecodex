@@ -347,12 +347,17 @@ export function bindSavedStatusTopics(
   rows: LiveStatusTopicRow[],
   cache: Map<string, number>,
 ): void {
-  const visibleThreadIds = new Set(rows.map((row) => row.threadId));
-  for (const threadId of cache.keys()) {
-    if (!visibleThreadIds.has(threadId)) cache.delete(threadId);
-  }
+  const currentBindings = new Map<string, number>();
   for (const row of rows) {
-    if (row.messageThreadId !== undefined) cache.set(row.threadId, row.messageThreadId);
+    if (row.messageThreadId !== undefined) {
+      currentBindings.set(row.threadId, row.messageThreadId);
+    }
+  }
+  for (const threadId of cache.keys()) {
+    if (!currentBindings.has(threadId)) cache.delete(threadId);
+  }
+  for (const [threadId, messageThreadId] of currentBindings) {
+    cache.set(threadId, messageThreadId);
   }
   for (const row of rows) row.messageThreadId = cache.get(row.threadId);
 }

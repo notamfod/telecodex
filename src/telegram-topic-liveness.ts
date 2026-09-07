@@ -38,6 +38,9 @@ export function createForumTopicLivenessProbe(options: ForumTopicLivenessOptions
     callerSignal?: AbortSignal,
   ): Promise<boolean> => {
     validateDestination(destination);
+    if (callerSignal?.aborted) {
+      return Promise.reject(new Error("Telegram topic probe aborted"));
+    }
     const key = `${destination.chatId}:${destination.messageThreadId}`;
     const currentTime = now();
     for (const [cachedKey, cachedValue] of cache) {

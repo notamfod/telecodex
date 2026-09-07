@@ -167,6 +167,16 @@ describe("forum topic liveness", () => {
     expect(sendChatAction).toHaveBeenCalledOnce();
   });
 
+  it("skips Telegram when the first caller is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const sendChatAction = vi.fn(async () => true);
+    const probe = createForumTopicLivenessProbe({ sendChatAction });
+
+    await expect(probe(destination, controller.signal)).rejects.toThrow("Telegram topic probe aborted");
+    expect(sendChatAction).not.toHaveBeenCalled();
+  });
+
   it("caches a missing result and expires that negative cache", async () => {
     let now = 1_000;
     const sendChatAction = vi.fn().mockRejectedValue(new Error("TOPIC_DELETED"));

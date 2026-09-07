@@ -4,9 +4,7 @@ import { createBot, registerCommands } from "./bot.js";
 import type { TelegramBotReliability } from "./bot.js";
 import { checkAuthStatus } from "./codex-auth.js";
 import { findLaunchProfile, formatLaunchProfileBehavior } from "./codex-launch.js";
-import { getThread } from "./codex-state.js";
 import { loadConfig } from "./config.js";
-import { escapeHTML } from "./format.js";
 import {
   createTeleCodexLifecycle,
   runTeleCodexShutdownSafely,
@@ -21,7 +19,6 @@ import {
   type RunningMiniAppServer,
 } from "./mini-app-server.js";
 import { restartPollingAfterDelay } from "./polling-lifecycle.js";
-import { probeForumTopic } from "./projects.js";
 import { SessionGuardianIpcClient } from "./session-guardian-ipc-client.js";
 import { SessionRegistry } from "./session-registry.js";
 import { TelegramBackgroundWriteGate } from "./telegram-background-write-gate.js";
@@ -43,6 +40,7 @@ import {
   createTelegramReliabilityRuntime,
   type TelegramReliabilityRuntime,
 } from "./telegram-reliability-runtime.js";
+import { createTelegramTopicRecoveryAdapter } from "./telegram-topic-recovery-adapter.js";
 import { createTelegramGuardianRuntimeFacade }
   from "./telegram-guardian-reconciliation.js";
 import type { TelegramCompletionProcessor } from "./telegram-inbox-completion.js";
@@ -160,8 +158,18 @@ try {
       ? createTelegramGuardianRuntimeFacade({
           operational: guardianClient,
           probe: guardianProbeClient,
-        })
+      })
       : { inspectThread: async (_threadId: string) => { throw new Error("Guardian unavailable"); } };
+    const topicRecovery = createTelegramTopicRecoveryAdapter({
+      enabled: config.telegramTopicRecoveryEnabled,
+      forumChatId: config.telegramForumChatId,
+      creationTimeoutMs: config.reliabilityTimeouts.telegramDeliveryMs,
+      api: bot.api,
+      registry,
+      reportReason: ({ reasonCode }) => {
+        console.warn(`Telegram topic recovery: ${reasonCode}`);
+      },
+    });
     reliabilityRuntime = createTelegramReliabilityRuntime({
       store: canonicalJobStore,
       registry,
@@ -199,39 +207,7 @@ try {
       materializationTimeoutMs: config.reliabilityTimeouts.appServerRequestMs,
       deliveryTimeoutMs: config.reliabilityTimeouts.telegramDeliveryMs,
       maxAttempts: config.telegramJobs.maxAttempts,
-      ...(config.telegramTopicRecoveryEnabled ? {
-        topicRecovery: {
-          forumChatId: config.telegramForumChatId ?? 0,
-          hasThreadTopicBinding: (threadId, destination) => registry!.listContexts().some(
-            (context) => context.contextKey === `${destination.chatId}:${destination.messageThreadId}`
-              && context.threadId === threadId,
-          ),
-          probeForumTopic: ({ chatId, messageThreadId }, signal) => probeForumTopic(messageThreadId, {
-            reopen: (threadId) => bot!.api.reopenForumTopic(chatId, threadId, signal as never),
-            close: (threadId) => bot!.api.closeForumTopic(chatId, threadId, signal as never),
-          }),
-          createForumTopic: async ({ chatId, topicName, signal }) => {
-            const topic = await bot!.api.createForumTopic(chatId, topicName, {}, signal as never);
-            return { chatId, messageThreadId: topic.message_thread_id };
-          },
-          getThread,
-          rebindThreadTopic: (oldContextKey, newContextKey, thread) => {
-            registry!.rebindThreadTopic(oldContextKey, newContextKey, thread);
-          },
-          sendWelcome: async ({ chatId, messageThreadId }, topicName, signal) => {
-            await bot!.api.sendMessage(
-              chatId,
-              `<b>${escapeHTML(topicName)}</b>\n\nSend a message to continue this session.`,
-              { message_thread_id: messageThreadId, parse_mode: "HTML" },
-              signal as never,
-            );
-          },
-          creationTimeoutMs: config.reliabilityTimeouts.telegramDeliveryMs,
-          reportReason: ({ reasonCode }) => {
-            console.warn(`Telegram topic recovery: ${reasonCode}`);
-          },
-        },
-      } : {}),
+      ...(topicRecovery ? { topicRecovery } : {}),
       prepareCompletion: async (input) => {
         if (!completionProcessor) throw new Error("Telegram completion processor is unavailable");
         return completionProcessor(input);

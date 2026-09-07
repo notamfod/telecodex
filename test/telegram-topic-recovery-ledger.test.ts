@@ -22,6 +22,7 @@ import type { TelegramTopicRecoveryRecord } from "../src/telegram-topic-recovery
 const NOW = 1_700_000_000_000;
 const OLD = { chatId: -100_123, messageThreadId: 41 } as const;
 const NEW = { chatId: OLD.chatId, messageThreadId: 99 } as const;
+const token = (value: number) => value.toString(16).padStart(64, "0");
 
 describe("Telegram topic recovery ledger", () => {
   let directory: string;
@@ -51,13 +52,13 @@ describe("Telegram topic recovery ledger", () => {
     const result = fixture.store.reserveTopicRecovery({
       candidate: fixture.candidate,
       eventId: "reserve-1",
-      actionToken: "token-1",
+      actionToken: token(1),
       eventAt: NOW + 20,
     });
 
     expect(result.recovery).toEqual({
       jobId: "job-1",
-      actionToken: "token-1",
+      actionToken: token(1),
       state: "in_flight",
       oldDestination: OLD,
       newMessageThreadId: null,
@@ -76,7 +77,7 @@ describe("Telegram topic recovery ledger", () => {
     expect(() => fixture.store.reserveTopicRecovery({
       candidate: fixture.candidate,
       eventId: "reserve-duplicate",
-      actionToken: "token-2",
+      actionToken: token(2),
       eventAt: NOW + 21,
     })).toThrow();
     expect(fixture.store.get(fixture.job.id)).toEqual(result.job);
@@ -88,7 +89,7 @@ describe("Telegram topic recovery ledger", () => {
     const before = snapshot(databasePath);
     expect(() => fixture.store.reserveTopicRecovery({
       candidate: { ...fixture.candidate, expectedVersion: fixture.candidate.expectedVersion - 1 },
-      eventId: "reserve-stale", actionToken: "token-stale", eventAt: NOW + 20,
+      eventId: "reserve-stale", actionToken: token(3), eventAt: NOW + 20,
     })).toThrow();
     expect(snapshot(databasePath)).toEqual(before);
   });
@@ -98,7 +99,7 @@ describe("Telegram topic recovery ledger", () => {
     const reserved = fixture.store.reserveTopicRecovery({
       candidate: fixture.candidate,
       eventId: "reserve-1",
-      actionToken: "token-1",
+      actionToken: token(1),
       eventAt: NOW + 20,
     });
 
@@ -106,7 +107,7 @@ describe("Telegram topic recovery ledger", () => {
       jobId: fixture.job.id,
       expectedVersion: reserved.job.version,
       eventId: "complete-1",
-      actionToken: "token-1",
+      actionToken: token(1),
       target: NEW,
       eventAt: NOW + 21,
     });
@@ -151,11 +152,11 @@ describe("Telegram topic recovery ledger", () => {
       ...outcomeInput(fixture), nextAttemptAt: NOW + 60,
     }), "TOPIC_RECOVERY_RATE_LIMITED", NOW + 60],
     ["unknown", (fixture: ReturnType<typeof reservedFixture>) => fixture.store.markTopicRecoveryUnknown({
-      ...outcomeInput(fixture), reasonCode: "TOPIC_CREATE_AMBIGUOUS",
-    }), "TOPIC_CREATE_AMBIGUOUS", null],
+      ...outcomeInput(fixture), reasonCode: "TOPIC_RECOVERY_UNKNOWN",
+    }), "TOPIC_RECOVERY_UNKNOWN", null],
     ["failed", (fixture: ReturnType<typeof reservedFixture>) => fixture.store.failTopicRecovery({
-      ...outcomeInput(fixture), reasonCode: "TOPIC_CREATE_REJECTED",
-    }), "TOPIC_CREATE_REJECTED", null],
+      ...outcomeInput(fixture), reasonCode: "TOPIC_RECOVERY_FAILED",
+    }), "TOPIC_RECOVERY_FAILED", null],
   ] as const)("atomically records the %s outcome and advances attention", (
     state, transition, reasonCode, nextAttemptAt,
   ) => {
@@ -198,7 +199,7 @@ describe("Telegram topic recovery ledger", () => {
   it.each([
     ["early deadline", (waiting: TelegramTopicRecoveryRecord) => ({ updatedAt: waiting.nextAttemptAt! - 1 })],
     ["stale version", (waiting: TelegramTopicRecoveryRecord) => ({ expectedVersion: waiting.currentJobVersion - 1 })],
-    ["stale token", () => ({ actionToken: "wrong-token" })],
+    ["stale token", () => ({ actionToken: token(99) })],
   ])("rolls back a retry resume on %s", (_name, override) => {
     const fixture = reservedFixture(open());
     const waiting = fixture.store.deferTopicRecovery({ ...outcomeInput(fixture), nextAttemptAt: NOW + 60 });
@@ -230,10 +231,10 @@ describe("Telegram topic recovery ledger", () => {
       ...outcomeInput(fixture), expectedVersion: fixture.reserved.job.version - 1, nextAttemptAt: NOW + 60,
     })],
     ["unknown with stale token", (fixture: ReturnType<typeof reservedFixture>) => fixture.store.markTopicRecoveryUnknown({
-      ...outcomeInput(fixture), actionToken: "wrong", reasonCode: "AMBIGUOUS",
+      ...outcomeInput(fixture), actionToken: token(99), reasonCode: "TOPIC_RECOVERY_UNKNOWN",
     })],
     ["failure with stale token", (fixture: ReturnType<typeof reservedFixture>) => fixture.store.failTopicRecovery({
-      ...outcomeInput(fixture), actionToken: "wrong", reasonCode: "FAILED",
+      ...outcomeInput(fixture), actionToken: token(99), reasonCode: "TOPIC_RECOVERY_FAILED",
     })],
   ] as const)("rolls back a %s outcome conflict", (_name, transition) => {
     const fixture = reservedFixture(open());
@@ -260,7 +261,7 @@ describe("Telegram topic recovery ledger", () => {
       jobId: fixture.job.id,
       expectedVersion: fixture.reserved.job.version,
       eventId: "complete-conflict",
-      actionToken: "token-1",
+      actionToken: token(1),
       target: NEW,
       eventAt: NOW + 21,
       ...override,
@@ -276,7 +277,7 @@ describe("Telegram topic recovery ledger", () => {
 
     first.store.completeTopicRecovery({
       jobId: first.job.id, expectedVersion: first.reserved.job.version,
-      eventId: "complete-isolated", actionToken: "token-1", target: NEW, eventAt: NOW + 21,
+      eventId: "complete-isolated", actionToken: token(1), target: NEW, eventAt: NOW + 21,
     });
 
     expect(snapshot(databasePath, "job-2")).toEqual(unrelated);
@@ -291,17 +292,76 @@ describe("Telegram topic recovery ledger", () => {
     const before = snapshot(databasePath);
     expect(() => fixture.store.reserveTopicRecovery({
       candidate: fixture.candidate, eventId: "reserve-noncanonical",
-      actionToken: "token-noncanonical", eventAt: NOW + 20,
+      actionToken: token(4), eventAt: NOW + 20,
     })).toThrow();
     expect(snapshot(databasePath)).toEqual(before);
   });
+
+  it.each([
+    ["source whitespace", () => mutate("UPDATE inbox_updates SET source_json = ' ' || source_json WHERE job_id = 'job-1'")],
+    ["source key order", () => reorderSourceKeys()],
+    ["anchor delivery", () => prefixDeliveryJson("status-anchor")],
+    ["rich follower", () => prefixDeliveryJson("final:0000")],
+    ["notice follower", () => prefixDeliveryJson("notice:0001")],
+    ["anchor delivery key order", () => reorderDeliveryKeys("status-anchor")],
+    ["rich follower key order", () => reorderDeliveryKeys("final:0000")],
+    ["notice follower key order", () => reorderDeliveryKeys("notice:0001")],
+  ])("rolls back reservation for noncanonical raw %s JSON", (_name, corrupt) => {
+    const fixture = recoverable(open(), "job-1", 1);
+    corrupt();
+    const before = snapshot(databasePath);
+    expect(() => fixture.store.reserveTopicRecovery({
+      candidate: fixture.candidate, eventId: "reserve-raw-conflict",
+      actionToken: token(5), eventAt: NOW + 20,
+    })).toThrow();
+    expect(snapshot(databasePath)).toEqual(before);
+  });
+
+  it.each([
+    ["source", () => mutate("UPDATE inbox_updates SET source_json = ' ' || source_json WHERE job_id = 'job-1'")],
+    ["delivery", () => prefixDeliveryJson("notice:0001")],
+  ])("rechecks canonical raw %s JSON during completion", (_name, corrupt) => {
+    const fixture = reservedFixture(open());
+    corrupt();
+    const before = snapshot(databasePath);
+    expect(() => fixture.store.completeTopicRecovery({
+      jobId: fixture.job.id, expectedVersion: fixture.reserved.job.version,
+      eventId: "complete-raw-conflict", actionToken: token(1), target: NEW, eventAt: NOW + 21,
+    })).toThrow();
+    expect(snapshot(databasePath)).toEqual(before);
+  });
+
+  it.each(["operator token", "token\nsecret", "sk-secret-credential"])(
+    "rejects unsafe recovery action token %j without writes",
+    (actionToken) => {
+      const fixture = recoverable(open(), "job-1", 1);
+      const before = snapshot(databasePath);
+      expect(() => fixture.store.reserveTopicRecovery({
+        candidate: fixture.candidate, eventId: "reserve-unsafe-token",
+        actionToken, eventAt: NOW + 20,
+      })).toThrow();
+      expect(snapshot(databasePath)).toEqual(before);
+    },
+  );
+
+  it.each(["ambiguous prose", "TOPIC_RECOVERY_UNKNOWN\nsecret", "password=credential"])(
+    "rejects unsafe recovery reason code %j without writes",
+    (reasonCode) => {
+      const fixture = reservedFixture(open());
+      const before = snapshot(databasePath);
+      expect(() => fixture.store.markTopicRecoveryUnknown({
+        ...outcomeInput(fixture), reasonCode: reasonCode as "TOPIC_RECOVERY_UNKNOWN",
+      })).toThrow();
+      expect(snapshot(databasePath)).toEqual(before);
+    },
+  );
 
   test("strictly decodes records and permits read-only inspection but not mutation", () => {
     const fixture = reservedFixture(open());
     const readOnly = open(true);
     expect(readOnly.getTopicRecovery(fixture.job.id)).toEqual(fixture.reserved.recovery);
     expect(() => readOnly.failTopicRecovery({
-      ...outcomeInput(fixture), reasonCode: "READ_ONLY_TEST",
+      ...outcomeInput(fixture), reasonCode: "TOPIC_RECOVERY_FAILED",
     })).toThrow(/readonly/i);
 
     readOnly.close();
@@ -311,6 +371,7 @@ describe("Telegram topic recovery ledger", () => {
     ["unknown state", "state = 'unexpected'"],
     ["nullable-field mismatch", "reason_code = 'NOT_NULL'"],
     ["out-of-range destination", "old_message_thread_id = 0"],
+    ["unsafe reason code", "state = 'failed', reason_code = 'password=credential'"],
   ])("rejects a strictly malformed recovery row with %s", (_name, assignment) => {
     const fixture = reservedFixture(open());
     mutate(`UPDATE topic_recoveries SET ${assignment} WHERE job_id = 'job-1'`);
@@ -319,23 +380,22 @@ describe("Telegram topic recovery ledger", () => {
 
   test("derives collision-safe outcome event identities from the full action token", () => {
     const store = open();
-    const prefix = "x".repeat(80);
     const first = recoverable(store, "job-1", 1);
     const second = recoverable(store, "job-2", 2);
     const reserve = (fixture: typeof first, suffix: string) => store.reserveTopicRecovery({
       candidate: fixture.candidate, eventId: `reserve-${suffix}`,
-      actionToken: `${prefix}-${suffix}`, eventAt: NOW + 20,
+      actionToken: suffix === "one" ? token(1) : token(2), eventAt: NOW + 20,
     });
     const firstReserved = reserve(first, "one");
     const secondReserved = reserve(second, "two");
 
     expect(store.failTopicRecovery({
       jobId: first.job.id, expectedVersion: firstReserved.job.version,
-      actionToken: `${prefix}-one`, reasonCode: "FAILED", updatedAt: NOW + 21,
+      actionToken: token(1), reasonCode: "TOPIC_RECOVERY_FAILED", updatedAt: NOW + 21,
     }).state).toBe("failed");
     expect(store.failTopicRecovery({
       jobId: second.job.id, expectedVersion: secondReserved.job.version,
-      actionToken: `${prefix}-two`, reasonCode: "FAILED", updatedAt: NOW + 21,
+      actionToken: token(2), reasonCode: "TOPIC_RECOVERY_FAILED", updatedAt: NOW + 21,
     }).state).toBe("failed");
   });
 
@@ -343,7 +403,7 @@ describe("Telegram topic recovery ledger", () => {
     const fixture = reservedFixture(open());
     const completed = fixture.store.completeTopicRecovery({
       jobId: fixture.job.id, expectedVersion: fixture.reserved.job.version,
-      eventId: "complete-retention", actionToken: "token-1", target: NEW, eventAt: NOW + 21,
+      eventId: "complete-retention", actionToken: token(1), target: NEW, eventAt: NOW + 21,
     });
     const terminal = deliverAndFinalize(fixture.store, completed.job, NOW + 22);
 
@@ -372,12 +432,36 @@ describe("Telegram topic recovery ledger", () => {
         .run(JSON.stringify({ ...source, targetContext: { ...source.targetContext, messageThreadId } }));
     });
   }
+
+  function reorderSourceKeys(): void {
+    raw(databasePath, (db) => {
+      const row = db.prepare("SELECT source_json FROM inbox_updates WHERE job_id = 'job-1'").get() as { source_json: string };
+      const { botId, ...source } = JSON.parse(row.source_json);
+      db.prepare("UPDATE inbox_updates SET source_json = ? WHERE job_id = 'job-1'")
+        .run(JSON.stringify({ ...source, botId }));
+    });
+  }
+
+  function prefixDeliveryJson(partKey: string): void {
+    raw(databasePath, (db) => db.prepare(`UPDATE deliveries SET payload_json = ' ' || payload_json
+      WHERE job_id = 'job-1' AND part_key = ?`).run(partKey));
+  }
+
+  function reorderDeliveryKeys(partKey: string): void {
+    raw(databasePath, (db) => {
+      const row = db.prepare(`SELECT payload_json FROM deliveries
+        WHERE job_id = 'job-1' AND part_key = ?`).get(partKey) as { payload_json: string };
+      const { operation, ...payload } = JSON.parse(row.payload_json);
+      db.prepare(`UPDATE deliveries SET payload_json = ?
+        WHERE job_id = 'job-1' AND part_key = ?`).run(JSON.stringify({ ...payload, operation }), partKey);
+    });
+  }
 });
 
 function reservedFixture(store: SqliteTelegramJobStore, id = "job-1", updateId = 1) {
   const fixture = recoverable(store, id, updateId);
   const reserved = store.reserveTopicRecovery({
-    candidate: fixture.candidate, eventId: `reserve-${id}`, actionToken: `token-${updateId}`, eventAt: NOW + 20,
+    candidate: fixture.candidate, eventId: `reserve-${id}`, actionToken: token(updateId), eventAt: NOW + 20,
   });
   return { ...fixture, reserved };
 }

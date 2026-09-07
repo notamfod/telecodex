@@ -23,7 +23,9 @@
 
 ## File map
 
-- Create `src/telegram-topic-recovery.ts`, `src/telegram-topic-recovery-ledger.ts`, and `src/telegram-topic-recovery-runtime.ts` for the pure contract, SQLite saga, and runtime.
+- Create `src/telegram-topic-recovery.ts`, `src/telegram-topic-recovery-source-codec.ts`,
+  `src/telegram-topic-recovery-ledger.ts`, and `src/telegram-topic-recovery-runtime.ts`
+  for the pure contract, exact-raw source boundary, SQLite saga, and runtime.
 - Modify `src/telegram-job-ledger-schema.ts` and `src/telegram-job-ledger.ts` for schema v7, store methods, and retention.
 - Modify `src/session-registry.ts`, `src/config.ts`, `.env.example`, `src/telegram-reliability-runtime.ts`, and `src/index.ts` for binding, configuration, and composition.
 - Modify `src/telegram-status-projection.ts`, `src/telegram-grammy-transport.ts`, `src/status-board-render.ts`, `src/bot.ts`, and `src/mini-app-server.ts` for the versioned action.
@@ -147,11 +149,21 @@ Run the shared build, preflight, install, and ten-minute observation. Confirm th
 ### Task 2: Microrelease 05.2, schema and atomic ledger saga
 
 **Files:**
+- Create: `src/telegram-topic-recovery-source-codec.ts`
 - Create: `src/telegram-topic-recovery-ledger.ts`
 - Create: `test/telegram-topic-recovery-ledger.test.ts`
 - Modify: `src/telegram-job-ledger-schema.ts`
 - Modify: `src/telegram-job-ledger.ts`
 - Modify: `test/telegram-job-store-sqlite.test.ts`
+- Modify: `test/telegram-job-reconciliation-scan.test.ts`
+- Modify: `test/telegram-delivery-outbox.test.ts`
+
+The source codec is a narrow safety boundary, not a generic JSON helper. It
+reconstructs the canonical `TelegramWorkSource` property order and rejects any
+raw SQLite serialization that differs by whitespace, key order, shape, or
+value normalization. The ledger separately requires exact canonical raw JSON
+for every delivery payload and the installed anchor plan before reservation
+and completion.
 
 - [ ] **Step 1: Write the failing v6-to-v7 migration test**
 
@@ -215,7 +227,8 @@ interface TelegramTopicRecoveryRecord {
   readonly oldDestination: TelegramTopicDestination;
   readonly newMessageThreadId: number | null;
   readonly reservedJobVersion: number; readonly currentJobVersion: number;
-  readonly nextAttemptAt: number | null; readonly reasonCode: string | null;
+  readonly nextAttemptAt: number | null;
+  readonly reasonCode: "TOPIC_RECOVERY_RATE_LIMITED" | "TOPIC_RECOVERY_UNKNOWN" | "TOPIC_RECOVERY_FAILED" | null;
   readonly startedAt: number; readonly updatedAt: number;
 }
 interface TelegramTopicRecoveryResult {
@@ -227,19 +240,23 @@ interface TelegramTopicRecoveryCompletion extends TelegramTopicRecoveryResult {
 
 reserveTopicRecovery(input: {
   readonly candidate: TelegramTopicRecoveryCandidate; readonly eventId: string;
-  readonly actionToken: string; readonly eventAt: number;
+  readonly actionToken: string; readonly eventAt: number; // token is exactly 64 lowercase hex
 }): TelegramTopicRecoveryResult;
 deferTopicRecovery(input: {
   readonly jobId: string; readonly expectedVersion: number; readonly actionToken: string;
   readonly nextAttemptAt: number; readonly updatedAt: number;
 }): TelegramTopicRecoveryRecord;
+resumeTopicRecovery(input: {
+  readonly jobId: string; readonly expectedVersion: number; readonly actionToken: string;
+  readonly updatedAt: number;
+}): TelegramTopicRecoveryResult;
 markTopicRecoveryUnknown(input: {
   readonly jobId: string; readonly expectedVersion: number; readonly actionToken: string;
-  readonly reasonCode: string; readonly updatedAt: number;
+  readonly reasonCode: "TOPIC_RECOVERY_UNKNOWN"; readonly updatedAt: number;
 }): TelegramTopicRecoveryRecord;
 failTopicRecovery(input: {
   readonly jobId: string; readonly expectedVersion: number; readonly actionToken: string;
-  readonly reasonCode: string; readonly updatedAt: number;
+  readonly reasonCode: "TOPIC_RECOVERY_FAILED"; readonly updatedAt: number;
 }): TelegramTopicRecoveryRecord;
 completeTopicRecovery(input: {
   readonly jobId: string; readonly expectedVersion: number; readonly eventId: string;
@@ -258,17 +275,23 @@ out-of-range values.
 Validate the candidate, recheck every database-backed field inside one
 immediate transaction, insert `in_flight`, advance the job version, and set
 bounded recovery attention. The runtime rechecks the Codex thread immediately
-before this call.
+before this call. Require exact canonical raw serialization for the durable
+source, anchor plan, anchor delivery, and every follower before advancing the
+job or inserting the reservation.
 
 - [ ] **Step 7: Implement outcome transitions**
 
 Add compare-and-swap transitions from `in_flight` to `retry_wait`, `unknown`,
 or `failed`. Require the token and current job version; advance the job version
-and attention on each transition.
+and attention on each transition. Add a public compare-and-swap transition
+from due `retry_wait` back to `in_flight`; reject an early deadline or stale
+state, token, or version without writes. Accept only 64-character lowercase
+hex action tokens and the closed operational outcome codes.
 
 - [ ] **Step 8: Implement atomic completion**
 
-In one immediate transaction, update source, every delivery payload/hash, the
+Recheck the exact raw canonical source, plan, and delivery serialization. In
+one immediate transaction, update source, every delivery payload/hash, the
 anchor plan, anchor state, recovery record, and job projection. Roll back on
 any mismatch.
 

@@ -10,17 +10,20 @@ import {
   type TelegramTopicRecoveryCandidate,
 } from "./telegram-topic-recovery.js";
 import { hashTelegramDeliveryPayload, normalizeTelegramDeliveryPayload } from "./telegram-response-plan.js";
-const JOB_ID_MAX_LENGTH = 128, EVENT_ID_MAX_LENGTH = 128, TOKEN_MAX_LENGTH = 128;
-const REASON_CODE_MAX_LENGTH = 128, TOPIC_NAME_MAX_LENGTH = 128;
+import { decodeCanonicalTopicRecoverySourceJson, encodeCanonicalTopicRecoverySource } from "./telegram-topic-recovery-source-codec.js";
+const JOB_ID_MAX_LENGTH = 128, EVENT_ID_MAX_LENGTH = 128;
+const TOPIC_NAME_MAX_LENGTH = 128;
 const DEFAULT_LIST_LIMIT = 100, MAX_LIST_LIMIT = 1_000;
 export type TelegramTopicRecoveryState = "in_flight" | "retry_wait" | "unknown" | "complete" | "failed";
+export type TelegramTopicRecoveryOutcomeReasonCode = "TOPIC_RECOVERY_UNKNOWN" | "TOPIC_RECOVERY_FAILED";
+export type TelegramTopicRecoveryReasonCode = TelegramTopicRecoveryOutcomeReasonCode | "TOPIC_RECOVERY_RATE_LIMITED";
 export interface TelegramTopicRecoveryRecord {
   readonly jobId: string; readonly actionToken: string;
   readonly state: TelegramTopicRecoveryState;
   readonly oldDestination: TelegramTopicDestination;
   readonly newMessageThreadId: number | null; readonly reservedJobVersion: number;
   readonly currentJobVersion: number; readonly nextAttemptAt: number | null;
-  readonly reasonCode: string | null; readonly startedAt: number; readonly updatedAt: number;
+  readonly reasonCode: TelegramTopicRecoveryReasonCode | null; readonly startedAt: number; readonly updatedAt: number;
 }
 export interface TelegramTopicRecoveryResult {
   readonly job: TelegramJob; readonly recovery: TelegramTopicRecoveryRecord;
@@ -34,7 +37,7 @@ export interface ReserveTopicRecoveryInput {
 }
 export interface TopicRecoveryOutcomeInput {
   readonly jobId: string; readonly expectedVersion: number; readonly actionToken: string;
-  readonly reasonCode: string; readonly updatedAt: number;
+  readonly reasonCode: TelegramTopicRecoveryOutcomeReasonCode; readonly updatedAt: number;
 }
 export interface DeferTopicRecoveryInput extends Omit<TopicRecoveryOutcomeInput, "reasonCode"> {
   readonly nextAttemptAt: number;
@@ -46,7 +49,7 @@ export interface CompleteTopicRecoveryInput {
 }
 interface TelegramTopicRecoveryLedgerHost {
   readonly database: Database.Database; readonly statement: (sql: string) => Database.Statement;
-  readonly getJob: (jobId: string) => TelegramJob | null; readonly readSourcePayload: (jobId: string) => unknown | null;
+  readonly getJob: (jobId: string) => TelegramJob | null;
   readonly listDeliveries: (jobId: string) => readonly DeliveryPart[];
   readonly applyTransition: (input: {
     readonly jobId: string;
@@ -121,11 +124,11 @@ export class TelegramTopicRecoveryLedger {
     }).immediate();
   }
   markUnknown(input: TopicRecoveryOutcomeInput): TelegramTopicRecoveryRecord {
-    validateOutcomeInput(input);
+    validateOutcomeInput(input, "TOPIC_RECOVERY_UNKNOWN");
     return this.transitionOutcome(input, "unknown", input.reasonCode, null);
   }
   fail(input: TopicRecoveryOutcomeInput): TelegramTopicRecoveryRecord {
-    validateOutcomeInput(input);
+    validateOutcomeInput(input, "TOPIC_RECOVERY_FAILED");
     return this.transitionOutcome(input, "failed", input.reasonCode, null);
   }
   complete(input: CompleteTopicRecoveryInput): TelegramTopicRecoveryCompletion {
@@ -141,7 +144,7 @@ export class TelegramTopicRecoveryLedger {
         || input.eventAt < current.updatedAt || input.eventAt < recovery.updatedAt) conflict();
       const candidate = this.eligiblePlan(current);
       if (!candidate || !same(candidate.oldDestination, recovery.oldDestination)) conflict();
-      const source = requiredRecord(this.host.readSourcePayload(input.jobId), "Telegram topic recovery source conflict");
+      const source = this.canonicalSource(input.jobId);
       const rebound = new Map(candidate.parts.map((part) => [
         part.partKey,
         rebindTelegramTopicPayload(part.payload, recovery.oldDestination, input.target),
@@ -179,7 +182,8 @@ export class TelegramTopicRecoveryLedger {
       if (planUpdate.changes !== 1) conflict();
       const sourceUpdate = this.host.statement(`UPDATE inbox_updates SET source_json = ?
         WHERE job_id = ? AND source_json = ?`).run(
-        stringify({ ...source, targetContext: input.target }), input.jobId, stringify(source),
+        encodeCanonicalTopicRecoverySource({ ...source, targetContext: input.target }),
+        input.jobId, encodeCanonicalTopicRecoverySource(source),
       );
       if (sourceUpdate.changes !== 1) conflict();
       const updatedRows = this.host.listDeliveries(input.jobId);
@@ -228,11 +232,10 @@ export class TelegramTopicRecoveryLedger {
       ORDER BY updated_at_ms, job_id LIMIT ?`).all(...states, limit) as Record<string, unknown>[])
       .map(decodeRecovery);
   }
-
   private transitionOutcome(
     input: DeferTopicRecoveryInput | TopicRecoveryOutcomeInput,
     state: "retry_wait" | "unknown" | "failed",
-    reasonCode: string,
+    reasonCode: TelegramTopicRecoveryReasonCode,
     nextAttemptAt: number | null,
   ): TelegramTopicRecoveryRecord {
     return this.host.database.transaction(() => {
@@ -261,10 +264,9 @@ export class TelegramTopicRecoveryLedger {
       return this.require(input.jobId);
     }).immediate();
   }
-
   private eligiblePlan(job: TelegramJob): EligibleRecoveryPlan | null {
     try {
-      const source = requiredRecord(this.host.readSourcePayload(job.id), "Telegram topic recovery source conflict");
+      const source = this.canonicalSource(job.id);
       const target = source.targetContext === undefined ? source : requiredRecord(
         source.targetContext, "Telegram topic recovery source conflict",
       );
@@ -277,13 +279,14 @@ export class TelegramTopicRecoveryLedger {
         || Object.hasOwn(source, "targetProvision")
         || (source.targetContext !== undefined && target.chatId !== source.chatId)) return null;
       const rows = this.host.listDeliveries(job.id);
+      const rawPayloads = this.rawDeliveryPayloads(job.id);
       const anchors = rows.filter((part) => part.partKey === "status-anchor");
       const ordinary = rows.filter((part) => part.partKey !== "status-anchor");
       const anchorPlan = this.statusAnchorPlanOrNull(job.id);
       if (anchors.length !== 1 || !anchorPlan || ordinary.length !== job.responsePlan.length
         || rows.length !== job.responsePlan.length + 1) return null;
       const anchor = anchors[0]!;
-      const canonicalAnchor = canonicalPart(anchor, oldDestination);
+      const canonicalAnchor = canonicalPart(anchor, oldDestination, rawPayloads.get(anchor.partKey));
       if (anchor.jobId !== job.id || anchor.kind !== "status-anchor" || anchor.ordinal !== 0
         || anchor.state !== "failed" || anchor.telegramMessageId !== null
         || !canonicalAnchor || !same(anchor.payload, anchorPlan.payload)
@@ -294,7 +297,7 @@ export class TelegramTopicRecoveryLedger {
         if (matches.length !== 1 || !part || part.jobId !== job.id || part.kind !== planned.kind
           || part.ordinal !== ordinal || part.state !== "pending" || part.telegramMessageId !== null
           || part.attemptCount !== 0 || part.nextAttemptAt !== null || part.lastErrorCode !== null) conflict();
-        const canonical = canonicalPart(part, oldDestination);
+        const canonical = canonicalPart(part, oldDestination, rawPayloads.get(part.partKey));
         if (!canonical) conflict();
         return { partKey: part.partKey, ...canonical };
       });
@@ -303,7 +306,19 @@ export class TelegramTopicRecoveryLedger {
       return { oldDestination, parts, anchorPlan: { partKey: anchor.partKey, ...canonicalAnchor } };
     } catch { return null; }
   }
-
+  private canonicalSource(jobId: string): Record<string, unknown> {
+    const row = this.host.statement("SELECT source_json FROM inbox_updates WHERE job_id = ?")
+      .get(jobId) as Record<string, unknown> | undefined;
+    if (!row) conflict();
+    return decodeCanonicalTopicRecoverySourceJson(row.source_json);
+  }
+  private rawDeliveryPayloads(jobId: string): ReadonlyMap<string, string> {
+    const rows = this.host.statement("SELECT part_key, payload_json FROM deliveries WHERE job_id = ?")
+      .all(jobId) as Record<string, unknown>[];
+    const result = new Map(rows.map((row) => [text(row.part_key), text(row.payload_json)]));
+    if (result.size !== rows.length) conflict();
+    return result;
+  }
   private statusAnchorPlan(jobId: string): { readonly payload: unknown; readonly contentHash: string } {
     const plan = this.statusAnchorPlanOrNull(jobId);
     if (!plan) conflict();
@@ -334,8 +349,7 @@ export class TelegramTopicRecoveryLedger {
 function decodeRecovery(row: Record<string, unknown>): TelegramTopicRecoveryRecord {
   try {
     const recovery: TelegramTopicRecoveryRecord = {
-      jobId: bounded(row.job_id, "jobId", JOB_ID_MAX_LENGTH),
-      actionToken: bounded(row.action_token, "actionToken", TOKEN_MAX_LENGTH),
+      jobId: bounded(row.job_id, "jobId", JOB_ID_MAX_LENGTH), actionToken: actionToken(row.action_token),
       state: state(row.state),
       oldDestination: {
         chatId: nonzeroInteger(row.old_chat_id, "oldChatId"),
@@ -345,9 +359,8 @@ function decodeRecovery(row: Record<string, unknown>): TelegramTopicRecoveryReco
       reservedJobVersion: positiveInteger(row.reserved_job_version, "reservedJobVersion"),
       currentJobVersion: positiveInteger(row.current_job_version, "currentJobVersion"),
       nextAttemptAt: nullableTimestamp(row.next_attempt_at_ms, "nextAttemptAt"),
-      reasonCode: nullableBounded(row.reason_code, "reasonCode", REASON_CODE_MAX_LENGTH),
-      startedAt: timestamp(row.started_at_ms, "startedAt"),
-      updatedAt: timestamp(row.updated_at_ms, "updatedAt"),
+      reasonCode: nullableRecoveryReason(row.reason_code),
+      startedAt: timestamp(row.started_at_ms, "startedAt"), updatedAt: timestamp(row.updated_at_ms, "updatedAt"),
     };
     if (recovery.currentJobVersion <= recovery.reservedJobVersion || recovery.updatedAt < recovery.startedAt) invalidRow();
     if (recovery.state === "in_flight" && (recovery.newMessageThreadId !== null
@@ -374,11 +387,13 @@ function sameCandidate(expected: TelegramTopicRecoveryCandidate, job: TelegramJo
 function canonicalPart(
   part: DeliveryPart,
   destination: TelegramTopicDestination,
+  payloadJson: string | undefined,
 ): { readonly payload: ReturnType<typeof rebindTelegramTopicPayload>["payload"]; readonly contentHash: string } | null {
   try {
     validateDelivery(part);
     const rebound = rebindTelegramTopicPayload(part.payload, destination, destination);
-    return same(rebound.payload, part.payload) && rebound.contentHash === part.contentHash ? rebound : null;
+    return payloadJson === JSON.stringify(rebound.payload)
+      && same(rebound.payload, part.payload) && rebound.contentHash === part.contentHash ? rebound : null;
   } catch { return null; }
 }
 function ordinaryFromPlan(job: TelegramJob, rows: readonly DeliveryPart[]) {
@@ -391,10 +406,7 @@ function ordinaryFromPlan(job: TelegramJob, rows: readonly DeliveryPart[]) {
 function recoveryEvent(eventAt: number, attentionCode: string | null):
 Extract<TransitionEvent, { readonly type: "delivery.changed" }> {
   return {
-    schemaVersion: 1,
-    type: "delivery.changed",
-    phase: "delivering",
-    eventAt,
+    schemaVersion: 1, type: "delivery.changed", phase: "delivering", eventAt,
     attention: attentionCode === null
       ? { kind: "none" }
       : { kind: "required", code: attentionCode, actions: ["inspect"] },
@@ -402,44 +414,33 @@ Extract<TransitionEvent, { readonly type: "delivery.changed" }> {
 }
 function projectDelivery(part: DeliveryPart) {
   return {
-    partId: part.partKey,
-    state: part.state,
-    attempts: part.attemptCount,
+    partId: part.partKey, state: part.state, attempts: part.attemptCount,
     messageId: part.telegramMessageId,
     deliveredAt: part.state === "delivered" ? part.updatedAt : null,
   };
 }
 function validateReserveInput(input: ReserveTopicRecoveryInput): void {
   const candidate = input.candidate;
-  bounded(candidate.jobId, "jobId", JOB_ID_MAX_LENGTH);
-  positiveInteger(candidate.expectedVersion, "expectedVersion");
-  bounded(candidate.threadId, "threadId", JOB_ID_MAX_LENGTH);
-  bounded(candidate.topicName, "topicName", TOPIC_NAME_MAX_LENGTH);
-  destination(candidate.oldDestination);
-  bounded(input.eventId, "eventId", EVENT_ID_MAX_LENGTH);
-  bounded(input.actionToken, "actionToken", TOKEN_MAX_LENGTH);
-  timestamp(input.eventAt, "eventAt");
+  bounded(candidate.jobId, "jobId", JOB_ID_MAX_LENGTH); positiveInteger(candidate.expectedVersion, "expectedVersion");
+  bounded(candidate.threadId, "threadId", JOB_ID_MAX_LENGTH); bounded(candidate.topicName, "topicName", TOPIC_NAME_MAX_LENGTH);
+  destination(candidate.oldDestination); bounded(input.eventId, "eventId", EVENT_ID_MAX_LENGTH);
+  actionToken(input.actionToken); timestamp(input.eventAt, "eventAt");
   if (candidate.parts.length === 0 || candidate.anchorPlan.partKey !== "status-anchor") {
     throw new Error("Invalid Telegram topic recovery candidate");
   }
 }
 function validateOutcomeBase(input: ResumeTopicRecoveryInput): void {
-  bounded(input.jobId, "jobId", JOB_ID_MAX_LENGTH);
-  positiveInteger(input.expectedVersion, "expectedVersion");
-  bounded(input.actionToken, "actionToken", TOKEN_MAX_LENGTH);
-  timestamp(input.updatedAt, "updatedAt");
+  bounded(input.jobId, "jobId", JOB_ID_MAX_LENGTH); positiveInteger(input.expectedVersion, "expectedVersion");
+  actionToken(input.actionToken); timestamp(input.updatedAt, "updatedAt");
 }
-function validateOutcomeInput(input: TopicRecoveryOutcomeInput): void {
+function validateOutcomeInput(input: TopicRecoveryOutcomeInput, expected: TelegramTopicRecoveryOutcomeReasonCode): void {
   validateOutcomeBase(input);
-  bounded(input.reasonCode, "reasonCode", REASON_CODE_MAX_LENGTH);
+  if (input.reasonCode !== expected) throw new Error("Invalid topic recovery reason code");
 }
 function validateCompleteInput(input: CompleteTopicRecoveryInput): void {
-  bounded(input.jobId, "jobId", JOB_ID_MAX_LENGTH);
-  positiveInteger(input.expectedVersion, "expectedVersion");
-  bounded(input.eventId, "eventId", EVENT_ID_MAX_LENGTH);
-  bounded(input.actionToken, "actionToken", TOKEN_MAX_LENGTH);
-  destination(input.target);
-  timestamp(input.eventAt, "eventAt");
+  bounded(input.jobId, "jobId", JOB_ID_MAX_LENGTH); positiveInteger(input.expectedVersion, "expectedVersion");
+  bounded(input.eventId, "eventId", EVENT_ID_MAX_LENGTH); actionToken(input.actionToken);
+  destination(input.target); timestamp(input.eventAt, "eventAt");
 }
 function outcomeEventId(state: string, token: string, version: number): string {
   const digest = createHash("sha256").update(token).digest("hex");
@@ -448,9 +449,7 @@ function outcomeEventId(state: string, token: string, version: number): string {
 function destination(value: TelegramTopicDestination): void {
   nonzeroInteger(value.chatId, "chatId"); positiveInteger(value.messageThreadId, "messageThreadId");
 }
-
 function state(value: unknown): TelegramTopicRecoveryState { if (isState(value)) return value; invalidRow(); }
-
 function isState(value: unknown): value is TelegramTopicRecoveryState {
   return value === "in_flight" || value === "retry_wait" || value === "unknown"
     || value === "complete" || value === "failed";
@@ -470,12 +469,19 @@ function timestamp(value: unknown, name: string): number {
 function nullablePositiveInteger(value: unknown, name: string): number | null { return value === null ? null : positiveInteger(value, name); }
 function nullableTimestamp(value: unknown, name: string): number | null { return value === null ? null : timestamp(value, name); }
 function text(value: unknown): string { if (typeof value !== "string") throw new Error("Invalid text"); return value; }
-
 function bounded(value: unknown, name: string, maximum: number): string {
   if (typeof value !== "string" || value.length === 0 || value.length > maximum) throw new Error(`Invalid ${name}`);
   return value;
 }
-function nullableBounded(value: unknown, name: string, maximum: number): string | null { return value === null ? null : bounded(value, name, maximum); }
+function actionToken(value: unknown): string {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) throw new Error("Invalid actionToken");
+  return value;
+}
+function nullableRecoveryReason(value: unknown): TelegramTopicRecoveryReasonCode | null {
+  if (value === null || value === "TOPIC_RECOVERY_RATE_LIMITED"
+    || value === "TOPIC_RECOVERY_UNKNOWN" || value === "TOPIC_RECOVERY_FAILED") return value;
+  invalidRow();
+}
 function requiredRecord(value: unknown, message: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(message);
   return value as Record<string, unknown>;
@@ -489,6 +495,5 @@ function nonEmpty(value: unknown): value is string { return typeof value === "st
 function same(left: unknown, right: unknown): boolean {
   return isDeepStrictEqual(JSON.parse(JSON.stringify(left)), JSON.parse(JSON.stringify(right)));
 }
-
 function conflict(): never { throw new Error("Telegram topic recovery conflict"); }
 function invalidRow(): never { throw new Error("Malformed Telegram topic recovery"); }

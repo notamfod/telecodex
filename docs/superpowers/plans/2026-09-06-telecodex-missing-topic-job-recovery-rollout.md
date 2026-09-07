@@ -100,6 +100,39 @@ export TELECODEX_RELEASE_TAG=05.3-runtime-disabled
 export TELECODEX_RELEASE_TAG=05.4-dashboard-action
 ```
 
+## Schema compatibility gate for 05.2
+
+The 05.2 restart is the first step that changes the live SQLite schema from
+v6 to v7. The saved 05.1 code tree cannot open v7, so a code-only rollback is
+not valid for this one microrelease.
+
+- [ ] **Before installing 05.2, create and verify an online SQLite backup**
+
+Store it under the private release-state directory with mode `0600`. Require
+`quick_check=ok`, zero foreign-key violations, schema version 6, and zero
+pre-existing `topic_recoveries` tables. Record its SHA-256 without printing
+job or payload data.
+
+- [ ] **Rehearse the v7-to-v6 rollback on a private copy**
+
+Open a private copy with the 05.2 candidate so it migrates to v7. Require an
+empty `topic_recoveries` table, then stop the private process and perform one
+immediate transaction that drops only `topic_recoveries` and sets
+`user_version=6`. Require `quick_check=ok`, zero foreign-key violations, and
+successful read-only validation by the saved 05.1 build.
+
+- [ ] **Use the schema rollback only if 05.2 fails before acceptance**
+
+Stop `telecodex.service`, require live `user_version=7`, zero recovery rows,
+`quick_check=ok`, and zero foreign-key violations. In one immediate
+transaction drop only `topic_recoveries` and set `user_version=6`; recheck
+integrity, restore the saved 05.1 `dist` and `dist-web`, start the service, and
+repeat the probes. Stop without rollback if any recovery row exists or any
+assertion differs. Never restore the whole database over newer live state.
+
+After 05.2 passes its full observation window, v7 becomes the rollback floor
+for 05.3 and later code releases.
+
 ## Task 5: Microrelease 05.5, recover the historical job once
 
 **Files:**

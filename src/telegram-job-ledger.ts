@@ -164,7 +164,6 @@ export class SqliteTelegramJobStore {
       database: this.database,
       statement: (sql) => this.statement(sql),
       getJob: (jobId) => this.get(jobId),
-      readSourcePayload: (jobId) => this.readSourcePayload(jobId),
       listDeliveries: (jobId) => this.listDeliveries(jobId),
       applyTransition: (input) => this.applyTransition(input),
     });

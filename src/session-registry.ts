@@ -200,10 +200,15 @@ export class SessionRegistry {
     }
 
     const oldSession = this.sessions.get(oldContextKey);
-    oldSession?.dispose();
+    const newSession = this.sessions.get(newContextKey);
+    const invalidatesNewSession = newSession !== undefined || this.sessionCreations.has(newContextKey);
+    for (const session of new Set([oldSession, newSession])) session?.dispose();
     this.sessions.delete(oldContextKey);
+    this.sessions.delete(newContextKey);
     this.sessionCreations.delete(oldContextKey);
+    this.sessionCreations.delete(newContextKey);
     this.onRemoveCallback?.(oldContextKey);
+    if (invalidatesNewSession) this.onRemoveCallback?.(newContextKey);
   }
 
   onRemove(callback: (contextKey: TelegramContextKey) => void): void {

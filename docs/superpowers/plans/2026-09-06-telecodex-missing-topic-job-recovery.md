@@ -198,16 +198,16 @@ Set `SCHEMA_VERSION = 7`, define `TABLES_V7`, create the table for versions 1 th
 Assert these store calls and results:
 
 ```ts
+const actionToken = "0000000000000000000000000000000000000000000000000000000000000001";
 const reserved = store.reserveTopicRecovery({
-  jobId: job.id, expectedVersion: job.version, eventId: "reserve-1",
-  actionToken: "token-1", eventAt: NOW,
+  candidate, eventId: "reserve-1", actionToken, eventAt: NOW,
 });
 expect(reserved.recovery.state).toBe("in_flight");
 expect(reserved.job.version).toBe(job.version + 1);
 
 const completed = store.completeTopicRecovery({
   jobId: job.id, expectedVersion: reserved.job.version, eventId: "complete-1",
-  actionToken: "token-1", target: { chatId: -100123, messageThreadId: 99 },
+  actionToken, target: { chatId: -100123, messageThreadId: 99 },
   eventAt: NOW + 1,
 });
 expect(completed.recovery.state).toBe("complete");

@@ -318,6 +318,29 @@ describe("Telegram topic recovery ledger", () => {
   });
 
   it.each([
+    ["relative", "work/telecodex"],
+    ["root", "/"],
+    ["unnormalized absolute", "/work/telecodex/../telecodex"],
+  ])("rolls back reservation for %s raw source workspace", (_name, workspace) => {
+    const fixture = recoverable(open(), "job-1", 1);
+    raw(databasePath, (db) => {
+      const row = db.prepare("SELECT source_json FROM inbox_updates WHERE job_id = 'job-1'")
+        .get() as { source_json: string };
+      const source = JSON.parse(row.source_json);
+      db.prepare("UPDATE inbox_updates SET source_json = ? WHERE job_id = 'job-1'").run(JSON.stringify({
+        ...source,
+        sessionDefaults: { workspace, launchProfileId: "default" },
+      }));
+    });
+    const before = snapshot(databasePath);
+    expect(() => fixture.store.reserveTopicRecovery({
+      candidate: fixture.candidate, eventId: "reserve-invalid-workspace",
+      actionToken: token(6), eventAt: NOW + 20,
+    })).toThrow();
+    expect(snapshot(databasePath)).toEqual(before);
+  });
+
+  it.each([
     ["source", () => mutate("UPDATE inbox_updates SET source_json = ' ' || source_json WHERE job_id = 'job-1'")],
     ["delivery", () => prefixDeliveryJson("notice:0001")],
   ])("rechecks canonical raw %s JSON during completion", (_name, corrupt) => {

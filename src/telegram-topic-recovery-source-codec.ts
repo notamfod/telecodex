@@ -1,3 +1,5 @@
+import path from "node:path";
+
 const SOURCE_KEYS = [
   "botId", "updateId", "chatId", "messageThreadId", "messageId", "kind", "text",
   "attachment", "retryOfJobId", "targetContext", "targetProvision", "sessionDefaults",
@@ -49,7 +51,7 @@ function normalizeSource(raw: Record<string, unknown>): Record<string, unknown> 
     const defaults = record(raw.sessionDefaults);
     exactAllowed(defaults, ["workspace", "launchProfileId", "topicName"]);
     source.sessionDefaults = {
-      workspace: bounded(defaults.workspace, 4_096), launchProfileId: bounded(defaults.launchProfileId, 128),
+      workspace: workspace(defaults.workspace), launchProfileId: bounded(defaults.launchProfileId, 128),
       ...(defaults.topicName === undefined ? {} : { topicName: bounded(defaults.topicName, 128) }),
     };
   }
@@ -108,6 +110,11 @@ function bounded(value: unknown, maximum: number): string {
 function sourceText(value: unknown, maximum: number): string {
   if (typeof value !== "string" || value.length > maximum || value.includes("\0")) invalid();
   return value;
+}
+function workspace(value: unknown): string {
+  const result = bounded(value, 4_096);
+  if (!path.isAbsolute(result) || result === path.parse(result).root) invalid();
+  return path.normalize(result);
 }
 function integer(value: unknown, minimum: number): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum) invalid();

@@ -44,13 +44,17 @@ Rejected alternatives:
 
 Add a focused module that owns topic-probe classification, request coalescing, and a bounded cache. Its input is a destination, an optional abort signal, and a narrow adapter that sends `typing` to the topic.
 
+Keep this primitive grammY-independent. A separate `telegram-topic-liveness-api.ts` factory creates one dedicated grammY `Api` with no transformers and exposes only `sendChatAction`. Bot wiring uses it in both legacy/JSON and canonical modes; ordinary legacy `bot.api` retains its existing autoRetry policy. Injecting client options/fetch permits real transport tests without network traffic or token disclosure. The disabled recovery adapter uses the same primitive with the already retry-free canonical API.
+
 For each `(chatId, messageThreadId)` key:
 
 - at most one request may be in flight;
-- concurrent callers receive the same promise;
+- concurrent callers share one request through independent cancellable subscriptions;
 - a completed boolean result may be reused for five seconds;
 - failures are not cached;
 - the caller's abort signal and a three-second probe timeout are passed to Telegram.
+
+Timeout overrides must be safe integers from 1 through `2_147_483_647` milliseconds, the maximum Node timer delay. Cache TTL does not schedule a timer and accepts any positive safe integer.
 
 The module returns:
 
@@ -122,6 +126,9 @@ Use RED-GREEN-REFACTOR with focused tests for:
 - closed-topic classification as existing;
 - each definitive missing-topic error as missing;
 - propagation of 429, network, timeout, abort, and unknown errors;
+- exactly one HTTP request for a Telegram 429, preserving the typed error despite a possible subsequent success;
+- dedicated API use through actual bot callbacks in legacy and canonical modes, with ordinary legacy retry policy preserved;
+- rejection of Node timer overflow while accepting the maximum valid delay;
 - single-flight behavior for concurrent callers;
 - five-second result reuse and expiry;
 - absence of `reopenForumTopic` and `closeForumTopic` from the liveness adapter;
@@ -138,7 +145,7 @@ Run focused tests first, then the complete Vitest suite, TypeScript build/typech
 This is a separate hotfix gate before missing-topic recovery activation continues. Because the current branch already contains the 05.3 runtime code, the release artifact may contain that code, but recovery remains disabled by default, has no Dashboard action, and performs no recovery work.
 
 1. Build and test a private release candidate outside the live `dist` directory.
-2. Capture live PID, restart count, health/readiness, queue state, and the disabled recovery configuration.
+2. Capture live PID, restart count, health/readiness, queue state, and verify effective disabled recovery configuration. Select only the exact recovery key from `/proc/$MainPID/environ`, export it unchanged or unset it when absent in a `tsx` subprocess, and call source `loadConfig()` in the service working directory to apply `.env` precedence. Reject invalid nonempty boolean values independently of config's warning/fallback behavior. Print only the boolean JSON result and require `false`; unreadable state or config failure must stop release. Repeat immediately before installation and after restart.
 3. Wait for the existing idle preflight and require two consecutive idle samples. The shell condition must use an explicit `if` block so `set -e` cannot terminate the deploy loop on a normal false check.
 4. Preserve a rollback artifact, install the candidate, and restart once.
 5. Verify health/readiness, unchanged disabled recovery state, queue safety, and no unexpected recovery records.

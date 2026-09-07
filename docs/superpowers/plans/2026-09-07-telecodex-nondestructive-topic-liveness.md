@@ -4,7 +4,7 @@
 
 **Goal:** Stop background collectors from reopening and reclosing work topics, while preserving definitive missing-topic detection for explicit actions and recovery.
 
-**Architecture:** A focused liveness module will classify an ephemeral `sendChatAction` request, own a three-second deadline, and coalesce checks per topic with a five-second cache. Status Board and Dashboard rendering will project saved bindings without any Telegram liveness request. Existing explicit consumers will share the nondestructive probe, while intentional ticket and Status Board lifecycle mutations remain unchanged.
+**Architecture:** A focused liveness module will classify an ephemeral `sendChatAction` request, own a three-second deadline, and coalesce checks per topic with a five-second cache. A dedicated grammY API without transformers will send bot probes in both legacy and canonical modes. Status Board and Dashboard rendering will project saved bindings without any Telegram liveness request. Existing explicit consumers will share the nondestructive probe, while intentional ticket and Status Board lifecycle mutations remain unchanged.
 
 **Tech Stack:** TypeScript 5.9, Node.js 20+, grammY 1.45, Vitest 3, Svelte 5, systemd, curl, rsync.
 
@@ -14,6 +14,9 @@
 
 - Create `src/telegram-topic-liveness.ts`: nondestructive probe, error classification, deadline, single-flight, and short cache.
 - Create `test/telegram-topic-liveness.test.ts`: focused behavioral contract for the probe.
+- Create `src/telegram-topic-liveness-api.ts`: dedicated grammY API without retry transformers, exposing only `sendChatAction` and accepting client options for transport tests.
+- Create `test/telegram-topic-liveness-api.test.ts`: fake-fetch HTTP/API 429 regression proving exactly one request and the original typed failure.
+- Create `test/bot-topic-liveness.test.ts`: real bot callback routing through the injected dedicated API in both compatibility modes.
 - Modify `src/projects.ts`: remove the reopen/close probe while retaining bound-topic selection and job partitioning.
 - Modify `test/projects.test.ts`: remove tests that lock in the destructive implementation.
 - Modify `src/telegram-topic-recovery-adapter.ts`: adapt recovery to `sendChatAction` instead of topic mutations.
@@ -205,6 +208,7 @@ function isClosedForumTopicError(error: unknown): boolean {
 export function createForumTopicLivenessProbe(options: ForumTopicLivenessOptions) {
   const now = options.now ?? Date.now;
   const timeoutMs = positiveInteger(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, "timeoutMs");
+  if (timeoutMs > 2_147_483_647) throw new Error("Invalid timeoutMs");
   const cacheTtlMs = positiveInteger(options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS, "cacheTtlMs");
   const cache = new Map<string, { readonly value: boolean; readonly expiresAt: number }>();
   const inFlight = new Map<string, Promise<boolean>>();
@@ -326,6 +330,9 @@ git commit -m "NO-TICKET fix: probe topics without changing state"
 ## Task 2: Wire all explicit liveness consumers
 
 **Files:**
+- Create: `src/telegram-topic-liveness-api.ts`
+- Create: `test/telegram-topic-liveness-api.test.ts`
+- Create: `test/bot-topic-liveness.test.ts`
 - Modify: `src/projects.ts:88-168`
 - Modify: `test/projects.test.ts:229-272`
 - Modify: `src/bot.ts:69-82,3195-3200`
@@ -377,17 +384,23 @@ In `src/bot.ts`, remove the `probeForumTopic` import and import:
 
 ```ts
 import { createForumTopicLivenessProbe } from "./telegram-topic-liveness.js";
+import { createTelegramTopicLivenessApi, type TelegramTopicLivenessApi }
+  from "./telegram-topic-liveness-api.js";
 ```
 
-Replace the old `topicIsAlive` closure with one shared probe:
+Add the narrow optional `topicLivenessApi?: TelegramTopicLivenessApi` dependency to `TeleCodexBotOptions`. Replace the old `topicIsAlive` closure with one shared probe:
 
 ```ts
 /** Telegram sends no update when a forum topic is deleted. */
-const topicIsAlive = createForumTopicLivenessProbe({
-  sendChatAction: (chatId, action, requestOptions, signal) =>
-    bot.api.sendChatAction(chatId, action, requestOptions, signal as never),
+const probeTopicLiveness = createForumTopicLivenessProbe({
+  sendChatAction: (options.topicLivenessApi
+    ?? createTelegramTopicLivenessApi(config.telegramBotToken)).sendChatAction,
 });
+const topicIsAlive = (chatId: number, messageThreadId: number): Promise<boolean> =>
+  probeTopicLiveness({ chatId, messageThreadId });
 ```
+
+The factory creates `new Api(token, options)` exactly once and wraps its `sendChatAction`; it installs no transformers and does not expose `config.use`. Keep ordinary legacy `bot.api` autoRetry unchanged. Prove this separation through actual bot callbacks in both legacy and canonical modes, and prove an HTTP/API 429 is rejected after exactly one fake-fetch request. Add RED validation for `timeoutMs = 2_147_483_648`; accept integer timeouts from 1 through `2_147_483_647`. Cache TTL has no timer and can remain a positive safe integer.
 
 In `src/telegram-topic-recovery-adapter.ts`, import `createForumTopicLivenessProbe`, narrow `RecoveryApi`, create the probe once, and delegate to it:
 
@@ -406,6 +419,8 @@ const topicIsAlive = createForumTopicLivenessProbe({
 probeForumTopic: (destination, signal) => topicIsAlive(destination, signal),
 ```
 
+The recovery adapter is composed only in canonical mode, whose API has no retry transformer, and remains disabled by default.
+
 - [ ] **Step 4: Run explicit-consumer regression tests**
 
 Run:
@@ -413,6 +428,8 @@ Run:
 ```bash
 TMPDIR=/var/tmp npx vitest run \
   test/telegram-topic-liveness.test.ts \
+  test/telegram-topic-liveness-api.test.ts \
+  test/bot-topic-liveness.test.ts \
   test/projects.test.ts \
   test/telegram-topic-recovery-adapter.test.ts \
   test/telegram-topic-recovery-runtime.test.ts \
@@ -435,7 +452,8 @@ Expected: no matches.
 
 ```bash
 git add src/projects.ts src/bot.ts src/telegram-topic-recovery-adapter.ts \
-  test/projects.test.ts test/telegram-topic-recovery-adapter.test.ts
+  src/telegram-topic-liveness-api.ts test/telegram-topic-liveness-api.test.ts \
+  test/bot-topic-liveness.test.ts test/projects.test.ts test/telegram-topic-recovery-adapter.test.ts
 git commit -m "NO-TICKET fix: use nondestructive topic probes"
 ```
 
@@ -674,9 +692,11 @@ not run `npm run build` because its default outputs are the live `dist` and
 ```bash
 set -euo pipefail
 test "$(wc -l < src/telegram-topic-liveness.ts)" -lt 500
+test "$(wc -l < src/telegram-topic-liveness-api.ts)" -lt 500
 test "$(wc -l < src/telegram-topic-recovery-adapter.ts)" -lt 500
 ! rg -n "reopenForumTopic|closeForumTopic" \
-  src/telegram-topic-liveness.ts src/telegram-topic-recovery-adapter.ts src/projects.ts
+  src/telegram-topic-liveness.ts src/telegram-topic-liveness-api.ts \
+  src/telegram-topic-recovery-adapter.ts src/projects.ts
 ! rg -n "validateTopicBindings|createPeriodicDashboardCollector|bindLiveStatusTopics" src test
 git status --short
 ```
@@ -733,13 +753,52 @@ chmod -R go-rwx "$TELECODEX_STAGE" "$TELECODEX_ROLLBACK"
 set -euo pipefail
 ! rg -n "reopenForumTopic|closeForumTopic" \
   "$TELECODEX_STAGE/dist/telegram-topic-liveness.js" \
+  "$TELECODEX_STAGE/dist/telegram-topic-liveness-api.js" \
   "$TELECODEX_STAGE/dist/telegram-topic-recovery-adapter.js" \
   "$TELECODEX_STAGE/dist/projects.js"
-! systemctl show telecodex.service -p Environment --value \
-  | tr ' ' '\n' | rg '^TELEGRAM_TOPIC_RECOVERY_ENABLED=(1|true|yes|on)$'
+node --input-type=module <<'NODE'
+import assert from "node:assert/strict";
+import { readFileSync, realpathSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+
+try {
+  const serviceProperty = (name) => execFileSync("systemctl", [
+    "show", "telecodex.service", "-p", name, "--value",
+  ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const pid = serviceProperty("MainPID");
+  assert.match(pid, /^[1-9]\d*$/);
+  const cwd = realpathSync(serviceProperty("WorkingDirectory"));
+  assert.equal(cwd, realpathSync(process.cwd()));
+  const key = "TELEGRAM_TOPIC_RECOVERY_ENABLED";
+  // Retain only this exact key; never forward or print the complete service environment.
+  const records = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0")
+    .filter((record) => record.startsWith(`${key}=`));
+  assert.ok(records.length <= 1);
+  const env = { ...process.env };
+  delete env[key];
+  if (records.length === 1) env[key] = records[0].slice(key.length + 1);
+  const check = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", `
+    import { loadConfig } from "./src/config.ts";
+    const config = loadConfig();
+    const raw = process.env.TELEGRAM_TOPIC_RECOVERY_ENABLED?.trim() ?? "";
+    if (raw !== "" && !/^(true|false)$/i.test(raw)) process.exit(1);
+    process.stdout.write(JSON.stringify({
+      telegramTopicRecoveryEnabled: config.telegramTopicRecoveryEnabled,
+    }));
+  `], { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 });
+  assert.equal(check.status, 0);
+  const result = JSON.parse(check.stdout);
+  assert.deepEqual(result, { telegramTopicRecoveryEnabled: false });
+  assert.equal(serviceProperty("MainPID"), pid);
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+} catch {
+  // Suppress raw config values, subprocess warnings, environments, and tokens on failure.
+  process.exit(1);
+}
+NODE
 ```
 
-Expected: both negative assertions exit 0. Do not print the complete service environment.
+Expected: the structural assertion and config gate exit 0; the only config output is `{"telegramTopicRecoveryEnabled":false}`. `/proc/$MainPID/environ` supplies the exact initial process value, including systemd `Environment` and `EnvironmentFile`. An absent key is explicitly unset in the subprocess, allowing source `loadConfig()` to apply the service working directory's `.env` with its normal precedence; an explicitly empty key stays present. Nonempty values other than case-insensitive `true`/`false`, enabled recovery, unreadable process state, PID changes, or any config failure stop the gate without printing raw values. Rerun this gate immediately before installation and after restart.
 
 - [ ] **Step 3: Require two consecutive idle preflight samples**
 

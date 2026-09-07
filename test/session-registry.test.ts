@@ -97,6 +97,9 @@ vi.mock("node:fs", () => ({
   renameSync: vi.fn((source: string, destination: string) => {
     mockFsState.rename(source, destination);
   }),
+  unlinkSync: vi.fn((targetPath: string) => {
+    if (!mockFsState.files.delete(targetPath)) throw new Error(`ENOENT: ${targetPath}`);
+  }),
   writeFileSync: vi.fn((targetPath: string, content: string) => {
     mockFsState.files.set(targetPath, content);
     mockFsState.directories.add(path.dirname(targetPath));
@@ -396,6 +399,8 @@ describe("SessionRegistry", () => {
     ]);
     expect(registry.has("-100123:41")).toBe(true);
     expect(oldSession.dispose).not.toHaveBeenCalled();
+    expect([...mockFsState.files.keys()].filter((file) => file.startsWith(`${persistPath}.tmp-`)))
+      .toEqual([]);
   });
 
   it("disposes an in-flight stale session instead of resurrecting the old context", async () => {

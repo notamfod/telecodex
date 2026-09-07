@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { findLaunchProfile } from "./codex-launch.js";
@@ -255,8 +255,14 @@ export class SessionRegistry {
     const dir = path.dirname(this.persistPath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     const temporaryPath = `${this.persistPath}.tmp-${process.pid}-${randomUUID()}`;
-    writeFileSync(temporaryPath, JSON.stringify([...this.metadata.values()], null, 2), "utf8");
-    renameSync(temporaryPath, this.persistPath);
+    try {
+      writeFileSync(temporaryPath, JSON.stringify([...this.metadata.values()], null, 2), "utf8");
+      renameSync(temporaryPath, this.persistPath);
+    } catch (error) {
+      try { unlinkSync(temporaryPath); }
+      catch { /* Preserve the persistence failure. */ }
+      throw error;
+    }
   }
 
   private threadMetadata(

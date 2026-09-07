@@ -201,6 +201,11 @@ try {
       maxAttempts: config.telegramJobs.maxAttempts,
       ...(config.telegramTopicRecoveryEnabled ? {
         topicRecovery: {
+          forumChatId: config.telegramForumChatId ?? 0,
+          hasThreadTopicBinding: (threadId, destination) => registry!.listContexts().some(
+            (context) => context.contextKey === `${destination.chatId}:${destination.messageThreadId}`
+              && context.threadId === threadId,
+          ),
           probeForumTopic: ({ chatId, messageThreadId }) => probeForumTopic(messageThreadId, {
             reopen: (threadId) => bot!.api.reopenForumTopic(chatId, threadId),
             close: (threadId) => bot!.api.closeForumTopic(chatId, threadId),

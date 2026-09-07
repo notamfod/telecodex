@@ -46,6 +46,11 @@ export type TelegramTopicRecoveryRuntimeReasonCode =
 
 export interface TelegramTopicRecoveryRuntimeOptions {
   readonly store: TopicRecoveryStore;
+  readonly forumChatId: number;
+  readonly hasThreadTopicBinding: (
+    threadId: string,
+    destination: TelegramTopicDestination,
+  ) => boolean;
   readonly probeForumTopic: (destination: TelegramTopicDestination) => Promise<boolean>;
   readonly createForumTopic: (input: {
     readonly chatId: number;
@@ -85,6 +90,9 @@ export function createTelegramTopicRecoveryRuntime(
   const now = options.now ?? Date.now;
   const createId = options.createId ?? randomUUID;
   const creationTimeoutMs = boundedCreationTimeout(options.creationTimeoutMs);
+  if (!Number.isSafeInteger(options.forumChatId) || options.forumChatId === 0) {
+    throw new Error("Invalid Telegram topic recovery forum");
+  }
   const effects = new Map<string, Promise<void>>();
   const scheduled = new Map<string, number>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
@@ -130,10 +138,13 @@ export function createTelegramTopicRecoveryRuntime(
   ): Promise<void> => {
     try { bind(recovery, thread); }
     catch { report(jobId, "TOPIC_RECOVERY_BIND_FAILED"); }
-    void Promise.resolve().then(() => options.sendWelcome({
-        chatId: recovery.oldDestination.chatId,
-        messageThreadId: recovery.newMessageThreadId!,
-      }, topicName)).catch(() => report(jobId, "TOPIC_RECOVERY_WELCOME_FAILED"));
+    const destination = {
+      chatId: recovery.oldDestination.chatId,
+      messageThreadId: recovery.newMessageThreadId!,
+    };
+    void Promise.resolve()
+      .then(() => options.sendWelcome(destination, topicName))
+      .catch(() => report(jobId, "TOPIC_RECOVERY_WELCOME_FAILED"));
     await options.outboxPump();
   };
 
@@ -168,7 +179,7 @@ export function createTelegramTopicRecoveryRuntime(
         const current = options.store.getTopicRecovery(recovery.jobId);
         if (!current || current.state !== "retry_wait" || current.actionToken !== recovery.actionToken
           || current.nextAttemptAt === null || current.nextAttemptAt > now()) return;
-        const plan = recoveryPlan(options.store, options.getThread, current.jobId);
+        const plan = recoveryPlan(options, current.jobId);
         if (!plan || plan.candidate.expectedVersion !== current.currentJobVersion) return;
         const resumed = options.store.resumeTopicRecovery({
           jobId: current.jobId,
@@ -268,7 +279,7 @@ export function createTelegramTopicRecoveryRuntime(
     assertRunning(disposed);
     return enqueue(action.jobId, async () => {
       if (options.store.getTopicRecovery(action.jobId)) return;
-      const plan = recoveryPlan(options.store, options.getThread, action.jobId);
+      const plan = recoveryPlan(options, action.jobId);
       if (!plan || plan.candidate.expectedVersion !== action.expectedVersion) {
         throw new Error("Telegram topic recovery is no longer eligible");
       }
@@ -322,13 +333,13 @@ export function createTelegramTopicRecoveryRuntime(
 }
 
 function recoveryPlan(
-  store: TopicRecoveryStore,
-  getThread: TelegramTopicRecoveryRuntimeOptions["getThread"],
+  options: TelegramTopicRecoveryRuntimeOptions,
   jobId: string,
 ): TelegramTopicRecoveryPlan | null {
+  const store = options.store;
   const job = store.get(jobId);
   if (!job || !job.threadId) return null;
-  const thread = getThread(job.threadId);
+  const thread = options.getThread(job.threadId);
   if (!thread) return null;
   const deliveries = store.listDeliveries(job.id);
   const anchors = deliveries.filter((part) => part.partKey === "status-anchor");
@@ -343,7 +354,11 @@ function recoveryPlan(
     anchorPlan: { payload: anchor.payload, contentHash: anchor.contentHash },
     thread,
   });
-  return candidate ? { candidate, thread } : null;
+  return candidate
+    && candidate.oldDestination.chatId === options.forumChatId
+    && options.hasThreadTopicBinding(candidate.threadId, candidate.oldDestination)
+    ? { candidate, thread }
+    : null;
 }
 
 function requireJob(store: TopicRecoveryStore, jobId: string): TelegramJob {

@@ -52,6 +52,8 @@ describe("Telegram reliability runtime", () => {
     runtime = createTelegramReliabilityRuntime({
       ...harness.options,
       topicRecovery: {
+        forumChatId: -1001,
+        hasThreadTopicBinding: vi.fn(() => true),
         probeForumTopic: vi.fn(async () => false),
         createForumTopic: vi.fn(async ({ chatId }) => ({ chatId, messageThreadId: 99 })),
         getThread: vi.fn(() => null),

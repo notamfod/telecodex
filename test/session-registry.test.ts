@@ -439,6 +439,49 @@ describe("SessionRegistry", () => {
     ]);
   });
 
+  it("preserves the old context launch and reasoning settings during rebind", () => {
+    const config = createConfig();
+    const persistPath = path.join(config.workspace, ".telecodex", "contexts.json");
+    mockFsState.files.set(persistPath, JSON.stringify([{
+      contextKey: "-100123:41",
+      threadId: "thread-visible",
+      workspace: "/workspace/project",
+      model: "gpt-5.6-sol",
+      modelProvider: "openai",
+      modelChoiceId: "selected-model",
+      reasoningEffort: "high",
+      launchProfileId: "readonly",
+      topicName: "Pinned topic",
+      updatedAt: 10_000,
+    }]));
+    const registry = new SessionRegistry(config);
+    const thread: CodexThreadRecord = {
+      id: "thread-visible",
+      title: "Visible chat",
+      cwd: "/workspace/project",
+      model: "gpt-5.6-sol",
+      modelProvider: "openai",
+      createdAt: new Date(5_000),
+      updatedAt: new Date(20_000),
+      firstUserMessage: "Visible chat",
+    };
+
+    registry.rebindThreadTopic("-100123:41", "-100123:99", thread);
+
+    expect(registry.listContexts()).toEqual([{
+      contextKey: "-100123:99",
+      threadId: thread.id,
+      workspace: "/workspace/project",
+      model: "gpt-5.6-sol",
+      modelProvider: "openai",
+      modelChoiceId: "selected-model",
+      reasoningEffort: "high",
+      launchProfileId: "readonly",
+      topicName: "Pinned topic",
+      updatedAt: 10_000,
+    }]);
+  });
+
   it("two topic contexts in the same chat maintain independent sessions", async () => {
     const registry = new SessionRegistry(createConfig());
 

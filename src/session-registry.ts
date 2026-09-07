@@ -185,8 +185,12 @@ export class SessionRegistry {
       throw new Error("Telegram topic rebind requires a new context");
     }
     const previous = new Map(this.metadata);
+    const oldMetadata = this.metadata.get(oldContextKey);
+    const reboundMetadata = oldMetadata?.threadId === thread.id
+      ? { ...oldMetadata, contextKey: newContextKey }
+      : this.threadMetadata(newContextKey, thread);
     this.metadata.delete(oldContextKey);
-    this.metadata.set(newContextKey, this.threadMetadata(newContextKey, thread));
+    this.metadata.set(newContextKey, reboundMetadata);
     try {
       this.persistMetadataReplaceSafe();
     } catch {

@@ -174,6 +174,21 @@ describe("TelegramTopicRecoveryRuntime", () => {
       await recovery;
     }
   });
+
+  it.each([
+    ["configured forum differs", { forumChatId: -100999 }],
+    ["old registry binding is absent", { bindingPresent: false }],
+  ])("refuses recovery before reservation when %s", async (_label, overrides) => {
+    const harness = createHarness(overrides);
+    const runtime = createTelegramTopicRecoveryRuntime(harness.options);
+
+    await expect(runtime.recover(harness.action))
+      .rejects.toThrow("Telegram topic recovery is no longer eligible");
+
+    expect(harness.store.reserveTopicRecovery).not.toHaveBeenCalled();
+    expect(harness.probeForumTopic).not.toHaveBeenCalled();
+    expect(harness.createForumTopic).not.toHaveBeenCalled();
+  });
 });
 
 function createHarness(options: {
@@ -185,6 +200,8 @@ function createHarness(options: {
   retryAt?: number;
   welcomeError?: Error;
   threadDisappearsAfterPlanning?: boolean;
+  forumChatId?: number;
+  bindingPresent?: boolean;
 } = {}) {
   const thread: CodexThreadRecord = {
     id: "thread-1",
@@ -317,6 +334,8 @@ function createHarness(options: {
   const scheduled: Array<{ at: number; wake: () => Promise<void> }> = [];
   const runtimeOptions = {
     store,
+    forumChatId: options.forumChatId ?? OLD.chatId,
+    hasThreadTopicBinding: vi.fn(() => options.bindingPresent ?? true),
     probeForumTopic,
     createForumTopic,
     getThread,

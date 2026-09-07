@@ -33,7 +33,7 @@ import {
 import { checkAuthStatus, startLogin, startLogout } from "./codex-auth.js";
 import {
   createDashboardController,
-  createPeriodicDashboardCollector,
+  createDashboardSnapshotCollector,
   createSharedAsyncLoader,
   type DashboardController,
 } from "./dashboard-controller.js";
@@ -69,7 +69,6 @@ import { registerInboxHandlers } from "./bot-inbox.js";
 import {
   ensureThreadTopic,
   findBoundTopic,
-  findLiveBoundTopic,
   groupThreadsByProject,
   partitionJobsByTopicLiveness,
   projectButtons,
@@ -344,36 +343,18 @@ interface LiveStatusTopicRow {
   messageThreadId?: number;
 }
 
-export async function bindLiveStatusTopics(
+export function bindSavedStatusTopics(
   rows: LiveStatusTopicRow[],
   cache: Map<string, number>,
-  validate: boolean,
-  lookup: (threadId: string) => Promise<number | undefined>,
-): Promise<void> {
-  if (validate) {
-    const visibleThreadIds = new Set(rows.map((row) => row.threadId));
-    for (const threadId of cache.keys()) {
-      if (!visibleThreadIds.has(threadId)) cache.delete(threadId);
-    }
-    for (const row of rows) {
-      const messageThreadId = await lookup(row.threadId);
-      if (messageThreadId === undefined) cache.delete(row.threadId);
-      else cache.set(row.threadId, messageThreadId);
-    }
-  } else {
-    for (const row of rows) {
-      if (row.messageThreadId !== undefined) {
-        cache.set(row.threadId, row.messageThreadId);
-        continue;
-      }
-      if (cache.has(row.threadId)) continue;
-      const messageThreadId = await lookup(row.threadId);
-      if (messageThreadId !== undefined) cache.set(row.threadId, messageThreadId);
-    }
+): void {
+  const visibleThreadIds = new Set(rows.map((row) => row.threadId));
+  for (const threadId of cache.keys()) {
+    if (!visibleThreadIds.has(threadId)) cache.delete(threadId);
   }
   for (const row of rows) {
-    row.messageThreadId = cache.get(row.threadId);
+    if (row.messageThreadId !== undefined) cache.set(row.threadId, row.messageThreadId);
   }
+  for (const row of rows) row.messageThreadId = cache.get(row.threadId);
 }
 
 export async function removeStatusBoardMessage(
@@ -4215,7 +4196,7 @@ export function createBot(
     if (config.miniApp) {
       bot.dashboard = createDashboardController({
         chatId: boardChatId,
-        collect: createPeriodicDashboardCollector(collectStatusSnapshot),
+        collect: createDashboardSnapshotCollector(collectStatusSnapshot),
         ...(reliability?.loadDashboardSessionStatuses
           ? { loadSessionStatuses: () => reliability.loadDashboardSessionStatuses!() }
           : {}),
@@ -4251,13 +4232,10 @@ export function createBot(
    */
   async function collectStatusSnapshot(
     options: {
-      validateTopicBindings: boolean;
       maxRecentThreads?: number;
       includeCanonicalReliability?: boolean;
       refreshHostThreads?: boolean;
-    } = {
-      validateTopicBindings: true,
-    },
+    } = {},
   ): Promise<StatusSnapshot> {
     const contexts = registry.listContexts();
     const byContextKey = new Map(contexts.map((meta) => [meta.contextKey, meta]));
@@ -4369,17 +4347,7 @@ export function createBot(
     if (boardChatId !== undefined) {
       const actionable = [...snapshot.running, ...snapshot.recentThreads]
         .filter((row): row is typeof row & { threadId: string } => Boolean(row.threadId));
-      await bindLiveStatusTopics(
-        actionable,
-        liveStatusTopicByThreadId,
-        options.maxRecentThreads === undefined && options.validateTopicBindings,
-        (threadId) => findLiveBoundTopic(
-          contexts,
-          boardChatId,
-          threadId,
-          (messageThreadId) => topicIsAlive(boardChatId, messageThreadId),
-        ),
-      );
+      bindSavedStatusTopics(actionable, liveStatusTopicByThreadId);
     }
     return snapshot;
   }

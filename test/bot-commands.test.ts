@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  bindLiveStatusTopics,
+  bindSavedStatusTopics,
   deliverPromptError,
   deliverPromptSuccess,
   DISABLED_MODEL_SELECTION_CALLBACK_PATTERN,
@@ -13,45 +13,17 @@ import {
 import * as botModule from "../src/bot.js";
 
 describe("status board Telegram policy", () => {
-  it("reuses cached topic bindings between health checks", async () => {
-    const cache = new Map<string, number>();
-    const lookup = vi.fn().mockResolvedValue(42);
-    const first = [{ threadId: "thread-1", messageThreadId: undefined }];
-
-    await bindLiveStatusTopics(first, cache, true, lookup);
-    const second = [{ threadId: "thread-1", messageThreadId: undefined }];
-    await bindLiveStatusTopics(second, cache, false, lookup);
-
-    expect(lookup).toHaveBeenCalledOnce();
-    expect(first[0].messageThreadId).toBe(42);
-    expect(second[0].messageThreadId).toBe(42);
-  });
-
-  it("discovers a newly visible topic between full health checks", async () => {
-    const cache = new Map<string, number>([["known", 41]]);
-    const lookup = vi.fn(async (threadId: string) => threadId === "new" ? 42 : undefined);
+  it("projects saved bindings synchronously without a Telegram lookup", () => {
+    const cache = new Map<string, number>([["cached", 40], ["gone", 39]]);
     const rows = [
-      { threadId: "known", messageThreadId: undefined },
-      { threadId: "new", messageThreadId: undefined },
+      { threadId: "cached", messageThreadId: undefined },
+      { threadId: "stored", messageThreadId: 43 },
     ];
 
-    await bindLiveStatusTopics(rows, cache, false, lookup);
+    expect(bindSavedStatusTopics(rows, cache)).toBeUndefined();
 
-    expect(lookup).toHaveBeenCalledOnce();
-    expect(lookup).toHaveBeenCalledWith("new");
-    expect(rows.map((row) => row.messageThreadId)).toEqual([41, 42]);
-  });
-
-  it("trusts a stored binding without probing Telegram between health checks", async () => {
-    const cache = new Map<string, number>();
-    const lookup = vi.fn();
-    const rows = [{ threadId: "stored", messageThreadId: 43 }];
-
-    await bindLiveStatusTopics(rows, cache, false, lookup);
-
-    expect(lookup).not.toHaveBeenCalled();
-    expect(cache.get("stored")).toBe(43);
-    expect(rows[0].messageThreadId).toBe(43);
+    expect(rows.map((row) => row.messageThreadId)).toEqual([40, 43]);
+    expect(cache).toEqual(new Map([["cached", 40], ["stored", 43]]));
   });
 
   it("propagates a rate limit while removing the legacy board", async () => {

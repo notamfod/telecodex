@@ -216,10 +216,10 @@ describe("StatusBoard lifecycle", () => {
     });
   });
 
-  it("requests topic-binding probes only during periodic health checks", async () => {
+  it("does not request work-topic validation during background refreshes", async () => {
     const telegram = new FakeTelegram();
     let now = NOW;
-    const collect = vi.fn(async (_options?: { validateTopicBindings: boolean }) => emptySnapshot());
+    const collect = vi.fn(async () => emptySnapshot());
     const board = createBoard(
       telegram,
       collect,
@@ -234,11 +234,7 @@ describe("StatusBoard lifecycle", () => {
     now += 10 * 60_000;
     await board.refreshOnce();
 
-    expect(collect.mock.calls).toEqual([
-      [{ validateTopicBindings: true }],
-      [{ validateTopicBindings: false }],
-      [{ validateTopicBindings: true }],
-    ]);
+    expect(collect.mock.calls).toEqual([[], [], []]);
   });
 
   it("edits the board once the work changed", async () => {

@@ -53,35 +53,18 @@ export function createSharedAsyncLoader<T>(
   };
 }
 
-export function createPeriodicDashboardCollector(
+export function createDashboardSnapshotCollector(
   collect: (options: {
-    validateTopicBindings: boolean;
     maxRecentThreads?: number;
     includeCanonicalReliability?: boolean;
     refreshHostThreads?: boolean;
   }) => Promise<StatusSnapshot>,
-  options: {
-    now?: () => number;
-    validationIntervalMs?: number;
-  } = {},
 ): () => Promise<StatusSnapshot> {
-  const now = options.now ?? Date.now;
-  const validationIntervalMs = options.validationIntervalMs ?? 10 * 60_000;
-  let nextValidationAt = 0;
-
-  return () => {
-    const currentTime = now();
-    const validateTopicBindings = currentTime >= nextValidationAt;
-    if (validateTopicBindings) {
-      nextValidationAt = currentTime + validationIntervalMs;
-    }
-    return collect({
-      validateTopicBindings,
-      maxRecentThreads: Number.MAX_SAFE_INTEGER,
-      includeCanonicalReliability: false,
-      refreshHostThreads: false,
-    });
-  };
+  return () => collect({
+    maxRecentThreads: Number.MAX_SAFE_INTEGER,
+    includeCanonicalReliability: false,
+    refreshHostThreads: false,
+  });
 }
 
 export function createDashboardController(

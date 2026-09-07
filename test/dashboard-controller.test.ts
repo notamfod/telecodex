@@ -1,6 +1,6 @@
 import {
   createDashboardController,
-  createPeriodicDashboardCollector,
+  createDashboardSnapshotCollector,
   createSharedAsyncLoader,
 } from "../src/dashboard-controller.js";
 import type { StatusSnapshot } from "../src/status-board.js";
@@ -50,24 +50,18 @@ describe("Dashboard controller", () => {
     expect(source).toHaveBeenCalledTimes(2);
   });
 
-  it("validates Telegram topic bindings on first load and then periodically", async () => {
-    let now = NOW;
+  it("uses the same local-only snapshot options on every load", async () => {
     const collect = vi.fn(async () => emptySnapshot);
-    const periodicCollect = createPeriodicDashboardCollector(collect, {
-      now: () => now,
-      validationIntervalMs: 10 * 60_000,
-    });
+    const loadSnapshot = createDashboardSnapshotCollector(collect);
 
-    await periodicCollect();
-    now += 15_000;
-    await periodicCollect();
-    now += 10 * 60_000;
-    await periodicCollect();
+    await loadSnapshot();
+    await loadSnapshot();
+    await loadSnapshot();
 
     expect(collect.mock.calls).toEqual([
-      [{ validateTopicBindings: true, maxRecentThreads: Number.MAX_SAFE_INTEGER, includeCanonicalReliability: false, refreshHostThreads: false }],
-      [{ validateTopicBindings: false, maxRecentThreads: Number.MAX_SAFE_INTEGER, includeCanonicalReliability: false, refreshHostThreads: false }],
-      [{ validateTopicBindings: true, maxRecentThreads: Number.MAX_SAFE_INTEGER, includeCanonicalReliability: false, refreshHostThreads: false }],
+      [{ maxRecentThreads: Number.MAX_SAFE_INTEGER, includeCanonicalReliability: false, refreshHostThreads: false }],
+      [{ maxRecentThreads: Number.MAX_SAFE_INTEGER, includeCanonicalReliability: false, refreshHostThreads: false }],
+      [{ maxRecentThreads: Number.MAX_SAFE_INTEGER, includeCanonicalReliability: false, refreshHostThreads: false }],
     ]);
   });
 

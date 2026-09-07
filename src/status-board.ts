@@ -28,7 +28,7 @@ export interface StatusBoardOptions {
   chatId: number;
   intervalMs: number;
   miniAppLaunchUrl?: string;
-  collect(options: { validateTopicBindings: boolean }): Promise<StatusSnapshot>;
+  collect(): Promise<StatusSnapshot>;
   createTopic(): Promise<number>;
   send(messageThreadId: number, message: RenderedMessage): Promise<number>;
   edit(messageThreadId: number, messageId: number, message: RenderedMessage): Promise<void>;
@@ -82,7 +82,7 @@ export class StatusBoard {
     const healthCheckDue = this.lastHealthCheckAt === undefined
       || now - this.lastHealthCheckAt >= HEALTH_CHECK_INTERVAL_MS;
     const { body, buttons } = renderStatusBoard(
-      await this.options.collect({ validateTopicBindings: healthCheckDue }),
+      await this.options.collect(),
       this.options.chatId,
       this.options.miniAppLaunchUrl,
     );

@@ -1,8 +1,13 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { registerInboxHandlers } from "../src/bot-inbox.js";
 
 describe("registerInboxHandlers", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
   it("registers inbox commands, callbacks, and the message interceptor", () => {
     const commands: string[] = [];
     const callbacks: string[] = [];
@@ -159,5 +164,67 @@ describe("registerInboxHandlers", () => {
     expect(markStarted).toHaveBeenCalledWith(9);
     expect(accept).not.toHaveBeenCalled();
     expect(ctx.answerCallbackQuery).toHaveBeenCalledWith({ text: "Разбор уже запускали" });
+  });
+
+  it.each([
+    ["a probe timeout", new Error("Telegram topic probe timed out")],
+    ["a Telegram 429", new Error("429: Too Many Requests: retry after 1")],
+  ])("does not offer a replacement topic after %s", async (_label, probeError) => {
+    vi.useFakeTimers();
+    let messageHandler!: (ctx: any, next: () => Promise<void>) => Promise<void>;
+    const createForumTopic = vi.fn();
+    const bot = {
+      command: vi.fn(),
+      callbackQuery: vi.fn(),
+      on: (event: string, handler: typeof messageHandler) => {
+        if (event === "message") messageHandler = handler;
+      },
+      api: { createForumTopic },
+    };
+    const sendText = vi.fn();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const previous = {
+      id: 7,
+      externalKey: "MIR-123",
+      inboxContextKey: "-1001:7",
+      workTopicId: 41,
+      workspace: "/work",
+      prompt: "Investigate",
+      source: "telegram",
+      createdAt: 1,
+    };
+
+    registerInboxHandlers({
+      bot: bot as never,
+      config: { workspace: "/work", defaultLaunchProfileId: "default" } as never,
+      registry: {} as never,
+      inbox: {
+        get: vi.fn(() => ({ workspace: "/work", template: "{message}" })),
+        listTicketsByKey: vi.fn(() => [previous]),
+      } as never,
+      topicActivity: { rememberIdleIcon: vi.fn() },
+      getContextSession: vi.fn(),
+      isBusy: vi.fn(),
+      handleTicketPrompt: vi.fn(),
+      topicIsAlive: vi.fn().mockRejectedValue(probeError),
+      sendText,
+      safeReply: vi.fn(),
+    });
+
+    await messageHandler({
+      chat: { id: -1001 },
+      message: {
+        message_id: 10,
+        message_thread_id: 7,
+        text: "MIR-123 повторное обращение",
+      },
+    }, vi.fn(async () => undefined));
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(sendText.mock.calls.some(([, text]) =>
+      String(text).includes("активного рабочего топика у него нет")
+    )).toBe(false);
+    expect(createForumTopic).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledWith("Inbox burst failed:", expect.any(String));
   });
 });

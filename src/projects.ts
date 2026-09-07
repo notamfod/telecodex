@@ -114,9 +114,10 @@ export async function partitionJobsByTopicLiveness<
 >(
   jobs: T[],
   topicIsAlive: (chatId: number, messageThreadId: number) => Promise<boolean>,
-): Promise<{ retained: T[]; dead: T[] }> {
+): Promise<{ retained: T[]; dead: T[]; unknown: T[] }> {
   const retained: T[] = [];
   const dead: T[] = [];
+  const unknown: T[] = [];
 
   for (const job of jobs) {
     if (job.messageThreadId === undefined || job.messageThreadId === 1) {
@@ -127,11 +128,11 @@ export async function partitionJobsByTopicLiveness<
     try {
       (await topicIsAlive(job.chatId, job.messageThreadId) ? retained : dead).push(job);
     } catch {
-      dead.push(job);
+      unknown.push(job);
     }
   }
 
-  return { retained, dead };
+  return { retained, dead, unknown };
 }
 
 export interface EnsureThreadTopicOptions {

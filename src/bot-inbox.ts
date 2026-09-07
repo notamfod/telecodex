@@ -159,7 +159,7 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
       const candidates = inbox.listTicketsByKey(first.contextKey, externalKey);
       for (const candidate of candidates) {
         if (candidate.resolvedAt !== undefined || !candidate.workTopicId) continue;
-        if (await deps.topicIsAlive(first.chatId, candidate.workTopicId).catch(() => false)) {
+        if (await deps.topicIsAlive(first.chatId, candidate.workTopicId)) {
           await appendToTicket(candidate, group, text, source);
           return;
         }

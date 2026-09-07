@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import path from "node:path";
 
 import type { CodexThreadRecord } from "./codex-state.js";
 import type { TelegramWorkSource } from "./telegram-job-ingress.js";
@@ -152,7 +153,7 @@ function validJobProjection(job: TelegramJob): boolean {
 }
 
 function validResponsePlan(job: TelegramJob): boolean {
-  if (!job.responsePlan || !Number.isSafeInteger(job.version) || job.version < 0 || typeof job.id !== "string" || !job.id) {
+  if (!job.responsePlan || !Number.isSafeInteger(job.version) || job.version < 1 || typeof job.id !== "string" || !job.id) {
     return false;
   }
   const ids = new Set<string>();
@@ -165,7 +166,11 @@ function validResponsePlan(job: TelegramJob): boolean {
 }
 
 function validThread(threadId: unknown, thread: CodexThreadRecord | null): thread is CodexThreadRecord {
-  return thread !== null && typeof threadId === "string" && threadId.length > 0 && thread.id === threadId;
+  return thread !== null
+    && typeof threadId === "string" && threadId.length > 0 && thread.id === threadId
+    && typeof thread.title === "string" && thread.title.trim().length > 0
+    && typeof thread.cwd === "string" && path.isAbsolute(thread.cwd)
+    && path.resolve(thread.cwd) !== path.parse(path.resolve(thread.cwd)).root;
 }
 
 function sameSource(source: TelegramWorkSource, job: TelegramJob): boolean {

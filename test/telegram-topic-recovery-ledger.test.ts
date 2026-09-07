@@ -174,6 +174,57 @@ describe("Telegram topic recovery ledger", () => {
     expect(fixture.store.listTopicRecoveries([state])).toEqual([recovery]);
   });
 
+  test("resumes a due rate-limited recovery with one versioned compare-and-swap", () => {
+    const fixture = reservedFixture(open());
+    const waiting = fixture.store.deferTopicRecovery({
+      ...outcomeInput(fixture), nextAttemptAt: NOW + 60,
+    });
+
+    const resumed = fixture.store.resumeTopicRecovery({
+      jobId: fixture.job.id, expectedVersion: waiting.currentJobVersion,
+      actionToken: waiting.actionToken, updatedAt: NOW + 60,
+    });
+
+    expect(resumed.recovery).toMatchObject({
+      state: "in_flight", nextAttemptAt: null, reasonCode: null,
+      currentJobVersion: waiting.currentJobVersion + 1,
+    });
+    expect(resumed.job).toMatchObject({
+      version: waiting.currentJobVersion + 1,
+      attention: { kind: "required", code: "TOPIC_RECOVERY_IN_FLIGHT", actions: ["inspect"] },
+    });
+  });
+
+  it.each([
+    ["early deadline", (waiting: TelegramTopicRecoveryRecord) => ({ updatedAt: waiting.nextAttemptAt! - 1 })],
+    ["stale version", (waiting: TelegramTopicRecoveryRecord) => ({ expectedVersion: waiting.currentJobVersion - 1 })],
+    ["stale token", () => ({ actionToken: "wrong-token" })],
+  ])("rolls back a retry resume on %s", (_name, override) => {
+    const fixture = reservedFixture(open());
+    const waiting = fixture.store.deferTopicRecovery({ ...outcomeInput(fixture), nextAttemptAt: NOW + 60 });
+    const before = snapshot(databasePath);
+    expect(() => fixture.store.resumeTopicRecovery({
+      jobId: fixture.job.id, expectedVersion: waiting.currentJobVersion,
+      actionToken: waiting.actionToken, updatedAt: NOW + 60, ...override(waiting),
+    })).toThrow();
+    expect(snapshot(databasePath)).toEqual(before);
+  });
+
+  test("rolls back a retry resume from a stale recovery state", () => {
+    const fixture = reservedFixture(open());
+    const waiting = fixture.store.deferTopicRecovery({ ...outcomeInput(fixture), nextAttemptAt: NOW + 60 });
+    const resumed = fixture.store.resumeTopicRecovery({
+      jobId: fixture.job.id, expectedVersion: waiting.currentJobVersion,
+      actionToken: waiting.actionToken, updatedAt: NOW + 60,
+    });
+    const before = snapshot(databasePath);
+    expect(() => fixture.store.resumeTopicRecovery({
+      jobId: fixture.job.id, expectedVersion: resumed.job.version,
+      actionToken: waiting.actionToken, updatedAt: NOW + 61,
+    })).toThrow();
+    expect(snapshot(databasePath)).toEqual(before);
+  });
+
   it.each([
     ["rate limit with stale version", (fixture: ReturnType<typeof reservedFixture>) => fixture.store.deferTopicRecovery({
       ...outcomeInput(fixture), expectedVersion: fixture.reserved.job.version - 1, nextAttemptAt: NOW + 60,
@@ -232,6 +283,17 @@ describe("Telegram topic recovery ledger", () => {
     expect(raw(databasePath, (db) => db.prepare("PRAGMA foreign_key_check").all())).toEqual([]);
     expect(raw(databasePath, (db) => db.prepare("SELECT count(*) AS count FROM job_quarantine").get()))
       .toEqual({ count: 0 });
+  });
+
+  test("rolls back reservation for a noncanonical but normalizable raw anchor plan", () => {
+    const fixture = recoverable(open(), "job-1", 1);
+    mutate("UPDATE status_anchor_plans SET payload_json = ' ' || payload_json WHERE job_id = 'job-1'");
+    const before = snapshot(databasePath);
+    expect(() => fixture.store.reserveTopicRecovery({
+      candidate: fixture.candidate, eventId: "reserve-noncanonical",
+      actionToken: "token-noncanonical", eventAt: NOW + 20,
+    })).toThrow();
+    expect(snapshot(databasePath)).toEqual(before);
   });
 
   test("strictly decodes records and permits read-only inspection but not mutation", () => {

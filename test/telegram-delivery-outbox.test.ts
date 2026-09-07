@@ -143,6 +143,7 @@ describe("TelegramDeliveryOutbox", () => {
   function downgradeToV5WithoutAnchorPlans(): void {
     const raw = new Database(path.join(directory, "jobs.sqlite"));
     try {
+      raw.exec("DROP TABLE IF EXISTS topic_recoveries");
       const planTable = raw.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'status_anchor_plans'")
         .get();
       if (planTable) raw.exec("DROP TABLE status_anchor_plans");

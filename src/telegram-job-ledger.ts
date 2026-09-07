@@ -35,7 +35,7 @@ import type {
 } from "./telegram-job-types.js";
 import { TelegramTopicRecoveryLedger } from "./telegram-topic-recovery-ledger.js";
 import type {
-  CompleteTopicRecoveryInput, DeferTopicRecoveryInput, ReserveTopicRecoveryInput,
+  CompleteTopicRecoveryInput, DeferTopicRecoveryInput, ReserveTopicRecoveryInput, ResumeTopicRecoveryInput,
   TelegramTopicRecoveryCompletion, TelegramTopicRecoveryRecord, TelegramTopicRecoveryResult,
   TelegramTopicRecoveryState, TopicRecoveryOutcomeInput,
 } from "./telegram-topic-recovery-ledger.js";
@@ -51,7 +51,7 @@ export type {
 } from "./telegram-delivery-ledger.js";
 export type { ReplanRichDeliveryInput, ReplanRichDeliveryResult } from "./telegram-delivery-replan.js";
 export type {
-  CompleteTopicRecoveryInput, DeferTopicRecoveryInput, ReserveTopicRecoveryInput,
+  CompleteTopicRecoveryInput, DeferTopicRecoveryInput, ReserveTopicRecoveryInput, ResumeTopicRecoveryInput,
   TelegramTopicRecoveryCompletion, TelegramTopicRecoveryRecord, TelegramTopicRecoveryResult,
   TelegramTopicRecoveryState, TopicRecoveryOutcomeInput,
 } from "./telegram-topic-recovery-ledger.js";
@@ -683,6 +683,10 @@ export class SqliteTelegramJobStore {
 
   deferTopicRecovery(input: DeferTopicRecoveryInput): TelegramTopicRecoveryRecord {
     this.assertOpen(); return this.topicRecoveryLedger.defer(input);
+  }
+
+  resumeTopicRecovery(input: ResumeTopicRecoveryInput): TelegramTopicRecoveryResult {
+    this.assertOpen(); return this.topicRecoveryLedger.resume(input);
   }
 
   markTopicRecoveryUnknown(input: TopicRecoveryOutcomeInput): TelegramTopicRecoveryRecord {

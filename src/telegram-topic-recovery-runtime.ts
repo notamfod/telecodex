@@ -17,8 +17,7 @@ import type {
 } from "./telegram-topic-recovery-ledger.js";
 import type { TelegramWorkSource } from "./telegram-job-ingress.js";
 
-const DEFAULT_CREATION_TIMEOUT_MS = 30_000;
-const MAX_CREATION_TIMEOUT_MS = 300_000;
+const DEFAULT_CREATION_TIMEOUT_MS = 30_000, MAX_CREATION_TIMEOUT_MS = 300_000;
 const OPERATION_CANCELLED = Symbol("telegram-topic-recovery-operation-cancelled");
 
 type TopicRecoveryStore = Pick<
@@ -49,12 +48,10 @@ export interface TelegramTopicRecoveryRuntimeOptions {
   readonly store: TopicRecoveryStore;
   readonly forumChatId: number;
   readonly hasThreadTopicBinding: (
-    threadId: string,
-    destination: TelegramTopicDestination,
+    threadId: string, destination: TelegramTopicDestination,
   ) => boolean;
   readonly probeForumTopic: (
-    destination: TelegramTopicDestination,
-    signal: AbortSignal,
+    destination: TelegramTopicDestination, signal: AbortSignal,
   ) => Promise<boolean>;
   readonly createForumTopic: (input: {
     readonly chatId: number;
@@ -63,14 +60,10 @@ export interface TelegramTopicRecoveryRuntimeOptions {
   }) => Promise<TelegramTopicDestination>;
   readonly getThread: (threadId: string) => CodexThreadRecord | null;
   readonly rebindThreadTopic: (
-    oldContextKey: string,
-    newContextKey: string,
-    thread: CodexThreadRecord,
+    oldContextKey: string, newContextKey: string, thread: CodexThreadRecord,
   ) => void;
   readonly sendWelcome: (
-    destination: TelegramTopicDestination,
-    topicName: string,
-    signal: AbortSignal,
+    destination: TelegramTopicDestination, topicName: string, signal: AbortSignal,
   ) => Promise<void>;
   readonly outboxPump: () => Promise<void>;
   readonly now?: () => number;
@@ -243,8 +236,7 @@ export function createTelegramTopicRecoveryRuntime(
   };
 
   const runOwnedOperation = <T>(
-    operation: (signal: AbortSignal) => Promise<T>,
-    timeoutMessage: string,
+    operation: (signal: AbortSignal) => Promise<T>, timeoutMessage: string,
   ): Promise<T> => {
     const controller = new AbortController();
     return new Promise((resolve, reject) => {
@@ -287,10 +279,8 @@ export function createTelegramTopicRecoveryRuntime(
     });
   };
 
-  const createTopic = (
-    chatId: number,
-    topicName: string,
-  ): Promise<TelegramTopicDestination> => runOwnedOperation(
+  const createTopic = (chatId: number, topicName: string): Promise<TelegramTopicDestination> =>
+    runOwnedOperation(
     (signal) => options.createForumTopic({ chatId, topicName, signal }),
     "Telegram topic creation result is unknown",
   );
@@ -318,10 +308,7 @@ export function createTelegramTopicRecoveryRuntime(
 
     let target: TelegramTopicDestination;
     try {
-      target = await createTopic(
-        result.recovery.oldDestination.chatId,
-        candidate.topicName,
-      );
+      target = await createTopic(result.recovery.oldDestination.chatId, candidate.topicName);
       if (disposed) return;
       if (!validTarget(target, result.recovery.oldDestination)) {
         markUnknown(result);

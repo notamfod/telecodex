@@ -118,13 +118,31 @@ describe("TelegramTopicRecoveryRuntime", () => {
     expect(harness.store.completeTopicRecovery).toHaveBeenCalledOnce();
   });
 
-  it("repairs only the local binding for a complete recovery", async () => {
+  it("repairs only a missing new local binding for a complete recovery", async () => {
     const harness = createHarness({ initialRecoveryState: "complete" });
     const runtime = createTelegramTopicRecoveryRuntime(harness.options);
 
     await runtime.reconcile();
 
     expect(harness.rebindThreadTopic).toHaveBeenCalledOnce();
+    expect(harness.options.hasThreadTopicBinding).toHaveBeenCalledWith(harness.thread.id, NEW);
+    expect(harness.probeForumTopic).not.toHaveBeenCalled();
+    expect(harness.createForumTopic).not.toHaveBeenCalled();
+    expect(harness.sendWelcome).not.toHaveBeenCalled();
+    expect(harness.outboxPump).not.toHaveBeenCalled();
+  });
+
+  it("does not mutate an already-correct completed binding during restart reconciliation", async () => {
+    const harness = createHarness({
+      initialRecoveryState: "complete",
+      newBindingPresent: true,
+    });
+    const runtime = createTelegramTopicRecoveryRuntime(harness.options);
+
+    await runtime.reconcile();
+
+    expect(harness.options.hasThreadTopicBinding).toHaveBeenCalledWith(harness.thread.id, NEW);
+    expect(harness.rebindThreadTopic).not.toHaveBeenCalled();
     expect(harness.probeForumTopic).not.toHaveBeenCalled();
     expect(harness.createForumTopic).not.toHaveBeenCalled();
     expect(harness.sendWelcome).not.toHaveBeenCalled();
@@ -202,6 +220,7 @@ function createHarness(options: {
   threadDisappearsAfterPlanning?: boolean;
   forumChatId?: number;
   bindingPresent?: boolean;
+  newBindingPresent?: boolean;
 } = {}) {
   const thread: CodexThreadRecord = {
     id: "thread-1",
@@ -335,7 +354,10 @@ function createHarness(options: {
   const runtimeOptions = {
     store,
     forumChatId: options.forumChatId ?? OLD.chatId,
-    hasThreadTopicBinding: vi.fn(() => options.bindingPresent ?? true),
+    hasThreadTopicBinding: vi.fn((_threadId, destination) =>
+      destination.messageThreadId === NEW.messageThreadId
+        ? options.newBindingPresent ?? false
+        : options.bindingPresent ?? true),
     probeForumTopic,
     createForumTopic,
     getThread,

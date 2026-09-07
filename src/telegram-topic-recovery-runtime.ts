@@ -317,6 +317,15 @@ export function createTelegramTopicRecoveryRuntime(
             report(current.jobId, "TOPIC_RECOVERY_BIND_FAILED");
             return;
           }
+          if (current.newMessageThreadId === null) {
+            report(current.jobId, "TOPIC_RECOVERY_BIND_FAILED");
+            return;
+          }
+          const destination = {
+            chatId: current.oldDestination.chatId,
+            messageThreadId: current.newMessageThreadId,
+          };
+          if (options.hasThreadTopicBinding(thread.id, destination)) return;
           try { bind(current, thread); }
           catch { report(current.jobId, "TOPIC_RECOVERY_BIND_FAILED"); }
         });

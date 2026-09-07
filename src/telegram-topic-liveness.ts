@@ -31,7 +31,7 @@ export function createForumTopicLivenessProbe(options: ForumTopicLivenessOptions
   const timeoutMs = positiveInteger(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, "timeoutMs");
   const cacheTtlMs = positiveInteger(options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS, "cacheTtlMs");
   const cache = new Map<string, { readonly value: boolean; readonly expiresAt: number }>();
-  const inFlight = new Map<string, Promise<boolean>>();
+  const inFlight = new Map<string, SharedRequest>();
 
   return (
     destination: ForumTopicDestination,
@@ -40,28 +40,84 @@ export function createForumTopicLivenessProbe(options: ForumTopicLivenessOptions
     validateDestination(destination);
     const key = `${destination.chatId}:${destination.messageThreadId}`;
     const currentTime = now();
+    for (const [cachedKey, cachedValue] of cache) {
+      if (cachedValue.expiresAt <= currentTime) cache.delete(cachedKey);
+    }
     const cached = cache.get(key);
     if (cached && currentTime < cached.expiresAt) return Promise.resolve(cached.value);
-    if (cached) cache.delete(key);
-    const pending = inFlight.get(key);
-    if (pending) return abortForCaller(pending, callerSignal);
+    let request = inFlight.get(key);
+    if (!request) {
+      request = createSharedRequest(
+        key,
+        destination,
+        options.sendChatAction,
+        timeoutMs,
+        cache,
+        cacheTtlMs,
+        now,
+        inFlight,
+      );
+    }
+    return subscribe(request, callerSignal);
+  };
+}
 
-    let resolveRequest!: (value: boolean) => void;
-    let rejectRequest!: (error: unknown) => void;
-    const request = new Promise<boolean>((resolve, reject) => {
+interface SharedRequest {
+  readonly promise: Promise<boolean>;
+  readonly controller: AbortController;
+  readonly subscribers: Set<symbol>;
+  cancel(): void;
+  settled: boolean;
+}
+
+function createSharedRequest(
+  key: string,
+  destination: ForumTopicDestination,
+  sendChatAction: ForumTopicLivenessOptions["sendChatAction"],
+  timeoutMs: number,
+  cache: Map<string, { readonly value: boolean; readonly expiresAt: number }>,
+  cacheTtlMs: number,
+  now: () => number,
+  inFlight: Map<string, SharedRequest>,
+): SharedRequest {
+  const controller = new AbortController();
+  let resolveRequest!: (value: boolean) => void;
+  let rejectRequest!: (error: unknown) => void;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const request: SharedRequest = {
+    promise: new Promise<boolean>((resolve, reject) => {
       resolveRequest = resolve;
       rejectRequest = reject;
-    });
-    void request.catch(() => {});
-    inFlight.set(key, request);
-
-    void withDeadline(async (signal) => {
+    }),
+    controller,
+    subscribers: new Set<symbol>(),
+    cancel: () => {},
+    settled: false,
+  };
+  void request.promise.catch(() => {});
+  inFlight.set(key, request);
+  const finish = (complete: () => void) => {
+    if (request.settled) return;
+    request.settled = true;
+    if (inFlight.get(key) === request) inFlight.delete(key);
+    complete();
+  };
+  request.cancel = () => {
+    controller.abort();
+    if (timer !== undefined) clearTimeout(timer);
+    finish(() => rejectRequest(new Error("Telegram topic probe aborted")));
+  };
+  timer = setTimeout(() => {
+    controller.abort();
+    finish(() => rejectRequest(new Error("Telegram topic probe timed out")));
+  }, timeoutMs);
+  const operation = (async () => {
       try {
-        await options.sendChatAction(
+        await sendChatAction(
           destination.chatId,
           "typing",
           { message_thread_id: destination.messageThreadId },
-          signal,
+          controller.signal,
         );
         return true;
       } catch (error) {
@@ -69,82 +125,54 @@ export function createForumTopicLivenessProbe(options: ForumTopicLivenessOptions
         if (isMissingForumTopicError(error)) return false;
         throw error;
       }
-    }, timeoutMs, callerSignal).then(
+    })();
+  operation.then(
       (value) => {
-        if (inFlight.get(key) === request) inFlight.delete(key);
-        cache.set(key, { value, expiresAt: now() + cacheTtlMs });
-        resolveRequest(value);
+        clearTimeout(timer);
+        finish(() => {
+          cache.set(key, { value, expiresAt: now() + cacheTtlMs });
+          resolveRequest(value);
+        });
       },
       (error) => {
-        if (inFlight.get(key) === request) inFlight.delete(key);
-        rejectRequest(error);
+        clearTimeout(timer);
+        finish(() => rejectRequest(error));
       },
-    );
-    return request;
-  };
+  );
+  return request;
 }
 
-function abortForCaller<T>(promise: Promise<T>, callerSignal?: AbortSignal): Promise<T> {
-  if (callerSignal === undefined) return promise;
-  return new Promise<T>((resolve, reject) => {
+function subscribe(request: SharedRequest, callerSignal?: AbortSignal): Promise<boolean> {
+  const token = Symbol();
+  request.subscribers.add(token);
+  const subscription = new Promise<boolean>((resolve, reject) => {
     let settled = false;
-    const cleanup = () => callerSignal.removeEventListener("abort", abort);
+    const cleanup = () => callerSignal?.removeEventListener("abort", abort);
     const finish = (complete: () => void) => {
       if (settled) return;
       settled = true;
-      cleanup();
-      complete();
-    };
-    const abort = () => finish(() => reject(new Error("Telegram topic probe aborted")));
-    if (callerSignal.aborted) {
-      abort();
-      return;
-    }
-    callerSignal.addEventListener("abort", abort, { once: true });
-    promise.then(
-      (value) => finish(() => resolve(value)),
-      (error) => finish(() => reject(error)),
-    );
-  });
-}
-
-function withDeadline<T>(
-  operation: (signal: AbortSignal) => Promise<T>,
-  timeoutMs: number,
-  callerSignal?: AbortSignal,
-): Promise<T> {
-  const controller = new AbortController();
-  return new Promise<T>((resolve, reject) => {
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const cleanup = () => {
-      if (timer !== undefined) clearTimeout(timer);
-      callerSignal?.removeEventListener("abort", abort);
-    };
-    const finish = (complete: () => void) => {
-      if (settled) return;
-      settled = true;
+      request.subscribers.delete(token);
       cleanup();
       complete();
     };
     const abort = () => {
-      controller.abort();
       finish(() => reject(new Error("Telegram topic probe aborted")));
+      if (request.subscribers.size === 0 && !request.settled) {
+        request.cancel();
+      }
     };
     if (callerSignal?.aborted) {
       abort();
       return;
     }
     callerSignal?.addEventListener("abort", abort, { once: true });
-    timer = setTimeout(() => {
-      controller.abort();
-      finish(() => reject(new Error("Telegram topic probe timed out")));
-    }, timeoutMs);
-    operation(controller.signal).then(
+    request.promise.then(
       (value) => finish(() => resolve(value)),
       (error) => finish(() => reject(error)),
     );
   });
+  void subscription.catch(() => {});
+  return subscription;
 }
 
 function validateDestination(destination: ForumTopicDestination): void {

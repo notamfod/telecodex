@@ -146,6 +146,27 @@ describe("forum topic liveness", () => {
     expect(sendChatAction).toHaveBeenCalledOnce();
   });
 
+  it("keeps the shared request alive when the initiating caller aborts", async () => {
+    let release!: () => void;
+    const pending = new Promise<true>((resolve) => { release = () => resolve(true); });
+    let requestSignal: AbortSignal | undefined;
+    const sendChatAction = vi.fn((_chatId, _action, _options, signal) => {
+      requestSignal = signal;
+      return pending;
+    });
+    const probe = createForumTopicLivenessProbe({ sendChatAction });
+    const firstController = new AbortController();
+    const first = probe(destination, firstController.signal);
+    const second = probe(destination);
+
+    firstController.abort();
+    await expect(first).rejects.toThrow("Telegram topic probe aborted");
+    expect(requestSignal?.aborted).toBe(false);
+    release();
+    await expect(second).resolves.toBe(true);
+    expect(sendChatAction).toHaveBeenCalledOnce();
+  });
+
   it("caches a missing result and expires that negative cache", async () => {
     let now = 1_000;
     const sendChatAction = vi.fn().mockRejectedValue(new Error("TOPIC_DELETED"));

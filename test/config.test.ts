@@ -38,6 +38,7 @@ describe("loadConfig", () => {
     delete process.env.TOPIC_SYNC_INTERVAL_SECONDS;
     delete process.env.TELEGRAM_MAX_ACTIVE_TOPICS;
     delete process.env.TELEGRAM_PROGRESS_HEARTBEAT_SECONDS;
+    delete process.env.TELEGRAM_TOPIC_RECOVERY_ENABLED;
     delete process.env.STATUS_BOARD_INTERVAL_SECONDS;
     delete process.env.TELEGRAM_JOB_STORE_MODE;
     delete process.env.TELEGRAM_JOB_DB_PATH;
@@ -151,6 +152,7 @@ describe("loadConfig", () => {
       telegramWeeklyTokenLimit: undefined,
       enableTelegramLogin: false,
       enableTelegramReactions: false,
+      telegramTopicRecoveryEnabled: false,
       telegramForumChatId: -1001234567890,
       topicSyncIntervalMs: 15_000,
       topicSyncEnabled: true,
@@ -216,6 +218,7 @@ describe("loadConfig", () => {
     expect(config.telegramWeeklyTokenLimit).toBeUndefined();
     expect(config.enableTelegramLogin).toBe(false);
     expect(config.enableTelegramReactions).toBe(false);
+    expect(config.telegramTopicRecoveryEnabled).toBe(false);
     expect(config.telegramForumChatId).toBeUndefined();
     expect(config.topicSyncIntervalMs).toBe(30_000);
     expect(config.telegramMaxActiveTopics).toBe(4);
@@ -626,6 +629,31 @@ describe("loadConfig", () => {
     const config = loadConfig();
     expect(config.enableTelegramReactions).toBe(false);
   });
+
+  it("keeps Telegram topic recovery disabled unless explicitly enabled", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+
+    expect(loadConfig().telegramTopicRecoveryEnabled).toBe(false);
+
+    process.env.TELEGRAM_TOPIC_RECOVERY_ENABLED = "true";
+    expect(loadConfig().telegramTopicRecoveryEnabled).toBe(true);
+  });
+
+  it.each(["1", "yes", "TRUE-ish", "x".repeat(256)])(
+    "fails closed for invalid TELEGRAM_TOPIC_RECOVERY_ENABLED=%s",
+    (value) => {
+      process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+      process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+      process.env.TELEGRAM_TOPIC_RECOVERY_ENABLED = value;
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      expect(loadConfig().telegramTopicRecoveryEnabled).toBe(false);
+      expect(warning).toHaveBeenCalledOnce();
+      expect(warning.mock.calls[0]?.[0]).toMatch(/^Invalid boolean env value: .{1,160}$/);
+      expect(warning.mock.calls[0]?.[0]).not.toContain(value);
+    },
+  );
 
   it("parses SHOW_TURN_TOKEN_USAGE boolean values", () => {
     process.env.TELEGRAM_BOT_TOKEN = "bot-token";

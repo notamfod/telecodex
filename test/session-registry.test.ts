@@ -127,6 +127,7 @@ describe("SessionRegistry", () => {
     showTurnTokenUsage: false,
     enableTelegramLogin: true,
     enableTelegramReactions: false,
+    telegramTopicRecoveryEnabled: false,
     telegramMaxActiveTopics: 4,
     telegramProgressHeartbeatMs: 120_000,
     ...overrides,

@@ -83,6 +83,7 @@ export interface TeleCodexConfig {
   telegramWeeklyTokenLimit?: number;
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
+  telegramTopicRecoveryEnabled: boolean;
   telegramForumChatId?: number;
   statusBoardIntervalMs: number;
   miniApp?: MiniAppConfig;
@@ -158,6 +159,11 @@ export function loadConfig(): TeleCodexConfig {
   const enableTelegramReactions = parseBooleanEnv(
     optionalString(process.env.ENABLE_TELEGRAM_REACTIONS),
     false,
+  );
+  const telegramTopicRecoveryEnabled = parseBooleanEnv(
+    optionalString(process.env.TELEGRAM_TOPIC_RECOVERY_ENABLED),
+    false,
+    { strict: true, name: "TELEGRAM_TOPIC_RECOVERY_ENABLED" },
   );
   const telegramForumChatId = parseTelegramForumChatId(
     optionalString(process.env.TELEGRAM_FORUM_CHAT_ID),
@@ -240,6 +246,7 @@ export function loadConfig(): TeleCodexConfig {
     telegramWeeklyTokenLimit,
     enableTelegramLogin,
     enableTelegramReactions,
+    telegramTopicRecoveryEnabled,
     telegramForumChatId,
     statusBoardIntervalMs,
     miniApp,
@@ -557,20 +564,26 @@ function parseIntegerSetting(
   return value;
 }
 
-function parseBooleanEnv(raw: string | undefined, defaultValue: boolean): boolean {
+function parseBooleanEnv(
+  raw: string | undefined,
+  defaultValue: boolean,
+  options: { readonly strict?: boolean; readonly name?: string } = {},
+): boolean {
   if (!raw) {
     return defaultValue;
   }
 
   const lower = raw.toLowerCase();
-  if (lower === "true" || lower === "1" || lower === "yes") {
+  if (lower === "true" || (!options.strict && (lower === "1" || lower === "yes"))) {
     return true;
   }
-  if (lower === "false" || lower === "0" || lower === "no") {
+  if (lower === "false" || (!options.strict && (lower === "0" || lower === "no"))) {
     return false;
   }
 
-  console.warn(`Invalid boolean env value: "${raw}". Falling back to ${defaultValue}.`);
+  console.warn(options.name
+    ? `Invalid boolean env value: ${options.name}. Falling back to ${defaultValue}.`
+    : `Invalid boolean env value: "${raw.slice(0, 80)}". Falling back to ${defaultValue}.`);
   return defaultValue;
 }
 

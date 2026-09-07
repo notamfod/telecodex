@@ -395,6 +395,8 @@ describe("Telegram topic recovery ledger", () => {
     ["nullable-field mismatch", "reason_code = 'NOT_NULL'"],
     ["out-of-range destination", "old_message_thread_id = 0"],
     ["unsafe reason code", "state = 'failed', reason_code = 'password=credential'"],
+    ["unknown state with failed reason", "state = 'unknown', reason_code = 'TOPIC_RECOVERY_FAILED'"],
+    ["failed state with unknown reason", "state = 'failed', reason_code = 'TOPIC_RECOVERY_UNKNOWN'"],
   ])("rejects a strictly malformed recovery row with %s", (_name, assignment) => {
     const fixture = reservedFixture(open());
     mutate(`UPDATE topic_recoveries SET ${assignment} WHERE job_id = 'job-1'`);

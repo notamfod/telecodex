@@ -368,8 +368,8 @@ function decodeRecovery(row: Record<string, unknown>): TelegramTopicRecoveryReco
     if (recovery.state === "retry_wait" && (recovery.newMessageThreadId !== null
       || recovery.nextAttemptAt === null || recovery.nextAttemptAt <= recovery.updatedAt
       || recovery.reasonCode !== "TOPIC_RECOVERY_RATE_LIMITED")) invalidRow();
-    if ((recovery.state === "unknown" || recovery.state === "failed")
-      && (recovery.newMessageThreadId !== null || recovery.nextAttemptAt !== null || recovery.reasonCode === null)) invalidRow();
+    if ((recovery.state === "unknown" || recovery.state === "failed") && (recovery.newMessageThreadId !== null
+      || recovery.nextAttemptAt !== null || recovery.reasonCode !== (recovery.state === "unknown" ? "TOPIC_RECOVERY_UNKNOWN" : "TOPIC_RECOVERY_FAILED"))) invalidRow();
     if (recovery.state === "complete" && (recovery.newMessageThreadId === null
       || recovery.newMessageThreadId === recovery.oldDestination.messageThreadId
       || recovery.nextAttemptAt !== null || recovery.reasonCode !== null)) invalidRow();

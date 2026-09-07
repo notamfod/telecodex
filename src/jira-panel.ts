@@ -25,11 +25,13 @@ export interface JiraPanelMessage {
 
 export interface JiraPanelLocation {
   messageId?: number;
+  cleanupMessageIds?: number[];
 }
 
 export interface JiraPanelStore {
   read(): JiraPanelLocation;
   write(location: JiraPanelLocation): void;
+  withLock<T>(action: () => Promise<T>): Promise<T>;
 }
 
 export interface JiraPanelOptions {
@@ -38,8 +40,9 @@ export interface JiraPanelOptions {
   client: JiraClientPort;
   send(message: JiraPanelMessage): Promise<number>;
   edit(messageId: number, message: JiraPanelMessage): Promise<void>;
-  pin(messageId: number): Promise<void>;
+  remove(messageId: number): Promise<void>;
   store: JiraPanelStore;
+  miniAppLaunchUrl?: string;
   logger?: Pick<Console, "warn">;
 }
 
@@ -57,7 +60,12 @@ export class JiraPanel {
   }
 
   open(): Promise<JiraPanelPublishResult> {
-    return this.publish(renderHome(), true);
+    return moveJiraPanelMessage(renderHome(this.options.miniAppLaunchUrl), {
+      send: this.options.send,
+      remove: this.options.remove,
+      store: this.options.store,
+      logger: this.logger,
+    });
   }
 
   async openSafely(): Promise<void> {
@@ -74,11 +82,11 @@ export class JiraPanel {
 
     const request = parseCallback(data);
     if (!request) {
-      await this.publish(renderError("Неизвестное действие Jira", "jira:home"));
+      await this.updateExisting(renderError("Неизвестное действие Jira", "jira:home"));
       return true;
     }
     if (request.view === "home") {
-      await this.open();
+      await this.updateExisting(renderHome(this.options.miniAppLaunchUrl));
       return true;
     }
 
@@ -104,58 +112,117 @@ export class JiraPanel {
     } catch (error) {
       message = renderError(describe(error), retryCallback(data));
     }
-    await this.publish(message);
+    await this.updateExisting(message);
     return true;
   }
 
-  private async publish(
-    message: JiraPanelMessage,
-    repin: boolean = false,
-  ): Promise<JiraPanelPublishResult> {
-    const saved = this.options.store.read();
-    if (saved.messageId !== undefined) {
+  private async updateExisting(message: JiraPanelMessage): Promise<void> {
+    await this.options.store.withLock<void>(async () => {
+      const saved = this.options.store.read();
+      if (saved.messageId === undefined) return;
       try {
         await this.options.edit(saved.messageId, message);
-        if (repin) await this.pinSafely(saved.messageId);
-        return "edited";
       } catch (error) {
         if (!isMissingMessage(error)) throw error;
       }
-    }
-
-    const messageId = await this.options.send(message);
-    this.options.store.write({ messageId });
-    await this.pinSafely(messageId);
-    return "sent";
-  }
-
-  private async pinSafely(messageId: number): Promise<void> {
-    try {
-      await this.options.pin(messageId);
-    } catch (error) {
-      this.logger.warn(`Failed to pin Jira panel: ${describe(error)}`);
-    }
+    });
   }
 }
 
-export function renderHome(): JiraPanelMessage {
+interface MoveJiraPanelOptions {
+  send(message: JiraPanelMessage): Promise<number>;
+  remove(messageId: number): Promise<void>;
+  store: JiraPanelStore;
+  logger?: Pick<Console, "warn">;
+}
+
+export async function moveJiraPanelMessage(
+  message: JiraPanelMessage,
+  options: MoveJiraPanelOptions,
+): Promise<JiraPanelPublishResult> {
+  return options.store.withLock<JiraPanelPublishResult>(async () => {
+    const saved = options.store.read();
+    const messageId = await options.send(message);
+    const cleanupMessageIds = [...new Set([
+      ...(saved.cleanupMessageIds ?? []),
+      saved.messageId,
+    ].filter((value): value is number => value !== undefined && value !== messageId))];
+    try {
+      options.store.write({
+        messageId,
+        ...(cleanupMessageIds.length ? { cleanupMessageIds } : {}),
+      });
+    } catch (error) {
+      try {
+        await options.remove(messageId);
+      } catch (cleanupError) {
+        (options.logger ?? console).warn(
+          `Failed to remove untracked Jira panel: ${describe(cleanupError)}`,
+        );
+      }
+      throw error;
+    }
+
+    const remaining: number[] = [];
+    for (const previousMessageId of cleanupMessageIds) {
+      try {
+        await options.remove(previousMessageId);
+      } catch (error) {
+        remaining.push(previousMessageId);
+        (options.logger ?? console).warn(
+          `Failed to remove previous Jira panel: ${describe(error)}`,
+        );
+      }
+    }
+    if (remaining.length !== cleanupMessageIds.length) {
+      options.store.write({
+        messageId,
+        ...(remaining.length ? { cleanupMessageIds: remaining } : {}),
+      });
+    }
+    return "sent";
+  });
+}
+
+export async function removeJiraLauncherMessage(
+  unpin: () => Promise<unknown>,
+  remove: () => Promise<unknown>,
+  logger: Pick<Console, "warn"> = console,
+): Promise<void> {
+  let unpinError: unknown;
+  try {
+    await unpin();
+  } catch (error) {
+    unpinError = error;
+  }
+  try {
+    await remove();
+  } catch (removeError) {
+    if (unpinError !== undefined) {
+      throw new Error(
+        `unpin failed: ${describe(unpinError)}; delete failed: ${describe(removeError)}`,
+      );
+    }
+    logger.warn(`Previous Jira panel was unpinned but could not be deleted: ${describe(removeError)}`);
+  }
+}
+
+export function jiraMiniAppLaunchUrl(launchUrl: string): string {
+  const url = new URL(launchUrl);
+  url.searchParams.set("startapp", "jira");
+  return url.toString();
+}
+
+export function renderHome(miniAppLaunchUrl?: string): JiraPanelMessage {
   return {
     html: [
       "<b>Jira · mircli</b>",
-      "",
-      "Спринт, канбан и сохранённые фильтры.",
-      "Данные кэшируются на 4 часа. Кнопка обновления запрашивает Jira принудительно.",
+      "Мой спринт, канбан и фильтры в Mini App.",
     ].join("\n"),
     rows: [
-      [
-        { text: "📋 Мой спринт", callbackData: "jira:my-sprint:0" },
-        { text: "🏃 Текущий спринт", callbackData: "jira:sprint:0" },
-      ],
-      [
-        { text: "🗂 Канбан", callbackData: "jira:kanban:0" },
-        { text: "⭐ Мои фильтры", callbackData: "jira:filters:0" },
-      ],
-      [{ text: "🔄 Обновить", callbackData: "jira:refresh:my-sprint:0" }],
+      ...(miniAppLaunchUrl
+        ? [[{ text: "Открыть Jira", url: miniAppLaunchUrl }]]
+        : []),
     ],
   };
 }

@@ -3,6 +3,8 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const RESULT_LIMIT = "100";
+const SPRINT_RESULT_LIMIT = "500";
+const BACKLOG_JQL = "project = MIR AND statusCategory != Done AND (sprint IS EMPTY OR sprint in futureSprints()) ORDER BY created DESC, key DESC";
 
 export interface JiraCacheMetadata {
   cached: boolean;
@@ -39,10 +41,26 @@ export interface JiraIssueList extends JiraCacheMetadata {
   issues: JiraIssue[];
 }
 
-export interface JiraIssueResult extends JiraIssue, JiraCacheMetadata {}
+export interface JiraComment {
+  author: string;
+  created: string;
+  body: string;
+}
+
+export interface JiraIssueResult extends JiraIssue, JiraCacheMetadata {
+  description?: string;
+  comments?: JiraComment[];
+}
 
 export interface JiraSprintResult extends JiraIssueList {
   sprints: JiraSprint[];
+}
+
+export interface JiraBacklogResult extends JiraIssueList {
+  jql: string;
+  start_at: number;
+  limit: number;
+  returned: number;
 }
 
 export interface JiraFilterSummary {
@@ -77,8 +95,10 @@ export interface JiraKanbanResult extends JiraCacheMetadata {
 }
 
 export interface JiraClientPort {
+  getIssue(key: string, refresh: boolean): Promise<JiraIssueResult>;
   getMySprint(refresh: boolean): Promise<JiraFilterResult>;
   getSprint(refresh: boolean): Promise<JiraSprintResult>;
+  getBacklog(startAt: number, limit: number, refresh: boolean): Promise<JiraBacklogResult>;
   getKanban(refresh: boolean): Promise<JiraKanbanResult>;
   getFilters(refresh: boolean): Promise<JiraFiltersResult>;
   runFilter(id: string, refresh: boolean): Promise<JiraFilterResult>;
@@ -114,9 +134,36 @@ export class JiraClient implements JiraClientPort {
 
   getSprint(refresh: boolean): Promise<JiraSprintResult> {
     return this.run(
-      ["sprint", "--limit", RESULT_LIMIT, ...refreshFlag(refresh)],
+      [
+        "sprint",
+        "--project",
+        "MIR",
+        "--limit",
+        SPRINT_RESULT_LIMIT,
+        ...refreshFlag(refresh),
+      ],
       isSprintResult,
       "sprint",
+    );
+  }
+
+  getBacklog(startAt: number, limit: number, refresh: boolean): Promise<JiraBacklogResult> {
+    if (!Number.isSafeInteger(startAt) || startAt < 0
+      || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      return Promise.reject(new Error("Invalid Jira backlog page"));
+    }
+    return this.run(
+      [
+        "search",
+        BACKLOG_JQL,
+        "--start-at",
+        String(startAt),
+        "--limit",
+        String(limit),
+        ...refreshFlag(refresh),
+      ],
+      (value): value is JiraBacklogResult => isBacklogResult(value, startAt, limit),
+      "backlog",
     );
   }
 
@@ -201,7 +248,19 @@ function isIssue(value: unknown): value is JiraIssue {
 }
 
 function isIssueResult(value: unknown): value is JiraIssueResult {
-  return isRecord(value) && hasCacheMetadata(value) && isIssue(value);
+  return isRecord(value)
+    && hasCacheMetadata(value)
+    && isIssue(value)
+    && (value.description === undefined || typeof value.description === "string")
+    && (value.comments === undefined
+      || (Array.isArray(value.comments) && value.comments.every(isComment)));
+}
+
+function isComment(value: unknown): value is JiraComment {
+  return isRecord(value)
+    && typeof value.author === "string"
+    && typeof value.created === "string"
+    && typeof value.body === "string";
 }
 
 function isIssueList(value: Record<string, unknown>): boolean {
@@ -223,6 +282,22 @@ function isSprintResult(value: unknown): value is JiraSprintResult {
     && isIssueList(value)
     && Array.isArray(value.sprints)
     && value.sprints.every(isSprint);
+}
+
+function isBacklogResult(
+  value: unknown,
+  requestedStartAt: number,
+  requestedLimit: number,
+): value is JiraBacklogResult {
+  return isRecord(value)
+    && isIssueList(value)
+    && value.jql === BACKLOG_JQL
+    && Number.isSafeInteger(value.total) && (value.total as number) >= 0
+    && value.start_at === requestedStartAt
+    && value.limit === requestedLimit
+    && Number.isSafeInteger(value.returned)
+    && (value.returned as number) <= requestedLimit
+    && value.returned === (value.issues as unknown[]).length;
 }
 
 function isFilterSummary(value: unknown): value is JiraFilterSummary {

@@ -2,7 +2,11 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { loadConfig } from "../src/config.js";
+import {
+  loadConfig,
+  parseReliabilityTimeoutConfig,
+  parseSessionGuardianSocketPath,
+} from "../src/config.js";
 
 describe("loadConfig", () => {
   const originalEnv = process.env;
@@ -34,18 +38,30 @@ describe("loadConfig", () => {
     delete process.env.TOPIC_SYNC_INTERVAL_SECONDS;
     delete process.env.TELEGRAM_MAX_ACTIVE_TOPICS;
     delete process.env.TELEGRAM_PROGRESS_HEARTBEAT_SECONDS;
+    delete process.env.STATUS_BOARD_INTERVAL_SECONDS;
+    delete process.env.TELEGRAM_JOB_STORE_MODE;
+    delete process.env.TELEGRAM_JOB_DB_PATH;
+    delete process.env.TELEGRAM_JOB_LEGACY_JSON_PATH;
+    delete process.env.TELEGRAM_JOB_MAX_ATTEMPTS;
+    delete process.env.TELEGRAM_JOB_PAYLOAD_RETENTION_DAYS;
+    delete process.env.TELEGRAM_JOB_METADATA_RETENTION_DAYS;
+    delete process.env.TELEGRAM_JOB_RETENTION_INITIAL_DELAY_SECONDS;
+    delete process.env.MINI_APP_LAUNCH_URL;
+    delete process.env.MINI_APP_HOST;
+    delete process.env.MINI_APP_PORT;
+    delete process.env.MINI_APP_AUTH_MAX_AGE_SECONDS;
     delete process.env.JIRA_PANEL_CHAT_ID;
     delete process.env.JIRA_PANEL_TOPIC_ID;
     delete process.env.JIRA_CLIENT_PATH;
+    delete process.env.JIRA_PANEL_WORKSPACE;
     delete process.env.JIRA_COMMENT_SERVER;
     delete process.env.JIRA_COMMENT_LOGIN;
     delete process.env.JIRA_COMMENT_TOKEN;
-    delete process.env.SENTRY_URL;
-    delete process.env.SENTRY_TOKEN;
-    delete process.env.SENTRY_ORG;
-    delete process.env.SENTRY_BRIDGE_MAP_JSON;
-    delete process.env.SENTRY_BRIDGE_INTERVAL_SECONDS;
-    delete process.env.SENTRY_BRIDGE_LIMIT;
+    delete process.env.SESSION_GUARDIAN_SOCKET_PATH;
+    delete process.env.APP_SERVER_CONNECT_TIMEOUT_SECONDS;
+    delete process.env.APP_SERVER_REQUEST_TIMEOUT_SECONDS;
+    delete process.env.APP_SERVER_TURN_START_TIMEOUT_SECONDS;
+    delete process.env.TELEGRAM_DELIVERY_TIMEOUT_SECONDS;
     delete process.env.container;
   });
 
@@ -88,8 +104,18 @@ describe("loadConfig", () => {
       telegramAllowedUserIds: [123, 456],
       telegramAllowedUserIdSet: new Set([123, 456]),
       workspace: process.cwd(),
+      telegramJobs: {
+        storeMode: "json",
+        databasePath: path.join(process.cwd(), ".telecodex", "jobs.sqlite"),
+        legacyJsonPath: path.join(process.cwd(), ".telecodex", "jobs.json"),
+        maxAttempts: 5,
+        payloadRetentionDays: 7,
+        metadataRetentionDays: 90,
+        retentionInitialDelaySeconds: 0,
+      },
       maxFileSize: 20 * 1024 * 1024,
       codexApiKey: "secret-key",
+      threadReopenCommand: undefined,
       codexModel: "o3",
       modelChoices: [],
       defaultModelChoiceId: undefined,
@@ -130,10 +156,20 @@ describe("loadConfig", () => {
       topicSyncEnabled: true,
       telegramMaxActiveTopics: 4,
       telegramProgressHeartbeatMs: 120_000,
-      statusBoardIntervalMs: 30_000,
+      statusBoardIntervalMs: 5_000,
+      miniApp: undefined,
+      gitlabUrl: undefined,
+      gitlabToken: undefined,
+      gitlabGroupId: undefined,
+      gitlabWorkspaceRoot: undefined,
       jiraPanel: undefined,
       jiraComment: undefined,
-      sentryBridge: undefined,
+      reliabilityTimeouts: {
+        appServerConnectMs: 10_000,
+        appServerRequestMs: 15_000,
+        appServerTurnStartMs: 30_000,
+        telegramDeliveryMs: 30_000,
+      },
     });
   });
 
@@ -184,10 +220,124 @@ describe("loadConfig", () => {
     expect(config.topicSyncIntervalMs).toBe(30_000);
     expect(config.telegramMaxActiveTopics).toBe(4);
     expect(config.telegramProgressHeartbeatMs).toBe(120_000);
+    expect(config.statusBoardIntervalMs).toBe(5_000);
+    expect(config.miniApp).toBeUndefined();
     expect(config.workspace).toBe(process.cwd());
     expect(config.jiraPanel).toBeUndefined();
     expect(config.jiraComment).toBeUndefined();
-    expect(config.sentryBridge).toBeUndefined();
+    expect(config.sessionGuardianSocketPath).toBeUndefined();
+    expect(config.reliabilityTimeouts).toEqual({
+      appServerConnectMs: 10_000,
+      appServerRequestMs: 15_000,
+      appServerTurnStartMs: 30_000,
+      telegramDeliveryMs: 30_000,
+    });
+  });
+
+  it("parses bounded reliability deadlines in seconds", () => {
+    expect(parseReliabilityTimeoutConfig({
+      APP_SERVER_CONNECT_TIMEOUT_SECONDS: "12",
+      APP_SERVER_REQUEST_TIMEOUT_SECONDS: "20",
+      APP_SERVER_TURN_START_TIMEOUT_SECONDS: "45",
+      TELEGRAM_DELIVERY_TIMEOUT_SECONDS: "50",
+    })).toEqual({
+      appServerConnectMs: 12_000,
+      appServerRequestMs: 20_000,
+      appServerTurnStartMs: 45_000,
+      telegramDeliveryMs: 50_000,
+    });
+  });
+
+  it.each([
+    ["APP_SERVER_CONNECT_TIMEOUT_SECONDS", "0"],
+    ["APP_SERVER_REQUEST_TIMEOUT_SECONDS", "1.5"],
+    ["APP_SERVER_TURN_START_TIMEOUT_SECONDS", "301"],
+    ["TELEGRAM_DELIVERY_TIMEOUT_SECONDS", "Infinity"],
+  ])("rejects invalid bounded deadline %s=%s", (name, value) => {
+    expect(() => parseReliabilityTimeoutConfig({ [name]: value })).toThrow(name);
+  });
+
+  it("parses explicit Telegram job authority, paths, retry, and retention settings", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_JOB_STORE_MODE = "sqlite";
+    process.env.TELEGRAM_JOB_DB_PATH = "/var/lib/telecodex/jobs.sqlite";
+    process.env.TELEGRAM_JOB_LEGACY_JSON_PATH = "/var/lib/telecodex/jobs.json";
+    process.env.TELEGRAM_JOB_MAX_ATTEMPTS = "9";
+    process.env.TELEGRAM_JOB_PAYLOAD_RETENTION_DAYS = "14";
+    process.env.TELEGRAM_JOB_METADATA_RETENTION_DAYS = "120";
+    process.env.TELEGRAM_JOB_RETENTION_INITIAL_DELAY_SECONDS = "86400";
+
+    expect(loadConfig().telegramJobs).toEqual({
+      storeMode: "sqlite",
+      databasePath: "/var/lib/telecodex/jobs.sqlite",
+      legacyJsonPath: "/var/lib/telecodex/jobs.json",
+      maxAttempts: 9,
+      payloadRetentionDays: 14,
+      metadataRetentionDays: 120,
+      retentionInitialDelaySeconds: 86_400,
+    });
+  });
+
+  it.each([
+    ["TELEGRAM_JOB_STORE_MODE", "invalid"],
+    ["TELEGRAM_JOB_DB_PATH", "relative.sqlite"],
+    ["TELEGRAM_JOB_MAX_ATTEMPTS", "0"],
+    ["TELEGRAM_JOB_PAYLOAD_RETENTION_DAYS", "0"],
+    ["TELEGRAM_JOB_METADATA_RETENTION_DAYS", "6"],
+    ["TELEGRAM_JOB_RETENTION_INITIAL_DELAY_SECONDS", "604801"],
+  ])("rejects invalid %s before startup", (name, value) => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env[name] = value;
+
+    expect(() => loadConfig()).toThrow();
+  });
+
+  it("parses an optional absolute session guardian socket path", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_FORUM_CHAT_ID = "-1001234567890";
+    process.env.SESSION_GUARDIAN_SOCKET_PATH = "/run/user/0/codex-guardian.sock";
+
+    expect(loadConfig().sessionGuardianSocketPath).toBe(
+      "/run/user/0/codex-guardian.sock",
+    );
+  });
+
+  it.each(["relative.sock", "./guardian.sock"])(
+    "rejects non-absolute session guardian socket path %s",
+    (value) => {
+      process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+      process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+      process.env.SESSION_GUARDIAN_SOCKET_PATH = value;
+
+      expect(() => loadConfig()).toThrow(
+        "SESSION_GUARDIAN_SOCKET_PATH must be an absolute path",
+      );
+    },
+  );
+
+  it("validates guardian socket emptiness, NUL bytes, and Unix path length precisely", () => {
+    expect(() => parseSessionGuardianSocketPath("   ")).toThrow(
+      "SESSION_GUARDIAN_SOCKET_PATH must be non-empty",
+    );
+    expect(() => parseSessionGuardianSocketPath("/run/bad\0socket")).toThrow(
+      "SESSION_GUARDIAN_SOCKET_PATH must not contain NUL",
+    );
+    expect(() => parseSessionGuardianSocketPath(`/${"x".repeat(107)}`)).toThrow(
+      "SESSION_GUARDIAN_SOCKET_PATH must be at most 107 bytes",
+    );
+  });
+
+  it("requires the configured forum chat when the guardian adapter is enabled", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.SESSION_GUARDIAN_SOCKET_PATH = "/run/user/0/codex-guardian.sock";
+
+    expect(() => loadConfig()).toThrow(
+      "SESSION_GUARDIAN_SOCKET_PATH requires TELEGRAM_FORUM_CHAT_ID",
+    );
   });
 
   it("parses the Jira panel topic and executable", () => {
@@ -196,6 +346,7 @@ describe("loadConfig", () => {
     process.env.JIRA_PANEL_CHAT_ID = "-1003981282865";
     process.env.JIRA_PANEL_TOPIC_ID = "999";
     process.env.JIRA_CLIENT_PATH = "/opt/jira-client";
+    process.env.JIRA_PANEL_WORKSPACE = "/root/dev/Projects/mircli";
 
     const config = loadConfig();
 
@@ -203,6 +354,7 @@ describe("loadConfig", () => {
       chatId: -1003981282865,
       topicId: 999,
       clientPath: "/opt/jira-client",
+      workspace: "/root/dev/Projects/mircli",
     });
   });
 
@@ -232,48 +384,6 @@ describe("loadConfig", () => {
     delete process.env.JIRA_COMMENT_TOKEN;
     expect(() => loadConfig()).toThrow(
       "JIRA_COMMENT_SERVER, JIRA_COMMENT_LOGIN, and JIRA_COMMENT_TOKEN must be configured together",
-    );
-  });
-
-  it("parses a complete Sentry bridge configuration", () => {
-    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
-    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
-    process.env.SENTRY_URL = "https://sentry.example.test";
-    process.env.SENTRY_TOKEN = "token";
-    process.env.SENTRY_ORG = "mircli";
-    process.env.SENTRY_BRIDGE_MAP_JSON = JSON.stringify({
-      "mir-back": { inboxContextKey: "-100123:537", workspace: "/work/mircli" },
-    });
-    process.env.SENTRY_BRIDGE_INTERVAL_SECONDS = "300";
-    process.env.SENTRY_BRIDGE_LIMIT = "2";
-
-    expect(loadConfig().sentryBridge).toEqual({
-      baseUrl: "https://sentry.example.test",
-      token: "token",
-      org: "mircli",
-      mappings: {
-        "mir-back": { inboxContextKey: "-100123:537", workspace: "/work/mircli" },
-      },
-      intervalMs: 300_000,
-      limit: 2,
-    });
-  });
-
-  it("rejects partial or too-frequent Sentry bridge configuration", () => {
-    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
-    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
-    process.env.SENTRY_URL = "https://sentry.example.test";
-
-    expect(() => loadConfig()).toThrow("Sentry bridge credentials and map must be configured together");
-
-    process.env.SENTRY_TOKEN = "token";
-    process.env.SENTRY_ORG = "mircli";
-    process.env.SENTRY_BRIDGE_MAP_JSON = JSON.stringify({
-      "mir-back": { inboxContextKey: "-100123:537", workspace: "/work/mircli" },
-    });
-    process.env.SENTRY_BRIDGE_INTERVAL_SECONDS = "299";
-    expect(() => loadConfig()).toThrow(
-      "SENTRY_BRIDGE_INTERVAL_SECONDS must be an integer of at least 300",
     );
   });
 
@@ -319,11 +429,54 @@ describe("loadConfig", () => {
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
     process.env.TELEGRAM_MAX_ACTIVE_TOPICS = "6";
     process.env.TELEGRAM_PROGRESS_HEARTBEAT_SECONDS = "90";
+    process.env.STATUS_BOARD_INTERVAL_SECONDS = "12";
 
     const config = loadConfig();
 
     expect(config.telegramMaxActiveTopics).toBe(6);
     expect(config.telegramProgressHeartbeatMs).toBe(90_000);
+    expect(config.statusBoardIntervalMs).toBe(12_000);
+  });
+
+  it("enables the Mini App server when a launch URL is configured", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_FORUM_CHAT_ID = "-1001234567890";
+    process.env.MINI_APP_LAUNCH_URL = "https://t.me/telecodex_bot/dashboard?startapp=dashboard";
+    process.env.MINI_APP_HOST = "0.0.0.0";
+    process.env.MINI_APP_PORT = "8787";
+    process.env.MINI_APP_AUTH_MAX_AGE_SECONDS = "600";
+
+    expect(loadConfig().miniApp).toEqual({
+      launchUrl: "https://t.me/telecodex_bot/dashboard?startapp=dashboard",
+      host: "0.0.0.0",
+      port: 8787,
+      authMaxAgeSeconds: 600,
+      staticDir: path.join(process.cwd(), "dist-web"),
+    });
+  });
+
+  it("rejects unsafe Mini App launch URLs and invalid ports", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_FORUM_CHAT_ID = "-1001234567890";
+    process.env.MINI_APP_LAUNCH_URL = "http://example.test/dashboard";
+
+    expect(() => loadConfig()).toThrow("MINI_APP_LAUNCH_URL must use https");
+
+    process.env.MINI_APP_LAUNCH_URL = "https://t.me/telecodex_bot/dashboard";
+    process.env.MINI_APP_PORT = "0";
+    expect(() => loadConfig()).toThrow("MINI_APP_PORT must be an integer of at least 1");
+  });
+
+  it("requires a forum chat for Mini App topic actions", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.MINI_APP_LAUNCH_URL = "https://t.me/telecodex_bot/dashboard";
+
+    expect(() => loadConfig()).toThrow(
+      "MINI_APP_LAUNCH_URL requires TELEGRAM_FORUM_CHAT_ID",
+    );
   });
 
   it("rejects invalid Telegram concurrency and heartbeat settings", () => {
@@ -549,7 +702,7 @@ describe("loadConfig", () => {
         webSearch: "disabled",
       },
     ]);
-    process.env.CODEX_DEFAULT_MODEL_CHOICE = "glm-53";
+    process.env.CODEX_DEFAULT_MODEL_CHOICE = "openai-default";
 
     const config = loadConfig();
 
@@ -562,7 +715,21 @@ describe("loadConfig", () => {
       supportsImages: false,
       webSearch: "disabled",
     });
-    expect(config.defaultModelChoiceId).toBe("glm-53");
+    expect(config.defaultModelChoiceId).toBe("openai-default");
+  });
+
+  it("rejects a non-OpenAI default while model selection is disabled", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_MODEL_CHOICES_JSON = JSON.stringify([
+      { id: "openai", label: "OpenAI", provider: "openai", model: "gpt" },
+      { id: "glm", label: "GLM", provider: "zai", model: "glm" },
+    ]);
+    process.env.CODEX_DEFAULT_MODEL_CHOICE = "glm";
+
+    expect(() => loadConfig()).toThrow(
+      "CODEX_DEFAULT_MODEL_CHOICE must use the openai provider",
+    );
   });
 
   it("uses the first configured choice when no explicit default is set", () => {

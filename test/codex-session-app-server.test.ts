@@ -2,7 +2,7 @@ import { vi } from "vitest";
 
 import type { AppServerNotification } from "../src/app-server-client.js";
 import type { AppServerTurnRequest } from "../src/app-server-turn-manager.js";
-import { createDefaultLaunchProfile } from "../src/codex-launch.js";
+import { createDefaultLaunchProfile, createLaunchProfile } from "../src/codex-launch.js";
 import { CodexSessionService } from "../src/codex-session.js";
 import type { TeleCodexConfig } from "../src/config.js";
 
@@ -12,6 +12,10 @@ class FakeClient {
   async connect(): Promise<void> {}
 
   onNotification(_listener: (notification: AppServerNotification) => void): () => void {
+    return () => {};
+  }
+
+  onDisconnect(_listener: () => void): () => void {
     return () => {};
   }
 }
@@ -241,6 +245,79 @@ describe("CodexSessionService with shared app-server", () => {
     );
     expect(info.threadId).toBe("thread-new");
     expect(turnManager.trackThread).toHaveBeenCalledWith("thread-new", "idle");
+  });
+
+  it("forks a read-only thread into a writable profile while preserving its history", async () => {
+    const client = new FakeClient();
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "thread/resume") {
+        return {
+          thread: { id: "thread-readonly", status: { type: "idle" } },
+          cwd: "/workspace/existing",
+          model: "gpt-5.6-sol",
+          modelProvider: "openai",
+          approvalPolicy: "never",
+          sandbox: { type: "readOnly" },
+          reasoningEffort: "high",
+        };
+      }
+      if (method === "thread/fork") {
+        return {
+          thread: { id: "thread-implementation", status: { type: "idle" } },
+          cwd: "/workspace/existing",
+          model: "gpt-5.6-sol",
+          modelProvider: "openai",
+          approvalPolicy: "never",
+          sandbox: { type: "dangerFullAccess" },
+          reasoningEffort: "high",
+        };
+      }
+      return {};
+    });
+    const turnManager = new FakeTurnManager();
+    const config = createConfig();
+    config.launchProfiles.push(
+      createLaunchProfile({
+        id: "readonly",
+        label: "Read Only",
+        sandboxMode: "read-only",
+        approvalPolicy: "never",
+      }),
+      createLaunchProfile({
+        id: "implementation",
+        label: "Implementation",
+        sandboxMode: "danger-full-access",
+        approvalPolicy: "never",
+      }),
+    );
+    const session = await CodexSessionService.create(
+      config,
+      {
+        resumeThreadId: "thread-readonly",
+        workspace: "/workspace/existing",
+        launchProfileId: "readonly",
+      },
+      { client, turnManager },
+    );
+
+    const info = await session.forkThread("implementation");
+
+    expect(client.request).toHaveBeenCalledWith("thread/fork", {
+      threadId: "thread-readonly",
+      cwd: "/workspace/existing",
+      model: "gpt-5.6-sol",
+      modelProvider: "openai",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+      config: { model_reasoning_effort: "high" },
+    });
+    expect(info).toEqual(expect.objectContaining({
+      threadId: "thread-implementation",
+      launchProfileId: "implementation",
+      sandboxMode: "danger-full-access",
+      approvalPolicy: "never",
+    }));
+    expect(turnManager.trackThread).toHaveBeenCalledWith("thread-implementation", "idle");
   });
 
   it("reattaches callbacks to a persisted active turn", async () => {

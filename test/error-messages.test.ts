@@ -42,7 +42,8 @@ describe("error-messages", () => {
 
     it("translates model not found", () => {
       const result = translateError(new Error("404 model not found"));
-      expect(result.userMessage).toContain("/model");
+      expect(result.userMessage).toContain("/new");
+      expect(result.userMessage).not.toContain("/model");
     });
 
     it("translates timeout", () => {

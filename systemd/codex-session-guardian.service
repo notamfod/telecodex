@@ -1,0 +1,20 @@
+[Unit]
+Description=Monitor and recover stalled Codex sessions
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Documents/Codex/2026-08-07-hermes/telecodex
+Environment=HOME=/root
+ExecStartPre=/usr/bin/test -x /usr/bin/flock
+ExecStart=/usr/bin/node /root/Documents/Codex/2026-08-07-hermes/telecodex/dist/session-guardian.js
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

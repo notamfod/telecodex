@@ -13,6 +13,9 @@ describe("discoverReviewProjects", () => {
       if (args[0] === "rev-parse" && args[1] === "--git-dir" && !cwd.endsWith("artifacts")) {
         return ".git\n";
       }
+      if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+        return `${cwd}\n`;
+      }
       throw new Error("not a repository");
     });
 
@@ -24,6 +27,25 @@ describe("discoverReviewProjects", () => {
     expect(projects).toEqual([
       { name: "mir-back", sourcePath: "/srv/mircli/mir-back" },
       { name: "mir-widget", sourcePath: "/srv/mircli/mir-widget" },
+    ]);
+  });
+
+  it("ignores directories that only inherit the parent repository", async () => {
+    const git = vi.fn(async (cwd: string, args: string[]) => {
+      if (args[0] === "rev-parse" && args[1] === "--git-dir") return ".git\n";
+      if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+        return cwd.endsWith("artifacts") ? "/srv/mircli\n" : `${cwd}\n`;
+      }
+      throw new Error("unexpected git call");
+    });
+
+    const projects = await discoverReviewProjects("/srv/mircli", {
+      listDirectories: async () => ["mir-back", "artifacts"],
+      git,
+    });
+
+    expect(projects).toEqual([
+      { name: "mir-back", sourcePath: "/srv/mircli/mir-back" },
     ]);
   });
 });

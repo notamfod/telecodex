@@ -122,7 +122,7 @@ export function listUserThreads(limit = 100): CodexThreadRecord[] {
 
 export function listRecentRootThreads(
   since: Date,
-  limit = 100,
+  limit?: number,
 ): RecentCodexThreadRecord[] {
   return withDatabase((db) => {
     const query = db.prepare(`
@@ -132,10 +132,11 @@ export function listRecentRootThreads(
         AND updated_at >= ?
         AND (source IS NULL OR source NOT LIKE '%"subagent"%')
       ORDER BY updated_at DESC
-      LIMIT ?
+      ${limit === undefined ? "" : "LIMIT ?"}
     `);
 
-    const rows = query.all(Math.floor(since.getTime() / 1000), limit) as ThreadRow[];
+    const sinceSeconds = Math.floor(since.getTime() / 1000);
+    const rows = (limit === undefined ? query.all(sinceSeconds) : query.all(sinceSeconds, limit)) as ThreadRow[];
     return rows.map((row) => ({
       ...mapThreadRow(row),
       source: sourceLabel(row.source),

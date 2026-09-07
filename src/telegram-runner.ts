@@ -13,3 +13,27 @@ export function startTelegramRunner(bot: Bot<Context>): RunnerHandle {
     sink: { concurrency: RUNNER_UPDATE_CONCURRENCY },
   });
 }
+
+type StartTelegramRunner = (bot: Bot<Context>) => RunnerHandle;
+
+export function startTelegramRunnerAfterReconciliation(
+  bot: Bot<Context>,
+  reconcileUnfinishedJobs: () => Promise<void>,
+  start?: StartTelegramRunner,
+): Promise<RunnerHandle>;
+export function startTelegramRunnerAfterReconciliation(
+  bot: Bot<Context>,
+  reconcileUnfinishedJobs: () => Promise<void>,
+  start: StartTelegramRunner,
+  shouldStart: () => boolean,
+): Promise<RunnerHandle | undefined>;
+export async function startTelegramRunnerAfterReconciliation(
+  bot: Bot<Context>,
+  reconcileUnfinishedJobs: () => Promise<void>,
+  start: StartTelegramRunner = startTelegramRunner,
+  shouldStart: () => boolean = () => true,
+): Promise<RunnerHandle | undefined> {
+  await reconcileUnfinishedJobs();
+  if (!shouldStart()) return undefined;
+  return start(bot);
+}

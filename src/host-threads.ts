@@ -2,9 +2,11 @@ import type { HostThreadView, WaitingOn } from "./status-board.js";
 
 /** Loaded threads are the only ones that can be running, so this stays small. */
 const MAX_LOADED_THREADS = 100;
+const HOST_REQUEST_TIMEOUT_MS = 500;
+const HOST_READ_CONCURRENCY = 20;
 
 export interface HostThreadClient {
-  request<T>(method: string, params?: unknown): Promise<T>;
+  request<T>(method: string, params?: unknown, options?: { readonly timeoutMs?: number }): Promise<T>;
 }
 
 /**
@@ -33,17 +35,31 @@ export async function listHostThreads(
 ): Promise<{ threads: HostThreadView[]; activeSince: Map<string, number> }> {
   const loaded = await client.request<{ data: string[] }>("thread/loaded/list", {
     limit: options.limit ?? MAX_LOADED_THREADS,
-  });
+  }, { timeoutMs: HOST_REQUEST_TIMEOUT_MS });
 
-  const threads: HostThreadView[] = [];
-  for (const threadId of loaded.data ?? []) {
-    try {
-      const response = await client.request<{ thread?: unknown }>("thread/read", { threadId });
-      threads.push(toView(asRecord(response.thread ?? response), threadId, options));
-    } catch {
-      // One unreadable thread must not blank out the whole board.
-    }
-  }
+  const threadIds = (loaded.data ?? []).slice(0, options.limit ?? MAX_LOADED_THREADS);
+  const results: Array<HostThreadView | undefined> = new Array(threadIds.length);
+  let cursor = 0;
+  await Promise.all(Array.from(
+    { length: Math.min(HOST_READ_CONCURRENCY, threadIds.length) },
+    async () => {
+      while (cursor < threadIds.length) {
+        const index = cursor++;
+        const threadId = threadIds[index]!;
+        try {
+          const response = await client.request<{ thread?: unknown }>(
+            "thread/read",
+            { threadId },
+            { timeoutMs: HOST_REQUEST_TIMEOUT_MS },
+          );
+          results[index] = toView(asRecord(response.thread ?? response), threadId, options);
+        } catch {
+          // One unreadable thread must not blank out the whole board.
+        }
+      }
+    },
+  ));
+  const threads = results.filter((thread): thread is HostThreadView => thread !== undefined);
 
   const activeSince = trackActiveSince(options.activeSince, threads, options.now);
   return {

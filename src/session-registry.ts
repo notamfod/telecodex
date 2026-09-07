@@ -39,6 +39,7 @@ export class SessionRegistry {
     this.persistPath = path.join(config.workspace, ".telecodex", "contexts.json");
     this.sessionDependencies = sessionDependencies ?? createCodexSessionDependencies(
       config.telegramMaxActiveTopics,
+      config.reliabilityTimeouts,
     );
     this.loadPersistedMetadata();
   }
@@ -57,16 +58,19 @@ export class SessionRegistry {
     const meta = this.metadata.get(contextKey);
     const launchProfileId = resolveLaunchProfileId(this.config, meta);
     const modelProvider = meta?.modelProvider ?? (meta?.model ? "openai" : undefined);
+    const resumeThreadId = modelProvider === undefined || modelProvider === "openai"
+      ? meta?.threadId ?? undefined
+      : undefined;
     const creation = CodexSessionService.create(this.config, {
       workspace: meta?.workspace,
-      model: meta?.model,
-      modelProvider,
-      modelChoiceId: meta?.modelChoiceId,
+      model: resumeThreadId ? meta?.model : undefined,
+      modelProvider: resumeThreadId ? modelProvider : undefined,
+      modelChoiceId: resumeThreadId ? meta?.modelChoiceId : undefined,
       reasoningEffort: meta?.reasoningEffort,
       launchProfileId,
       topicName: meta?.topicName,
-      deferThreadStart: options?.deferThreadStart && !meta?.threadId,
-      resumeThreadId: meta?.threadId ?? undefined,
+      deferThreadStart: options?.deferThreadStart && !resumeThreadId,
+      resumeThreadId,
     }, this.sessionDependencies);
     this.sessionCreations.set(contextKey, creation);
 
@@ -117,6 +121,13 @@ export class SessionRegistry {
     return this.sessionDependencies.client;
   }
 
+  async checkAppServerConnectivity(timeoutMs: number): Promise<void> {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
+      throw new Error("Invalid app-server connectivity timeout");
+    }
+    await this.sessionDependencies.client.request("server/diagnostics", {}, { timeoutMs });
+  }
+
   listContexts(): ContextMetadata[] {
     return [...this.metadata.values()].sort((left, right) => right.updatedAt - left.updatedAt);
   }
@@ -142,6 +153,8 @@ export class SessionRegistry {
     contextKey: TelegramContextKey,
     defaults: { workspace: string; launchProfileId?: string; topicName?: string },
   ): void {
+    const cached = this.sessions.get(contextKey);
+    cached?.applyDeferredDefaults(defaults);
     this.metadata.set(contextKey, {
       contextKey,
       threadId: null,

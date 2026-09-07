@@ -1,11 +1,19 @@
 import { escapeHTML } from "./format.js";
 import { topicUrl } from "./projects.js";
-import type { RunningTask, StatusSnapshot, WaitingOn } from "./status-board.js";
+import type { RunningTask, StatusSnapshot, WaitingOn } from "./status-board-snapshot.js";
+import type {
+  TelegramStatusAction,
+  TelegramStatusActionKind,
+} from "./telegram-status-projection.js";
+import { telegramStatusActionCallbackData } from "./telegram-grammy-transport.js";
 import { containsSecret, workspaceLabel } from "./topic-sync.js";
 
 const MAX_LABEL_LENGTH = 40;
+const TELEGRAM_MESSAGE_UTF16_LIMIT = 4096;
 export const STATUS_BOARD_BUTTON_LIMIT = 8;
 const HIDDEN_LABEL = "(скрыто)";
+
+type ProjectedJobRow = NonNullable<StatusSnapshot["jobs"]>[number];
 
 export type BoardButton =
   | { text: string; url: string; callbackData?: never }
@@ -22,7 +30,22 @@ export interface RenderedBoard {
   buttons: BoardButton[];
 }
 
-export function renderStatusBoard(snapshot: StatusSnapshot, chatId: number): RenderedBoard {
+export function renderMiniAppLauncher(launchUrl: string): RenderedBoard {
+  return {
+    body: "📊 <b>TeleCodex Dashboard</b>\n\nСтатусы и действия теперь доступны в Mini App.",
+    buttons: [{ text: "Открыть Dashboard", url: launchUrl }],
+  };
+}
+
+export function renderStatusBoard(
+  snapshot: StatusSnapshot,
+  chatId: number,
+  miniAppLaunchUrl?: string,
+): RenderedBoard {
+  const launcherButtons: BoardButton[] = miniAppLaunchUrl
+    ? [{ text: "Открыть Dashboard", url: miniAppLaunchUrl }]
+    : [];
+  const statusButtonLimit = STATUS_BOARD_BUTTON_LIMIT - launcherButtons.length;
   const waiting = snapshot.running.reduce(
     (count, task) => count + Number(Boolean(task.waitingOn))
       + task.children.filter((child) => child.waitingOn).length,
@@ -38,7 +61,7 @@ export function renderStatusBoard(snapshot: StatusSnapshot, chatId: number): Ren
     .filter(Boolean)
     .join(" · ");
 
-  const sections: string[] = [heading];
+  const sections: string[] = [];
 
   if (snapshot.running.length > 0) {
     sections.push([
@@ -85,23 +108,119 @@ export function renderStatusBoard(snapshot: StatusSnapshot, chatId: number): Ren
     ].join("\n"));
   }
 
-  sections.push([
+  const systemSection = [
     "<b>Система</b>",
     snapshot.codexAvailable ? "🟢 Codex app-server" : "🔴 Codex app-server недоступен",
     snapshot.failedJobs24h > 0
       ? `⚠️ Задачи · ошибок ${snapshot.failedJobs24h} за 24ч`
       : "🟢 Задачи · без ошибок за 24ч",
-  ].join("\n"));
+  ].join("\n");
 
+  const { body, visibleJobs } = boundedBoardBody(
+    heading,
+    snapshot.jobs ?? [],
+    sections,
+    systemSection,
+    snapshot,
+    statusButtonLimit,
+  );
+  const jobButtons = projectedJobButtons(visibleJobs, statusButtonLimit);
   const actionable = [...snapshot.running, ...snapshot.recentThreads];
+  const remainingButtons = statusButtonLimit - jobButtons.length;
 
   return {
-    body: sections.join("\n\n"),
-    buttons: actionable
+    body,
+    buttons: [
+      ...launcherButtons,
+      ...jobButtons,
+      ...actionable
       .filter((task): task is typeof task & { threadId: string } => Boolean(task.threadId))
-      .slice(0, STATUS_BOARD_BUTTON_LIMIT)
+      .slice(0, remainingButtons)
       .map((task) => actionButton(task, chatId)),
+    ],
   };
+}
+
+function boundedBoardBody(
+  heading: string,
+  jobs: readonly ProjectedJobRow[],
+  detailSections: readonly string[],
+  systemSection: string,
+  snapshot: StatusSnapshot,
+  buttonLimit: number,
+): { readonly body: string; readonly visibleJobs: readonly ProjectedJobRow[] } {
+  const maximumVisible = Math.min(jobs.length, buttonLimit);
+  const full = composeBoardBody(
+    heading, jobs, maximumVisible, detailSections, systemSection, snapshot.now,
+  );
+  if (full.length <= TELEGRAM_MESSAGE_UTF16_LIMIT) {
+    return { body: full, visibleJobs: jobs.slice(0, maximumVisible) };
+  }
+
+  const hiddenDetails = snapshot.running.length
+    + snapshot.running.reduce((count, task) => count + task.children.length, 0)
+    + snapshot.queued.length + snapshot.recent.length + snapshot.recentThreads.length;
+  const compactSections = hiddenDetails === 0
+    ? []
+    : [`<b>Остальное</b>\n… скрыто элементов: ${hiddenDetails}`];
+  for (let visible = maximumVisible; visible >= 0; visible -= 1) {
+    const body = composeBoardBody(
+      heading, jobs, visible, compactSections, systemSection, snapshot.now,
+    );
+    if (body.length <= TELEGRAM_MESSAGE_UTF16_LIMIT) {
+      return { body, visibleJobs: jobs.slice(0, visible) };
+    }
+  }
+  throw new Error("Status board minimum rendering exceeds Telegram limit");
+}
+
+function composeBoardBody(
+  heading: string,
+  jobs: readonly ProjectedJobRow[],
+  visibleCount: number,
+  detailSections: readonly string[],
+  systemSection: string,
+  now: number,
+): string {
+  const visible = jobs.slice(0, visibleCount);
+  const omitted = jobs.length - visible.length;
+  const jobSection = jobs.length === 0 ? [] : [[
+    "<b>Задачи TeleCodex</b>",
+    ...visible.map((job) => projectedJobText(job, now)),
+    ...(omitted > 0 ? [`… ещё задач: ${omitted}`] : []),
+  ].join("\n")];
+  return [heading, ...jobSection, ...detailSections, systemSection].join("\n\n");
+}
+
+function projectedJobButtons(
+  jobs: readonly ProjectedJobRow[],
+  buttonLimit: number,
+): BoardButton[] {
+  const allocations = jobs.map((job) => {
+    const details = job.projection.actions.find((action) => action.kind === "details") ?? {
+      kind: "details" as const,
+      jobId: job.projection.jobId,
+      expectedVersion: job.projection.expectedVersion,
+    };
+    return { job, details, selected: new Set<TelegramStatusAction>([details]) };
+  });
+  let remaining = buttonLimit - allocations.length;
+  for (const allocation of allocations) {
+    for (const action of allocation.job.projection.actions) {
+      if (remaining === 0) break;
+      if (action.kind === "details") continue;
+      allocation.selected.add(action);
+      remaining -= 1;
+    }
+  }
+  return allocations.flatMap(({ job, details, selected }) => {
+    const actions = job.projection.actions.includes(details)
+      ? job.projection.actions
+      : [...job.projection.actions, details];
+    return actions.filter((action) => selected.has(action))
+      .map((action) => projectionActionButton(job, action))
+      .filter((button): button is BoardButton => button !== null);
+  });
 }
 
 export function clock(timestamp: number): string {
@@ -119,6 +238,57 @@ function waitingNote(waitingOn: WaitingOn | undefined): string {
 
 function rowText(row: { label: string; workspace: string }): string {
   return `${escapeHTML(workspaceLabel(row.workspace))} · ${escapeHTML(label(row.label))}`;
+}
+
+function projectedJobText(
+  row: NonNullable<StatusSnapshot["jobs"]>[number],
+  now: number,
+): string {
+  const value = row.projection;
+  const facts = [
+    value.state,
+    `health ${value.health}`,
+    value.queue ? `очередь ${value.queue.position} · ${shortElapsed(value.queue.ageMs)}` : undefined,
+    value.activity
+      ? `activity ${value.activity.kind} · ${shortElapsed(value.activity.ageMs)}`
+      : undefined,
+    value.guardian.availability === "unavailable"
+      ? "guardian unavailable"
+      : value.guardian.health ? `guardian ${value.guardian.health}` : undefined,
+    value.guardian.staleForMs === null
+      ? undefined
+      : `guardian stale ${shortElapsed(value.guardian.staleForMs)}`,
+    `delivery ${value.delivery.delivered}/${value.delivery.total}`,
+    value.attention.kind === "required" ? `attention ${value.attention.code}` : undefined,
+    value.reasonCodes.length > 0 ? `reasons ${value.reasonCodes.join(", ")}` : undefined,
+    `updated ${clock(value.timestamps.updatedAt)}`,
+    value.timestamps.lastEventAt === null
+      ? undefined
+      : `event ${shortElapsed(now - value.timestamps.lastEventAt)}`,
+  ].filter((fact): fact is string => fact !== undefined);
+  return `• ${rowText(row)}\n  <code>${escapeHTML(facts.join(" · "))}</code>`;
+}
+
+function projectionActionButton(
+  row: NonNullable<StatusSnapshot["jobs"]>[number],
+  action: TelegramStatusAction,
+): BoardButton | null {
+  const projection = row.projection;
+  if (action.jobId !== projection.jobId || action.expectedVersion !== projection.expectedVersion) {
+    throw new Error("Status action does not match its projection");
+  }
+  const callbackData = telegramStatusActionCallbackData(action);
+  if (!callbackData) return null;
+  return { text: actionLabel(action.kind), callbackData };
+}
+
+function actionLabel(kind: TelegramStatusActionKind): string {
+  const labels: Record<TelegramStatusActionKind, string> = {
+    abort: "Abort", refresh: "Refresh", details: "Details", inspect: "Inspect",
+    retry_new_turn: "Retry as new turn", guardian_restore: "Guardian Restore",
+    retry_delivery: "Retry delivery", send_again_warning: "Send again with warning",
+  };
+  return labels[kind];
 }
 
 function label(raw: string): string {
@@ -153,4 +323,10 @@ function elapsed(durationMs: number): string {
   if (totalMinutes < 1) return "меньше минуты";
   if (totalMinutes < 60) return `${totalMinutes}м`;
   return `${Math.floor(totalMinutes / 60)}ч ${totalMinutes % 60}м`;
+}
+
+function shortElapsed(durationMs: number): string {
+  const safe = Math.max(0, durationMs);
+  if (safe < 60_000) return `${Math.floor(safe / 1_000)}с`;
+  return elapsed(safe);
 }

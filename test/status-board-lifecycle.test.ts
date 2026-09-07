@@ -41,7 +41,15 @@ class FakeTelegram {
   readonly pin = vi.fn<(id: number) => Promise<void>>().mockResolvedValue(undefined);
   readonly closeTopic = vi.fn<(threadId: number) => Promise<void>>().mockResolvedValue(undefined);
   readonly reopenTopic = vi.fn<(threadId: number) => Promise<void>>().mockResolvedValue(undefined);
-  readonly remove = vi.fn<(id: number) => Promise<void>>().mockResolvedValue(undefined);
+  readonly unpin = vi.fn<(id: number) => Promise<void>>().mockResolvedValue(undefined);
+  readonly removeMessage = vi.fn<(id: number) => Promise<void>>().mockResolvedValue(undefined);
+  readonly remove = vi.fn(async (
+    id: number,
+    backgroundWrite: <T>(operation: () => Promise<T>) => Promise<T>,
+  ): Promise<void> => {
+    await backgroundWrite(() => this.unpin(id));
+    await backgroundWrite(() => this.removeMessage(id));
+  });
   readonly deleteMessage = vi.fn<(id: number) => Promise<void>>().mockResolvedValue(undefined);
 }
 
@@ -66,6 +74,11 @@ const createBoard = (
   collect: () => Promise<StatusSnapshot>,
   store = createStore(),
   logger = { warn: vi.fn() },
+  now: () => number = () => NOW,
+  miniAppLaunchUrl?: string,
+  backgroundWriteGate?: {
+    run<T>(chatId: number, priority: "ordinary" | "urgent", operation: () => Promise<T>): Promise<T>;
+  },
 ): StatusBoard => new StatusBoard({
   chatId: CHAT_ID,
   intervalMs: 30_000,
@@ -79,8 +92,10 @@ const createBoard = (
   remove: telegram.remove,
   deleteMessage: telegram.deleteMessage,
   store,
-  now: () => NOW,
+  now,
   logger,
+  miniAppLaunchUrl,
+  backgroundWriteGate,
 });
 
 describe("StatusBoard lifecycle", () => {
@@ -95,13 +110,135 @@ describe("StatusBoard lifecycle", () => {
     expect(telegram.closeTopic).toHaveBeenCalledWith(42);
   });
 
+  it("routes every physical Dashboard write through one ordinary per-chat gate", async () => {
+    const telegram = new FakeTelegram();
+    const physicalOperations: string[] = [];
+    let insideGate = 0;
+    const backgroundWriteGate = {
+      run: vi.fn(async <T>(
+        chatId: number,
+        priority: "ordinary" | "urgent",
+        operation: () => Promise<T>,
+      ): Promise<T> => {
+        expect(chatId).toBe(CHAT_ID);
+        expect(priority).toBe("ordinary");
+        insideGate += 1;
+        try { return await operation(); }
+        finally { insideGate -= 1; }
+      }),
+    };
+    const physical = <T>(name: string, value: T) => async (): Promise<T> => {
+      expect(insideGate).toBe(1);
+      physicalOperations.push(name);
+      return value;
+    };
+    telegram.createTopic.mockImplementation(physical("createTopic", 42));
+    telegram.send.mockImplementation(physical("send", 777));
+    telegram.edit.mockImplementation(physical("edit", undefined));
+    telegram.pin.mockImplementation(physical("pin", undefined));
+    telegram.closeTopic.mockImplementation(physical("closeTopic", undefined));
+    telegram.reopenTopic.mockImplementation(physical("reopenTopic", undefined));
+    telegram.unpin.mockImplementation(physical("unpin", undefined));
+    telegram.removeMessage.mockImplementation(physical("removeMessage", undefined));
+    telegram.deleteMessage.mockImplementation(physical("deleteMessage", undefined));
+    let snapshot = emptySnapshot();
+    const collect = vi.fn(async () => {
+      expect(insideGate).toBe(0);
+      return snapshot;
+    });
+    const board = createBoard(
+      telegram,
+      collect,
+      createStore({ messageId: 555 }),
+      { warn: vi.fn() },
+      () => NOW,
+      undefined,
+      backgroundWriteGate,
+    );
+
+    await board.refreshOnce();
+    snapshot = emptySnapshot({ running: [task()] });
+    await board.refreshOnce();
+    telegram.edit.mockImplementationOnce(async () => {
+      expect(insideGate).toBe(1);
+      physicalOperations.push("edit");
+      throw new Error("Bad Request: message to edit not found");
+    });
+    snapshot = emptySnapshot({ running: [task({ label: "changed" })] });
+    await board.refreshOnce();
+    await board.protectTopicMessage(CHAT_ID, 42, 888);
+
+    expect(new Set(physicalOperations)).toEqual(new Set([
+      "createTopic", "send", "edit", "pin", "closeTopic", "reopenTopic",
+      "unpin", "removeMessage", "deleteMessage",
+    ]));
+    expect(backgroundWriteGate.run).toHaveBeenCalledTimes(physicalOperations.length);
+    expect(backgroundWriteGate.run.mock.calls.every(
+      ([chatId, priority]) => chatId === CHAT_ID && priority === "ordinary",
+    )).toBe(true);
+    expect(collect).toHaveBeenCalledTimes(3);
+  });
+
   it("leaves the message text alone when nothing changed", async () => {
     const telegram = new FakeTelegram();
     const board = createBoard(telegram, async () => emptySnapshot());
 
     await board.refreshOnce();
+    telegram.closeTopic.mockClear();
+    telegram.pin.mockClear();
     expect(await board.refreshOnce()).toBe("unchanged");
     expect(telegram.edit).not.toHaveBeenCalled();
+    expect(telegram.closeTopic).not.toHaveBeenCalled();
+    expect(telegram.pin).not.toHaveBeenCalled();
+  });
+
+  it("keeps the live status board visible beside the Mini App launcher", async () => {
+    const telegram = new FakeTelegram();
+    const collect = vi.fn(async () => emptySnapshot({ running: [task()] }));
+    const board = createBoard(
+      telegram,
+      collect,
+      createStore(),
+      { warn: vi.fn() },
+      () => NOW,
+      "https://t.me/telecodex_bot/dashboard?startapp=dashboard",
+    );
+
+    expect(await board.refreshOnce()).toBe("sent");
+    expect(await board.refreshOnce()).toBe("unchanged");
+    expect(collect).toHaveBeenCalledTimes(2);
+    expect(telegram.send).toHaveBeenCalledWith(42, {
+      html: expect.stringContaining("MIR-6319 оплата"),
+      buttons: expect.arrayContaining([{
+        text: "Открыть Dashboard",
+        url: "https://t.me/telecodex_bot/dashboard?startapp=dashboard",
+      }]),
+    });
+  });
+
+  it("requests topic-binding probes only during periodic health checks", async () => {
+    const telegram = new FakeTelegram();
+    let now = NOW;
+    const collect = vi.fn(async (_options?: { validateTopicBindings: boolean }) => emptySnapshot());
+    const board = createBoard(
+      telegram,
+      collect,
+      createStore(),
+      { warn: vi.fn() },
+      () => now,
+    );
+
+    await board.refreshOnce();
+    now += 30_000;
+    await board.refreshOnce();
+    now += 10 * 60_000;
+    await board.refreshOnce();
+
+    expect(collect.mock.calls).toEqual([
+      [{ validateTopicBindings: true }],
+      [{ validateTopicBindings: false }],
+      [{ validateTopicBindings: true }],
+    ]);
   });
 
   it("edits the board once the work changed", async () => {
@@ -141,6 +278,21 @@ describe("StatusBoard lifecycle", () => {
     expect(telegram.pin).toHaveBeenCalledWith(555);
   });
 
+  it("treats Telegram message-not-modified as a delivered board revision", async () => {
+    const telegram = new FakeTelegram();
+    telegram.edit.mockRejectedValueOnce(new Error("Bad Request: message is not modified"));
+    const board = createBoard(
+      telegram,
+      async () => emptySnapshot(),
+      createStore({ messageThreadId: 42, messageId: 555 }),
+    );
+
+    expect(await board.refreshOnce()).toBe("unchanged");
+    expect(await board.refreshOnce()).toBe("unchanged");
+    expect(telegram.edit).toHaveBeenCalledOnce();
+    expect(telegram.send).not.toHaveBeenCalled();
+  });
+
   it("stamps the board with the time of the change", async () => {
     const telegram = new FakeTelegram();
     const board = createBoard(telegram, async () => emptySnapshot());
@@ -164,13 +316,56 @@ describe("StatusBoard lifecycle", () => {
 
   it("recreates a deleted idle board even when its body did not change", async () => {
     const telegram = new FakeTelegram();
-    const board = createBoard(telegram, async () => emptySnapshot());
+    let now = NOW;
+    const board = createBoard(
+      telegram,
+      async () => emptySnapshot(),
+      createStore(),
+      { warn: vi.fn() },
+      () => now,
+    );
     await board.refreshOnce();
     telegram.pin.mockRejectedValueOnce(new Error("Bad Request: message to pin not found"));
+    now += 10 * 60_000;
 
     expect(await board.refreshOnce()).toBe("sent");
     expect(telegram.reopenTopic).toHaveBeenCalledWith(42);
     expect(telegram.send).toHaveBeenCalledTimes(2);
+  });
+
+  it("pauses background Telegram calls for retry_after after a 429", async () => {
+    const telegram = new FakeTelegram();
+    let now = NOW;
+    const board = createBoard(
+      telegram,
+      async () => emptySnapshot(),
+      createStore(),
+      { warn: vi.fn() },
+      () => now,
+    );
+    await board.refreshOnce();
+    now += 10 * 60_000;
+    telegram.pin.mockImplementationOnce(async () => {
+      now += 4 * 60_000;
+      throw {
+        error_code: 429,
+        description: "Too Many Requests",
+        parameters: { retry_after: 60 },
+      };
+    });
+
+    await board.refreshSafely();
+    telegram.closeTopic.mockClear();
+    telegram.pin.mockClear();
+    await board.refreshSafely();
+
+    expect(telegram.closeTopic).not.toHaveBeenCalled();
+    expect(telegram.pin).not.toHaveBeenCalled();
+
+    now += 61_000;
+    await board.refreshSafely();
+    expect(telegram.closeTopic).toHaveBeenCalledOnce();
+    expect(telegram.pin).toHaveBeenCalledOnce();
   });
 
   it("recreates Dashboard when the saved topic was deleted", async () => {
@@ -189,7 +384,9 @@ describe("StatusBoard lifecycle", () => {
     const board = createBoard(telegram, async () => emptySnapshot(), createStore({ messageId: 555 }));
 
     expect(await board.refreshOnce()).toBe("sent");
-    expect(telegram.remove).toHaveBeenCalledWith(555);
+    expect(telegram.remove).toHaveBeenCalledWith(555, expect.any(Function));
+    expect(telegram.unpin).toHaveBeenCalledWith(555);
+    expect(telegram.removeMessage).toHaveBeenCalledWith(555);
     expect(telegram.remove.mock.invocationCallOrder[0])
       .toBeGreaterThan(telegram.closeTopic.mock.invocationCallOrder[0]);
   });
@@ -212,8 +409,12 @@ describe("StatusBoard lifecycle", () => {
     const store = createStore({ messageThreadId: 42, messageId: 777 });
     const board = createBoard(telegram, async () => emptySnapshot(), store);
 
-    expect(board.isDashboardTopic(42)).toBe(true);
-    expect(board.isDashboardTopic(43)).toBe(false);
+    expect(board.isDashboardTopic(CHAT_ID, 42)).toBe(true);
+    expect(board.isDashboardTopic(CHAT_ID - 1, 42)).toBe(false);
+    expect(board.isDashboardTopic(CHAT_ID, 43)).toBe(false);
+    expect(board.isDashboardMessage(CHAT_ID, 42, 777)).toBe(true);
+    expect(board.isDashboardMessage(CHAT_ID - 1, 42, 777)).toBe(false);
+    expect(board.isDashboardMessage(CHAT_ID, 42, 778)).toBe(false);
   });
 
   it("deletes an accidental Dashboard message and closes the topic again", async () => {
@@ -221,7 +422,7 @@ describe("StatusBoard lifecycle", () => {
     const store = createStore({ messageThreadId: 42, messageId: 777 });
     const board = createBoard(telegram, async () => emptySnapshot(), store);
 
-    expect(await board.protectTopicMessage(42, 888)).toBe(true);
+    expect(await board.protectTopicMessage(CHAT_ID, 42, 888)).toBe(true);
     expect(telegram.deleteMessage).toHaveBeenCalledWith(888);
     expect(telegram.closeTopic).toHaveBeenCalledWith(42);
   });
@@ -231,7 +432,7 @@ describe("StatusBoard lifecycle", () => {
     const store = createStore({ messageThreadId: 42, messageId: 777 });
     const board = createBoard(telegram, async () => emptySnapshot(), store);
 
-    expect(await board.protectTopicMessage(43, 888)).toBe(false);
+    expect(await board.protectTopicMessage(CHAT_ID, 43, 888)).toBe(false);
     expect(telegram.deleteMessage).not.toHaveBeenCalled();
     expect(telegram.closeTopic).not.toHaveBeenCalled();
   });
@@ -285,5 +486,25 @@ describe("StatusBoard lifecycle", () => {
     expect(telegram.edit).toHaveBeenCalledWith(42, 777, expect.objectContaining({
       html: expect.stringContaining("MIR-6319 оплата"),
     }));
+  });
+
+  it("refreshes visible state within five seconds even with a slower configured interval", async () => {
+    vi.useFakeTimers();
+    const telegram = new FakeTelegram();
+    const collect = vi.fn(async () => emptySnapshot());
+    const board = createBoard(telegram, collect);
+
+    try {
+      board.start();
+      await vi.advanceTimersByTimeAsync(0);
+      collect.mockClear();
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(collect).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(collect).toHaveBeenCalledOnce();
+    } finally {
+      board.stop();
+      vi.useRealTimers();
+    }
   });
 });

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd -- /root/Documents/Codex/2026-08-07-hermes/telecodex
+exec /usr/bin/node /root/Documents/Codex/2026-08-07-hermes/telecodex/dist/session-guardian-cli.js "$@"

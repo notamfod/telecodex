@@ -19,27 +19,42 @@
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.ts",
-    "build": "tsc",
-    "digest": "node dist/inbox-digest-cli.js",
+    "build": "npm run build:server && npm run build:web",
+    "build:server": "tsc",
+    "build:web": "vite build --config web/vite.config.ts",
+    "check:web": "svelte-check --tsconfig web/tsconfig.json",
+    "dev:web": "vite --config web/vite.config.ts",
     "start": "node dist/index.js",
+    "guardian": "node dist/session-guardian.js",
+    "guardian:cli": "node dist/session-guardian-cli.js",
+    "release:preflight": "node dist/telecodex-release-cli.js preflight --json",
+    "release:quarantine:audit": "node dist/telecodex-release-cli.js quarantine audit --json",
+    "release:quarantine:diagnose": "node dist/telecodex-release-cli.js quarantine diagnose --json",
     "test": "vitest run"
   },
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",
     "@grammyjs/runner": "^2.0.3",
-    "grammy": "^1.41.1",
+    "@tanstack/svelte-virtual": "^3.13.36",
+    "better-sqlite3": "^11.0.0",
+    "carbon-components-svelte": "0.111.0",
+    "carbon-icons-svelte": "13.14.0",
+    "grammy": "^1.45.1",
     "ws": "^8.21.2"
   },
   "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "6.2.4",
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^25.5.0",
     "@types/ws": "^8.18.1",
+    "svelte": "5.56.9",
+    "svelte-check": "4.7.6",
     "tsx": "^4.23.9",
     "typescript": "^5.9.3",
+    "vite": "7.3.6",
     "vitest": "^3.2.7"
   },
   "optionalDependencies": {
-    "better-sqlite3": "^11.0.0",
     "parakeet-coreml": "^2.2.0"
   }
 }

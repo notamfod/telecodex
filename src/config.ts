@@ -17,13 +17,26 @@ import {
   resolveDefaultModelChoice,
   type CodexModelChoice,
 } from "./codex-model.js";
+import { storagePathsAlias } from "./telegram-job-storage-path.js";
 
 export type ToolVerbosity = "all" | "summary" | "errors-only" | "none";
+export type TelegramJobStoreMode = "json" | "shadow" | "sqlite";
+
+export interface TelegramJobConfig {
+  storeMode: TelegramJobStoreMode;
+  databasePath: string;
+  legacyJsonPath: string;
+  maxAttempts: number;
+  payloadRetentionDays: number;
+  metadataRetentionDays: number;
+  retentionInitialDelaySeconds: number;
+}
 
 export interface JiraPanelConfig {
   chatId: number;
   topicId: number;
   clientPath: string;
+  workspace?: string;
 }
 
 export interface JiraCommentConfig {
@@ -32,18 +45,19 @@ export interface JiraCommentConfig {
   token: string;
 }
 
-export interface SentryBridgeTargetConfig {
-  inboxContextKey: string;
-  workspace: string;
+export interface MiniAppConfig {
+  launchUrl: string;
+  host: string;
+  port: number;
+  authMaxAgeSeconds: number;
+  staticDir: string;
 }
 
-export interface SentryBridgeConfig {
-  baseUrl: string;
-  token: string;
-  org: string;
-  mappings: Record<string, SentryBridgeTargetConfig>;
-  intervalMs: number;
-  limit: number;
+export interface ReliabilityTimeoutConfig {
+  appServerConnectMs: number;
+  appServerRequestMs: number;
+  appServerTurnStartMs: number;
+  telegramDeliveryMs: number;
 }
 
 export interface TeleCodexConfig {
@@ -51,6 +65,7 @@ export interface TeleCodexConfig {
   telegramAllowedUserIds: number[];
   telegramAllowedUserIdSet: Set<number>;
   workspace: string;
+  telegramJobs: TelegramJobConfig;
   maxFileSize: number;
   codexApiKey?: string;
   /** Told that a thread was re-read from disk, so a sync tool can clear its guard. */
@@ -70,6 +85,7 @@ export interface TeleCodexConfig {
   enableTelegramReactions: boolean;
   telegramForumChatId?: number;
   statusBoardIntervalMs: number;
+  miniApp?: MiniAppConfig;
   gitlabUrl?: string;
   gitlabToken?: string;
   gitlabGroupId?: string;
@@ -80,7 +96,8 @@ export interface TeleCodexConfig {
   telegramProgressHeartbeatMs: number;
   jiraPanel?: JiraPanelConfig;
   jiraComment?: JiraCommentConfig;
-  sentryBridge?: SentryBridgeConfig;
+  sessionGuardianSocketPath?: string;
+  reliabilityTimeouts: ReliabilityTimeoutConfig;
 }
 
 export function loadConfig(): TeleCodexConfig {
@@ -89,6 +106,7 @@ export function loadConfig(): TeleCodexConfig {
   const telegramBotToken = requireEnv("TELEGRAM_BOT_TOKEN");
   const telegramAllowedUserIds = parseAllowedUserIds(requireEnv("TELEGRAM_ALLOWED_USER_IDS"));
   const workspace = resolveWorkspace();
+  const telegramJobs = parseTelegramJobConfig(workspace);
   const maxFileSize = parseMaxFileSize(optionalString(process.env.MAX_FILE_SIZE));
   const codexApiKey = optionalString(process.env.CODEX_API_KEY);
   const threadReopenCommand = optionalString(process.env.THREAD_REOPEN_COMMAND);
@@ -96,13 +114,17 @@ export function loadConfig(): TeleCodexConfig {
   const modelChoices = parseModelChoicesJson(
     optionalString(process.env.CODEX_MODEL_CHOICES_JSON),
   );
-  const defaultModelChoiceId = modelChoices.length
+  const defaultModelChoice = modelChoices.length
     ? resolveDefaultModelChoice(
         modelChoices,
         optionalString(process.env.CODEX_DEFAULT_MODEL_CHOICE),
         codexModel,
-      )?.id
+      )
     : undefined;
+  if (defaultModelChoice && defaultModelChoice.provider !== "openai") {
+    throw new Error("CODEX_DEFAULT_MODEL_CHOICE must use the openai provider");
+  }
+  const defaultModelChoiceId = defaultModelChoice?.id;
   const codexSandboxMode = parseSandboxMode(optionalString(process.env.CODEX_SANDBOX_MODE));
   const codexApprovalPolicy = parseApprovalPolicy(optionalString(process.env.CODEX_APPROVAL_POLICY));
   const enableUnsafeLaunchProfiles = parseBooleanEnv(
@@ -160,9 +182,18 @@ export function loadConfig(): TeleCodexConfig {
   const statusBoardIntervalMs = parseIntegerSetting(
     "STATUS_BOARD_INTERVAL_SECONDS",
     optionalString(process.env.STATUS_BOARD_INTERVAL_SECONDS),
-    30,
-    10,
+    5,
+    1,
   ) * 1000;
+  const miniApp = parseMiniAppConfig(
+    optionalString(process.env.MINI_APP_LAUNCH_URL),
+    optionalString(process.env.MINI_APP_HOST),
+    optionalString(process.env.MINI_APP_PORT),
+    optionalString(process.env.MINI_APP_AUTH_MAX_AGE_SECONDS),
+  );
+  if (miniApp && telegramForumChatId === undefined) {
+    throw new Error("MINI_APP_LAUNCH_URL requires TELEGRAM_FORUM_CHAT_ID");
+  }
   const telegramProgressHeartbeatMs = parseIntegerSetting(
     "TELEGRAM_PROGRESS_HEARTBEAT_SECONDS",
     optionalString(process.env.TELEGRAM_PROGRESS_HEARTBEAT_SECONDS),
@@ -173,26 +204,26 @@ export function loadConfig(): TeleCodexConfig {
     optionalString(process.env.JIRA_PANEL_CHAT_ID),
     optionalString(process.env.JIRA_PANEL_TOPIC_ID),
     optionalString(process.env.JIRA_CLIENT_PATH),
+    optionalString(process.env.JIRA_PANEL_WORKSPACE),
   );
   const jiraComment = parseJiraCommentConfig(
     optionalString(process.env.JIRA_COMMENT_SERVER),
     optionalString(process.env.JIRA_COMMENT_LOGIN),
     optionalString(process.env.JIRA_COMMENT_TOKEN),
   );
-  const sentryBridge = parseSentryBridgeConfig(
-    optionalString(process.env.SENTRY_URL),
-    optionalString(process.env.SENTRY_TOKEN),
-    optionalString(process.env.SENTRY_ORG),
-    optionalString(process.env.SENTRY_BRIDGE_MAP_JSON),
-    optionalString(process.env.SENTRY_BRIDGE_INTERVAL_SECONDS),
-    optionalString(process.env.SENTRY_BRIDGE_LIMIT),
+  const sessionGuardianSocketPath = parseSessionGuardianSocketPath(
+    process.env.SESSION_GUARDIAN_SOCKET_PATH,
   );
-
+  if (sessionGuardianSocketPath && telegramForumChatId === undefined) {
+    throw new Error("SESSION_GUARDIAN_SOCKET_PATH requires TELEGRAM_FORUM_CHAT_ID");
+  }
+  const reliabilityTimeouts = parseReliabilityTimeoutConfig(process.env);
   return {
     telegramBotToken,
     telegramAllowedUserIds,
     telegramAllowedUserIdSet: new Set(telegramAllowedUserIds),
     workspace,
+    telegramJobs,
     maxFileSize,
     codexApiKey,
     threadReopenCommand,
@@ -211,6 +242,7 @@ export function loadConfig(): TeleCodexConfig {
     enableTelegramReactions,
     telegramForumChatId,
     statusBoardIntervalMs,
+    miniApp,
     gitlabUrl,
     gitlabToken,
     gitlabGroupId,
@@ -221,65 +253,142 @@ export function loadConfig(): TeleCodexConfig {
     telegramProgressHeartbeatMs,
     jiraPanel,
     jiraComment,
-    sentryBridge,
+    reliabilityTimeouts,
+    ...(sessionGuardianSocketPath ? { sessionGuardianSocketPath } : {}),
   };
 }
 
-function parseSentryBridgeConfig(
-  baseUrl: string | undefined,
-  token: string | undefined,
-  org: string | undefined,
-  mapJson: string | undefined,
-  intervalSeconds: string | undefined,
-  limitRaw: string | undefined,
-): SentryBridgeConfig | undefined {
-  if (!baseUrl && !token && !org && !mapJson) return undefined;
-  if (!baseUrl || !token || !org || !mapJson) {
-    throw new Error("Sentry bridge credentials and map must be configured together");
+export function parseReliabilityTimeoutConfig(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): ReliabilityTimeoutConfig {
+  const seconds = (name: string, fallback: number): number => boundedIntegerSetting(
+    name,
+    environment[name],
+    fallback,
+    1,
+    300,
+  ) * 1_000;
+  return {
+    appServerConnectMs: seconds("APP_SERVER_CONNECT_TIMEOUT_SECONDS", 10),
+    appServerRequestMs: seconds("APP_SERVER_REQUEST_TIMEOUT_SECONDS", 15),
+    appServerTurnStartMs: seconds("APP_SERVER_TURN_START_TIMEOUT_SECONDS", 30),
+    telegramDeliveryMs: seconds("TELEGRAM_DELIVERY_TIMEOUT_SECONDS", 30),
+  };
+}
+
+export function parseTelegramJobConfig(
+  workspace: string,
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): TelegramJobConfig {
+  const mode = environment.TELEGRAM_JOB_STORE_MODE ?? "json";
+  if (mode !== "json" && mode !== "shadow" && mode !== "sqlite") {
+    throw new Error("TELEGRAM_JOB_STORE_MODE must be json, shadow, or sqlite");
   }
-  let value: unknown;
-  try {
-    value = JSON.parse(mapJson);
-  } catch {
-    throw new Error("SENTRY_BRIDGE_MAP_JSON must be valid JSON");
+  const databasePath = jobStorePath(
+    "TELEGRAM_JOB_DB_PATH",
+    environment.TELEGRAM_JOB_DB_PATH,
+    path.join(workspace, ".telecodex", "jobs.sqlite"),
+  );
+  const legacyJsonPath = jobStorePath(
+    "TELEGRAM_JOB_LEGACY_JSON_PATH",
+    environment.TELEGRAM_JOB_LEGACY_JSON_PATH,
+    path.join(workspace, ".telecodex", "jobs.json"),
+  );
+  if (storagePathsAlias(legacyJsonPath, databasePath)) {
+    throw new Error("TELEGRAM_JOB_DB_PATH and TELEGRAM_JOB_LEGACY_JSON_PATH must not overlap");
   }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("SENTRY_BRIDGE_MAP_JSON must be an object keyed by Sentry project");
-  }
-  const mappings: Record<string, SentryBridgeTargetConfig> = {};
-  for (const [project, rawTarget] of Object.entries(value)) {
-    if (!project || !rawTarget || typeof rawTarget !== "object" || Array.isArray(rawTarget)) {
-      throw new Error(`Invalid Sentry bridge mapping for ${project || "(empty project)"}`);
-    }
-    const target = rawTarget as Record<string, unknown>;
-    if (
-      typeof target.inboxContextKey !== "string"
-      || !/^-?\d+:\d+$/.test(target.inboxContextKey)
-      || typeof target.workspace !== "string"
-      || !target.workspace
-    ) {
-      throw new Error(`Invalid Sentry bridge mapping for ${project}`);
-    }
-    mappings[project] = {
-      inboxContextKey: target.inboxContextKey,
-      workspace: target.workspace,
-    };
-  }
-  if (Object.keys(mappings).length === 0) {
-    throw new Error("SENTRY_BRIDGE_MAP_JSON must contain at least one project");
+  const maxAttempts = boundedIntegerSetting(
+    "TELEGRAM_JOB_MAX_ATTEMPTS", environment.TELEGRAM_JOB_MAX_ATTEMPTS, 5, 1, 100,
+  );
+  const payloadRetentionDays = boundedIntegerSetting(
+    "TELEGRAM_JOB_PAYLOAD_RETENTION_DAYS", environment.TELEGRAM_JOB_PAYLOAD_RETENTION_DAYS, 7, 1, 3_650,
+  );
+  const metadataRetentionDays = boundedIntegerSetting(
+    "TELEGRAM_JOB_METADATA_RETENTION_DAYS", environment.TELEGRAM_JOB_METADATA_RETENTION_DAYS, 90, 1, 3_650,
+  );
+  const retentionInitialDelaySeconds = boundedIntegerSetting(
+    "TELEGRAM_JOB_RETENTION_INITIAL_DELAY_SECONDS",
+    environment.TELEGRAM_JOB_RETENTION_INITIAL_DELAY_SECONDS,
+    0,
+    0,
+    7 * 24 * 60 * 60,
+  );
+  if (metadataRetentionDays < payloadRetentionDays) {
+    throw new Error("TELEGRAM_JOB_METADATA_RETENTION_DAYS must not be shorter than payload retention");
   }
   return {
-    baseUrl,
-    token,
-    org,
-    mappings,
-    intervalMs: parseIntegerSetting(
-      "SENTRY_BRIDGE_INTERVAL_SECONDS",
-      intervalSeconds,
-      900,
-      300,
-    ) * 1000,
-    limit: parseIntegerSetting("SENTRY_BRIDGE_LIMIT", limitRaw, 5, 1),
+    storeMode: mode,
+    databasePath,
+    legacyJsonPath,
+    maxAttempts,
+    payloadRetentionDays,
+    metadataRetentionDays,
+    retentionInitialDelaySeconds,
+  };
+}
+
+function jobStorePath(name: string, raw: string | undefined, fallback: string): string {
+  const value = raw?.trim() || fallback;
+  if (value.includes("\0") || !path.isAbsolute(value) || value === path.parse(value).root) {
+    throw new Error(`${name} must be an absolute file path`);
+  }
+  return path.normalize(value);
+}
+
+function boundedIntegerSetting(
+  name: string, raw: string | undefined, fallback: number, minimum: number, maximum: number,
+): number {
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer from ${minimum} through ${maximum}`);
+  }
+  return value;
+}
+
+export function parseSessionGuardianSocketPath(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  if (raw.trim().length === 0) {
+    throw new Error("SESSION_GUARDIAN_SOCKET_PATH must be non-empty");
+  }
+  if (raw.includes("\0")) throw new Error("SESSION_GUARDIAN_SOCKET_PATH must not contain NUL");
+  if (!path.isAbsolute(raw)) throw new Error("SESSION_GUARDIAN_SOCKET_PATH must be an absolute path");
+  if (raw === path.parse(raw).root) {
+    throw new Error("SESSION_GUARDIAN_SOCKET_PATH must name a socket file");
+  }
+  if (Buffer.byteLength(raw) > 107) {
+    throw new Error("SESSION_GUARDIAN_SOCKET_PATH must be at most 107 bytes");
+  }
+  return raw;
+}
+
+function parseMiniAppConfig(
+  launchUrl: string | undefined,
+  host: string | undefined,
+  rawPort: string | undefined,
+  rawAuthMaxAgeSeconds: string | undefined,
+): MiniAppConfig | undefined {
+  if (!launchUrl) return undefined;
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(launchUrl);
+  } catch {
+    throw new Error("MINI_APP_LAUNCH_URL must be a valid https URL");
+  }
+  if (parsedUrl.protocol !== "https:") {
+    throw new Error("MINI_APP_LAUNCH_URL must use https");
+  }
+  return {
+    launchUrl: parsedUrl.toString(),
+    host: host ?? "127.0.0.1",
+    port: parseIntegerSetting("MINI_APP_PORT", rawPort, 8787, 1),
+    authMaxAgeSeconds: parseIntegerSetting(
+      "MINI_APP_AUTH_MAX_AGE_SECONDS",
+      rawAuthMaxAgeSeconds,
+      3600,
+      60,
+    ),
+    staticDir: path.resolve(process.cwd(), "dist-web"),
   };
 }
 
@@ -398,6 +507,7 @@ function parseJiraPanelConfig(
   rawChatId: string | undefined,
   rawTopicId: string | undefined,
   clientPath: string | undefined,
+  workspace: string | undefined,
 ): JiraPanelConfig | undefined {
   if (!rawChatId && !rawTopicId) return undefined;
   if (!rawChatId || !rawTopicId) {
@@ -413,7 +523,12 @@ function parseJiraPanelConfig(
     throw new Error(`Invalid JIRA_PANEL_TOPIC_ID: ${rawTopicId}`);
   }
 
-  return { chatId, topicId, clientPath: clientPath ?? "jira-client" };
+  return {
+    chatId,
+    topicId,
+    clientPath: clientPath ?? "jira-client",
+    ...(workspace ? { workspace: path.resolve(workspace) } : {}),
+  };
 }
 
 function parseTopicSyncInterval(raw: string | undefined): number {

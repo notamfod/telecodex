@@ -2,6 +2,8 @@ const CODE_BLOCK_PREFIX = "\uE000CODE_";
 const CODE_BLOCK_SUFFIX = "_\uE000";
 const INLINE_CODE_PREFIX = "\uE001INLINE_";
 const INLINE_CODE_SUFFIX = "_\uE001";
+const MAX_FENCE_LANGUAGE_LENGTH = 64;
+const CHUNK_BUDGET_ERROR = "Telegram markdown split exceeds chunk budget";
 
 export function escapeHTML(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -39,16 +41,16 @@ export function splitTelegramMarkdown(
   markdown: string,
   targetLength = 3000,
   maxHtmlLength = 4000,
+  maximumChunks = Number.POSITIVE_INFINITY,
 ): TelegramMarkdownChunk[] {
   if (!markdown) return [];
 
-  const pieces = splitMarkdownBlocks(markdown).flatMap((block) =>
-    splitOversizedBlock(block, targetLength, maxHtmlLength));
   const chunks: TelegramMarkdownChunk[] = [];
   let current = "";
 
   const flush = (): void => {
     if (!current) return;
+    if (chunks.length >= maximumChunks) throw new Error(CHUNK_BUDGET_ERROR);
     chunks.push({
       sourceText: current,
       html: formatTelegramHTML(current),
@@ -57,16 +59,22 @@ export function splitTelegramMarkdown(
     current = "";
   };
 
-  for (const piece of pieces) {
-    const candidate = current ? `${current}\n\n${piece}` : piece;
-    if (
-      current &&
-      (candidate.length > targetLength || formatTelegramHTML(candidate).length > maxHtmlLength)
-    ) {
-      flush();
-      current = piece;
-    } else {
-      current = candidate;
+  for (const block of splitMarkdownBlocks(markdown)) {
+    const maximumPieces = Number.isFinite(maximumChunks)
+      ? Math.max(1, maximumChunks - chunks.length + 1)
+      : Number.POSITIVE_INFINITY;
+    for (const piece of splitOversizedBlock(block, targetLength, maxHtmlLength, maximumPieces)) {
+      const candidate = current ? `${current}\n\n${piece}` : piece;
+      if (
+        current &&
+        (codePointLength(candidate) > targetLength
+          || codePointLength(formatTelegramHTML(candidate)) > maxHtmlLength)
+      ) {
+        flush();
+        current = piece;
+      } else {
+        current = candidate;
+      }
     }
   }
   flush();
@@ -115,30 +123,19 @@ function splitOversizedBlock(
   block: string,
   targetLength: number,
   maxHtmlLength: number,
+  maximumPieces: number,
 ): string[] {
-  if (formatTelegramHTML(block).length <= maxHtmlLength && block.length <= targetLength) {
+  if (codePointLength(block) <= targetLength
+    && codePointLength(formatTelegramHTML(block)) <= maxHtmlLength) {
     return [block];
   }
 
   const fenced = block.match(/^```([^\n`]*)\n([\s\S]*?)\n?```$/);
   if (fenced) {
-    return splitFencedCode(fenced[1], fenced[2], targetLength, maxHtmlLength);
+    return splitFencedCode(fenced[1], fenced[2], targetLength, maxHtmlLength, maximumPieces);
   }
 
-  const result: string[] = [];
-  let remaining = block;
-  while (remaining) {
-    if (formatTelegramHTML(remaining).length <= maxHtmlLength && remaining.length <= targetLength) {
-      result.push(remaining);
-      break;
-    }
-    const maxSource = largestFittingPrefix(remaining, maxHtmlLength, (value) => formatTelegramHTML(value).length);
-    const preferredLimit = Math.max(1, Math.min(maxSource, targetLength));
-    const cut = preferredSplit(remaining, preferredLimit);
-    result.push(remaining.slice(0, cut).trimEnd());
-    remaining = remaining.slice(cut).trimStart();
-  }
-  return result.filter(Boolean);
+  return splitBoundedSource(block, targetLength, maxHtmlLength, formatTelegramHTML, true, maximumPieces);
 }
 
 function splitFencedCode(
@@ -146,22 +143,57 @@ function splitFencedCode(
   code: string,
   targetLength: number,
   maxHtmlLength: number,
+  maximumPieces: number,
 ): string[] {
-  const language = sanitizeLanguage(rawLanguage);
-  const wrap = (value: string): string => `\`\`\`${language}\n${value}\n\`\`\``;
-  const result: string[] = [];
-  let remaining = code;
+  let language = sanitizeLanguage(rawLanguage);
+  let wrap = (value: string): string => `\`\`\`${language}\n${value}\n\`\`\``;
+  if (codePointLength(wrap("")) >= targetLength
+    || codePointLength(formatTelegramHTML(wrap(""))) >= maxHtmlLength) {
+    language = "";
+    wrap = (value: string): string => `\`\`\`\n${value}\n\`\`\``;
+  }
+  const sourceOverhead = codePointLength(wrap(""));
+  const htmlOverhead = codePointLength(formatTelegramHTML(wrap("")));
+  if (sourceOverhead >= targetLength || htmlOverhead >= maxHtmlLength) {
+    throw new Error("Telegram markdown limits cannot fit fenced block");
+  }
+  const bodyTargetLength = targetLength - sourceOverhead;
+  return splitBoundedSource(
+    code,
+    bodyTargetLength,
+    maxHtmlLength,
+    (value) => formatTelegramHTML(wrap(value)),
+    false,
+    maximumPieces,
+  ).map(wrap);
+}
 
-  while (remaining) {
-    const maxSource = largestFittingPrefix(
-      remaining,
-      maxHtmlLength,
-      (value) => formatTelegramHTML(wrap(value)).length,
-    );
-    const preferredLimit = Math.max(1, Math.min(maxSource, targetLength));
-    const cut = preferredSplit(remaining, preferredLimit);
-    result.push(wrap(remaining.slice(0, cut).trimEnd()));
-    remaining = remaining.slice(cut).replace(/^\n/, "");
+function splitBoundedSource(
+  source: string,
+  targetLength: number,
+  maxHtmlLength: number,
+  render: (value: string) => string,
+  trimAllLeadingWhitespace: boolean,
+  maximumPieces: number,
+): string[] {
+  const result: string[] = [];
+  let offset = 0;
+  while (offset < source.length) {
+    const window = source.slice(offset, indexAfterCodePoints(source, offset, targetLength));
+    const maxSource = largestFittingPrefix(window, maxHtmlLength, (value) => codePointLength(render(value)));
+    if (maxSource < 1) throw new Error("Telegram markdown limits cannot fit source character");
+    const cut = preferredSplit(window, maxSource);
+    const chunk = window.slice(0, cut).trimEnd();
+    if (chunk.length > 0) {
+      if (result.length >= maximumPieces) throw new Error(CHUNK_BUDGET_ERROR);
+      result.push(chunk);
+    }
+    offset += cut;
+    if (trimAllLeadingWhitespace) {
+      while (offset < source.length && source[offset]!.trim() === "") offset += 1;
+    } else if (source[offset] === "\n") {
+      offset += 1;
+    }
   }
   return result;
 }
@@ -172,12 +204,13 @@ function largestFittingPrefix(
   measure: (value: string) => number,
 ): number {
   let low = 1;
-  let high = text.length;
-  let best = 1;
+  let high = codePointLength(text);
+  let best = 0;
   while (low <= high) {
     const middle = Math.floor((low + high) / 2);
-    if (measure(text.slice(0, middle)) <= maxLength) {
-      best = middle;
+    const boundary = indexAfterCodePoints(text, 0, middle);
+    if (measure(text.slice(0, boundary)) <= maxLength) {
+      best = boundary;
       low = middle + 1;
     } else {
       high = middle - 1;
@@ -188,12 +221,41 @@ function largestFittingPrefix(
 
 function preferredSplit(text: string, limit: number): number {
   if (text.length <= limit) return text.length;
-  const newline = text.lastIndexOf("\n", limit);
+  const boundary = codePointBoundaryAtOrBefore(text, limit);
+  const newline = text.lastIndexOf("\n", boundary - 1);
   if (newline > 0) return newline + 1;
-  const space = text.lastIndexOf(" ", limit);
+  const space = text.lastIndexOf(" ", boundary - 1);
   if (space > 0) return space + 1;
-  return limit;
+  return boundary;
 }
+
+function codePointLength(value: string): number {
+  let count = 0;
+  for (let index = 0; index < value.length; count += 1) {
+    const first = value.charCodeAt(index++);
+    if (isHighSurrogate(first) && index < value.length && isLowSurrogate(value.charCodeAt(index))) index += 1;
+  }
+  return count;
+}
+
+function indexAfterCodePoints(value: string, start: number, maximum: number): number {
+  let index = codePointBoundaryAtOrBefore(value, start);
+  for (let count = 0; index < value.length && count < maximum; count += 1) {
+    const first = value.charCodeAt(index++);
+    if (isHighSurrogate(first) && index < value.length && isLowSurrogate(value.charCodeAt(index))) index += 1;
+  }
+  return index;
+}
+
+function codePointBoundaryAtOrBefore(value: string, index: number): number {
+  const bounded = Math.max(0, Math.min(value.length, index));
+  return bounded > 0 && bounded < value.length
+    && isHighSurrogate(value.charCodeAt(bounded - 1)) && isLowSurrogate(value.charCodeAt(bounded))
+    ? bounded - 1 : bounded;
+}
+
+function isHighSurrogate(value: number): boolean { return value >= 0xD800 && value <= 0xDBFF; }
+function isLowSurrogate(value: number): boolean { return value >= 0xDC00 && value <= 0xDFFF; }
 
 function extractCodeBlocks(text: string, codeBlocks: string[]): string {
   return text.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_match, rawLanguage: string, rawCode: string) => {
@@ -310,7 +372,8 @@ function restorePlaceholders(
 }
 
 function sanitizeLanguage(language: string): string {
-  return language.trim().replace(/[^a-zA-Z0-9_+-]/g, "");
+  const sanitized = language.trim().replace(/[^a-zA-Z0-9_+-]/g, "");
+  return sanitized.length <= MAX_FENCE_LANGUAGE_LENGTH ? sanitized : "";
 }
 
 const SAFE_URL_PROTOCOL = /^(https?|tg|mailto):/i;

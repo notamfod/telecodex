@@ -1,9 +1,40 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  closeSync,
+  constants,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
+import { Worker } from "node:worker_threads";
 import path from "node:path";
 
 import type { CodexPromptInput } from "./codex-session.js";
 import type { TelegramContextKey } from "./context-key.js";
+
+export type { TelegramJob, TelegramJobEvent, TelegramSourceKey } from "./telegram-job-types.js";
+export { replayTelegramJobEvents, SqliteTelegramJobStore } from "./telegram-job-ledger.js";
+export type {
+  AcceptRetryUpdateInput, AcceptUpdateInput, AcceptUpdateResult, DeliveryCompletionCandidate,
+  DeliveryCompletionScanCursor, DeliveryCompletionScanInput, DeliveryCompletionScanResult,
+  DeliveryPart, DeliveryTransitionInput, NewDeliveryPart,
+  FinishStatusAnchorRevisionInput, PrepareStatusAnchorRevisionInput, PrepareStatusAnchorRevisionResult,
+  ReplaceMissingStatusAnchorEditInput,
+  InstallDeliveryPlanInput, InstallLiveCommentaryInput,
+  ProjectedDeliveryTransitionInput, ProjectedDeliveryTransitionResult,
+  ReplanRichDeliveryInput, ReplanRichDeliveryResult,
+  TelegramDeliverySummary,
+  TelegramDashboardAggregates,
+  SqliteTelegramJobStoreOptions,
+  StoredAcceptedTelegramJobEvent, StoredTelegramJobEvent, StoredTransitionTelegramJobEvent,
+  StoredTelegramJobEventSummary, TelegramJobRetentionInput, TelegramJobRetentionResult,
+  TelegramJobQuarantine, TelegramReconciliationScanCursor, TelegramReconciliationScanInput,
+  TelegramReconciliationScanResult, TransitionEvent, TransitionInput,
+} from "./telegram-job-ledger.js";
 
 export type TelegramJobState =
   | "awaiting-model"
@@ -36,6 +67,76 @@ export type NewTelegramJob = Pick<
   "contextKey" | "chatId" | "messageThreadId" | "threadId" | "input"
 > & Pick<Partial<PersistentTelegramJob>, "modelChoiceId" | "cleanupInbox">;
 
+const MAX_LEGACY_PROBE_BYTES = 64 * 1024 * 1024;
+const DEFAULT_LEGACY_PROBE_TIMEOUT_MS = 250;
+const LEGACY_PROBE_WORKER_SOURCE = String.raw`
+const { closeSync, constants, fstatSync, openSync, readFileSync } = require("node:fs");
+const { parentPort, workerData } = require("node:worker_threads");
+let descriptor;
+try {
+  descriptor = openSync(workerData.filePath, constants.O_RDONLY);
+  if (fstatSync(descriptor).size > workerData.maxBytes) {
+    parentPort.postMessage("invalid");
+  } else {
+    const parsed = JSON.parse(readFileSync(descriptor, "utf8"));
+    parentPort.postMessage(Array.isArray(parsed) ? "ok" : "invalid");
+  }
+} catch {
+  parentPort.postMessage("unavailable");
+} finally {
+  if (descriptor !== undefined) closeSync(descriptor);
+}
+`;
+
+export class LegacyTelegramJobStoreProbe {
+  constructor(private readonly filePath: string) {}
+
+  probeReadable(timeoutMs = DEFAULT_LEGACY_PROBE_TIMEOUT_MS): Promise<void> {
+    if (!existsSync(this.filePath)) return Promise.resolve();
+    const boundedTimeoutMs = Number.isSafeInteger(timeoutMs) && timeoutMs > 0
+      ? timeoutMs : DEFAULT_LEGACY_PROBE_TIMEOUT_MS;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const worker = new Worker(LEGACY_PROBE_WORKER_SOURCE, {
+        eval: true,
+        workerData: { filePath: this.filePath, maxBytes: MAX_LEGACY_PROBE_BYTES },
+      });
+      const finish = (action: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        void worker.terminate();
+        action();
+      };
+      const deadline = setTimeout(() => finish(() => reject(
+        new Error("Legacy Telegram job store is unavailable"),
+      )), boundedTimeoutMs);
+      worker.once("message", (outcome: unknown) => finish(() => {
+        if (outcome === "ok") resolve();
+        else reject(new Error(outcome === "invalid"
+          ? "Legacy Telegram job store is invalid"
+          : "Legacy Telegram job store is unavailable"));
+      }));
+      worker.once("error", () => finish(() => reject(
+        new Error("Legacy Telegram job store is unavailable"),
+      )));
+      worker.once("exit", () => finish(() => reject(
+        new Error("Legacy Telegram job store is unavailable"),
+      )));
+    });
+  }
+
+  probeWritable(): void {
+    if (!existsSync(this.filePath)) {
+      accessSync(path.dirname(this.filePath), constants.W_OK);
+      return;
+    }
+    const descriptor = openSync(this.filePath, constants.O_RDWR);
+    closeSync(descriptor);
+  }
+}
+
+/** Legacy JSON facade. Bot routing moves to the canonical ledger in Task 12. */
 export class TelegramJobStore {
   private readonly jobs = new Map<string, PersistentTelegramJob>();
 
@@ -105,9 +206,9 @@ export class TelegramJobStore {
   ): PersistentTelegramJob | undefined {
     const job = [...this.jobs.values()].find(
       (candidate) =>
-        candidate.state === "awaiting-model" &&
-        candidate.selectionToken === selectionToken &&
-        candidate.contextKey === contextKey,
+        candidate.state === "awaiting-model"
+        && candidate.selectionToken === selectionToken
+        && candidate.contextKey === contextKey,
     );
     return job ? structuredClone(job) : undefined;
   }
@@ -127,9 +228,9 @@ export class TelegramJobStore {
   ): PersistentTelegramJob {
     const job = [...this.jobs.values()].find(
       (candidate) =>
-        candidate.state === "awaiting-model" &&
-        candidate.selectionToken === selectionToken &&
-        candidate.contextKey === contextKey,
+        candidate.state === "awaiting-model"
+        && candidate.selectionToken === selectionToken
+        && candidate.contextKey === contextKey,
     );
     if (!job) throw new Error("Invalid or expired model selection");
 
@@ -137,6 +238,19 @@ export class TelegramJobStore {
     job.modelChoiceId = modelChoiceId;
     job.threadId = threadId;
     delete job.selectionToken;
+    job.updatedAt = this.now();
+    this.persist();
+    return structuredClone(job);
+  }
+
+  useDefaultModel(id: string): PersistentTelegramJob {
+    const job = this.requireJob(id);
+    if (job.state !== "awaiting-model") {
+      throw new Error(`Telegram job ${id} cannot use the default model from state ${job.state}`);
+    }
+    job.state = "waiting";
+    delete job.selectionToken;
+    delete job.modelChoiceId;
     job.updatedAt = this.now();
     this.persist();
     return structuredClone(job);

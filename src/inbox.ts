@@ -28,6 +28,31 @@ export const TOPIC_NAMING_INSTRUCTION = [
   "После пустой строки продолжи основной разбор.",
 ].join("\n");
 
+const TICKET_LAUNCH_POLICY_START = "[telecodex-inbox-launch-policy-v2:start]";
+const TICKET_LAUNCH_POLICY_END = "[telecodex-inbox-launch-policy-v2:end]";
+
+export function prepareTicketLaunchPrompt(prompt: string, realm?: string): string {
+  const safeRealm = realm && /^[A-Za-z0-9_-]+$/.test(realm) ? realm : undefined;
+  const policy = [
+    TICKET_LAUNCH_POLICY_START,
+    "Правила запуска имеют приоритет над устаревшими ограничениями выше:",
+    "- Для проверки гипотез используй все подходящие доступные инструменты и источники.",
+    "- Если обращение связано с данными или состоянием системы, проверяй живые данные через БД, dofbox, Sentry, Kubernetes, очереди, логи, Jira и GitLab, когда они относятся к вопросу.",
+    safeRealm ? `- Для команд dofbox явно используй realm: dofbox --realm ${safeRealm} ...` : undefined,
+    "- Не объявляй источник недоступным, пока не проверил подходящий read-only способ доступа.",
+    "- Сохраняй режим диагностики: ничего не изменяй, не перезапускай и не закрывай без отдельного разрешения пользователя.",
+    "- Финальный ответ должен содержать не более 1200 символов: только подтверждённый факт, причина, место исправления и одно краткое уточнение о недостающих данных.",
+    "- Не включай ход расследования, список использованных инструментов и второстепенные гипотезы.",
+    TICKET_LAUNCH_POLICY_END,
+  ].filter((line): line is string => line !== undefined).join("\n");
+  const trimmed = prompt.trimEnd();
+  const trustedStart = trimmed.lastIndexOf(`\n\n${TICKET_LAUNCH_POLICY_START}\n`);
+  const base = trustedStart >= 0 && trimmed.endsWith(`\n${TICKET_LAUNCH_POLICY_END}`)
+    ? trimmed.slice(0, trustedStart).trimEnd()
+    : trimmed;
+  return `${base}\n\n${policy}`;
+}
+
 /** Ordered by how much each form can be trusted to be a real ticket reference. */
 const KEY_PATTERNS = [
   /\/issues\/(\d+)\b/i,

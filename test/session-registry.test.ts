@@ -30,6 +30,7 @@ const mockSessionState = vi.hoisted(() => {
     getInfo: ReturnType<typeof vi.fn>;
     dispose: ReturnType<typeof vi.fn>;
     isProcessing: ReturnType<typeof vi.fn>;
+    applyDeferredDefaults: ReturnType<typeof vi.fn>;
     setInfo: (next: Partial<{
       threadId: string | null;
       workspace: string;
@@ -53,6 +54,7 @@ const mockSessionState = vi.hoisted(() => {
 
   const reset = () => {
     create.mockReset();
+    dependencies.client.request.mockReset();
     dependencies.client.close.mockReset();
     dependencies.turnManager.dispose.mockReset();
     sessions.length = 0;
@@ -130,6 +132,19 @@ describe("SessionRegistry", () => {
     ...overrides,
   });
 
+  it("checks shared app-server connectivity through the typed request deadline", async () => {
+    mockSessionState.dependencies.client.request.mockResolvedValueOnce({});
+    const registry = new SessionRegistry(createConfig());
+
+    await registry.checkAppServerConnectivity(2_000);
+
+    expect(mockSessionState.dependencies.client.request).toHaveBeenCalledWith(
+      "server/diagnostics",
+      {},
+      { timeoutMs: 2_000 },
+    );
+  });
+
   const createMockSession = (info: {
     threadId: string | null;
     workspace: string;
@@ -150,6 +165,16 @@ describe("SessionRegistry", () => {
       getInfo: vi.fn(() => ({ ...currentInfo })),
       dispose: vi.fn(),
       isProcessing: vi.fn(() => false),
+      applyDeferredDefaults: vi.fn((defaults: { workspace: string; launchProfileId?: string }) => {
+        currentInfo = {
+          ...currentInfo,
+          workspace: defaults.workspace,
+          ...(defaults.launchProfileId ? {
+            launchProfileId: defaults.launchProfileId,
+            sandboxMode: defaults.launchProfileId === "readonly" ? "read-only" : "workspace-write",
+          } : {}),
+        };
+      }),
       setInfo: (next: Partial<typeof currentInfo>) => {
         currentInfo = { ...currentInfo, ...next };
       },
@@ -444,6 +469,40 @@ describe("SessionRegistry", () => {
     );
   });
 
+  it("does not implicitly resume a persisted non-OpenAI thread", async () => {
+    const persistPath = path.join("/workspace/base", ".telecodex", "contexts.json");
+    mockFsState.files.set(
+      persistPath,
+      JSON.stringify([
+        {
+          contextKey: "123:42",
+          threadId: "thread-glm",
+          workspace: "/workspace/glm",
+          model: "glm-5.3",
+          modelProvider: "zai",
+          modelChoiceId: "glm-53",
+          updatedAt: 1,
+        },
+      ]),
+    );
+
+    const registry = new SessionRegistry(createConfig());
+    await registry.getOrCreate("123:42", { deferThreadStart: true });
+
+    expect(mockSessionState.create).toHaveBeenCalledWith(
+      createConfig(),
+      expect.objectContaining({
+        workspace: "/workspace/glm",
+        model: undefined,
+        modelProvider: undefined,
+        modelChoiceId: undefined,
+        resumeThreadId: undefined,
+        deferThreadStart: true,
+      }),
+      mockSessionState.dependencies,
+    );
+  });
+
   it("falls back to the default launch profile when persisted metadata references a missing profile", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const persistPath = path.join("/workspace/base", ".telecodex", "contexts.json");
@@ -661,5 +720,25 @@ describe("SessionRegistry", () => {
       }),
       mockSessionState.dependencies,
     );
+  });
+
+  it("applies new durable defaults to an already cached deferred session", async () => {
+    const registry = new SessionRegistry(createConfig());
+    const session = await registry.getOrCreate("-100123:513", { deferThreadStart: true });
+
+    registry.setContextDefaults("-100123:513", {
+      workspace: "/workspace/sentry",
+      launchProfileId: "readonly",
+      topicName: "Sentry",
+    });
+
+    expect(session.applyDeferredDefaults).toHaveBeenCalledWith({
+      workspace: "/workspace/sentry",
+      launchProfileId: "readonly",
+      topicName: "Sentry",
+    });
+    expect(session.getInfo()).toMatchObject({
+      workspace: "/workspace/sentry", sandboxMode: "read-only",
+    });
   });
 });

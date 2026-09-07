@@ -1,4 +1,10 @@
-import type { AppServerNotification } from "./app-server-client.js";
+import {
+  AppServerRequestError,
+  type AppServerNotification,
+  type AppServerRequestOptions,
+} from "./app-server-client.js";
+import { mapAppServerActivity } from "./app-server-activity.js";
+import type { JobActivity } from "./telegram-job-types.js";
 import { TurnScheduler, type TurnSchedulerCallbacks } from "./turn-scheduler.js";
 
 export type AppServerUserInput =
@@ -7,7 +13,21 @@ export type AppServerUserInput =
 
 export interface AppServerTurnCallbacks {
   onQueued?: (status: AppServerQueueStatus) => void;
+  /** Blocking persistence barrier. Throwing prevents the corresponding turn/start write. */
+  beforeDispatchWrite?: (event: {
+    threadId: string;
+    previousTurnId: string | null;
+    previousTurnKnown: boolean;
+    attempt: number;
+  }) => void;
+  onDispatching?: (event: { previousTurnId: string | null; attempt: number }) => void;
+  onDispatchWritten?: () => void;
   onStarted?: (turnId: string) => void;
+  onActivity?: (event: {
+    activity: JobActivity;
+    eventAt: number;
+    method: string;
+  }) => void;
   onTextDelta: (delta: string) => void;
   onAgentMessageStart?: (message: AppServerAgentMessage) => void;
   onAgentMessageEnd?: (message: AppServerAgentMessage) => void;
@@ -22,6 +42,7 @@ export interface AppServerTurnCallbacks {
     cachedInputTokens: number;
     outputTokens: number;
   }) => void;
+  onTurnOutcome?: (event: { status: string; eventAt: number }) => void;
   onHookBlocked?: (block: AppServerHookBlock) => void;
 }
 
@@ -38,7 +59,8 @@ export interface AppServerAgentMessage {
 
 export type AppServerQueueStatus =
   | { position: number; reason: "thread-active" }
-  | { position: number; active: number; limit: number; reason: "global-limit" };
+  | { position: number; active: number; limit: number; reason: "global-limit" }
+  | { position: number; reason: "app-server-unavailable" };
 
 export interface AppServerTurnRequest {
   threadId: string;
@@ -53,17 +75,24 @@ export interface AppServerTurnRequest {
 
 export interface AppServerRequestClient {
   connect(): Promise<void>;
-  request<T>(method: string, params?: unknown): Promise<T>;
+  request<T>(method: string, params?: unknown, options?: AppServerRequestOptions): Promise<T>;
   onNotification(listener: (notification: AppServerNotification) => void): () => void;
+  onDisconnect(listener: () => void): () => void;
 }
 
 interface ThreadStatus {
   type: "notLoaded" | "idle" | "systemError" | "active";
+  activeFlags?: string[];
 }
 
 interface ThreadState {
   status: ThreadStatus["type"] | "unknown";
+  dispatchAmbiguous: boolean;
+  latestTurnId: string | null;
+  latestTurnKnown: boolean;
+  externalActiveTurnId?: string;
   initializePromise?: Promise<void>;
+  reconcilePromise?: Promise<void>;
   queue: TurnJob[];
   activeJob?: TurnJob;
   startingJob?: TurnJob;
@@ -75,6 +104,24 @@ interface TurnJob {
   turnId?: string;
   usage?: { inputTokens: number; cachedInputTokens: number; outputTokens: number };
   errorMessage?: string;
+  errorObserved?: boolean;
+  terminalReconciliation?: Promise<void>;
+  dispatchAttempt?: number;
+  dispatchWritten?: boolean;
+  previousTurnId?: string | null;
+  previousTurnKnown?: boolean;
+  startedNotified?: boolean;
+  provisionalTurnId?: string;
+  provisionalNotifications?: Array<{
+    notification: AppServerNotification;
+    receiptAt: number;
+  }>;
+  provisionalExternalCompleted?: boolean;
+  lastActivityObservation?: {
+    activity: JobActivity;
+    receiptAt: number;
+    sample: boolean;
+  };
   schedulerCallbacks?: TurnSchedulerCallbacks;
   releaseSlot?: () => void;
   settled?: boolean;
@@ -83,7 +130,7 @@ interface TurnJob {
 }
 
 interface ThreadResumeResponse {
-  thread: { id: string; status: ThreadStatus };
+  thread: { id: string; status: ThreadStatus; turns?: unknown[] };
 }
 
 interface TurnStartResponse {
@@ -94,24 +141,50 @@ interface ThreadReadResponse {
   thread: { turns?: unknown[] };
 }
 
+export interface AppServerTurnManagerOptions {
+  activityCoalesceMs?: number;
+  now?: () => number;
+}
+
+const DEFAULT_ACTIVITY_COALESCE_MS = 1_000;
+const MAX_PROVISIONAL_NOTIFICATIONS = 256;
+const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "aborted"]);
+
 export class AppServerTurnManager {
   private readonly threads = new Map<string, ThreadState>();
-  private readonly unsubscribe: () => void;
+  private readonly unsubscribeNotification: () => void;
+  private readonly unsubscribeDisconnect: () => void;
   private readonly scheduler: TurnScheduler;
+  private readonly activityCoalesceMs: number;
+  private readonly now: () => number;
+  private disposed = false;
 
-  constructor(private readonly client: AppServerRequestClient, maxActiveTopics = 4) {
+  constructor(
+    private readonly client: AppServerRequestClient,
+    maxActiveTopics = 4,
+    options: AppServerTurnManagerOptions = {},
+  ) {
     this.scheduler = new TurnScheduler(maxActiveTopics);
-    this.unsubscribe = client.onNotification((notification) => this.handleNotification(notification));
+    this.activityCoalesceMs = nonNegativeInterval(
+      options.activityCoalesceMs ?? DEFAULT_ACTIVITY_COALESCE_MS,
+    );
+    this.now = options.now ?? Date.now;
+    this.unsubscribeNotification = client.onNotification((notification) =>
+      this.handleNotification(notification),
+    );
+    this.unsubscribeDisconnect = client.onDisconnect(() => this.handleDisconnect());
   }
 
   runTurn(request: AppServerTurnRequest): Promise<void> {
+    if (this.disposed) return Promise.reject(disposedError());
     return new Promise<void>((resolve, reject) => {
       const job: TurnJob = { request, resolve, reject };
-      void this.enqueue(job).catch(reject);
+      void this.enqueue(job).catch((error) => this.rejectJob(job, asError(error)));
     });
   }
 
   recoverTurn(request: AppServerTurnRequest, turnId: string): Promise<void> {
+    if (this.disposed) return Promise.reject(disposedError());
     return new Promise<void>((resolve, reject) => {
       const job: TurnJob = { request, turnId, resolve, reject };
       void this.recoverJob(job).catch((error) => this.rejectJob(job, asError(error)));
@@ -124,6 +197,7 @@ export class AppServerTurnManager {
    * then just rejoins the copy already in memory. Archiving evicts it for real.
    */
   async reloadThread(threadId: string): Promise<void> {
+    this.assertNotDisposed();
     const state = this.threads.get(threadId);
     if (state?.activeJob || state?.startingJob) {
       throw new Error(`Cannot reload thread ${threadId}: a turn is in flight`);
@@ -138,18 +212,37 @@ export class AppServerTurnManager {
       );
     }
 
+    this.assertNotDisposed();
     const response = await this.client.request<ThreadResumeResponse>("thread/resume", {
       threadId,
     });
+    this.assertNotDisposed();
     this.getThreadState(threadId).status = response.thread.status.type;
   }
 
-  trackThread(threadId: string, status: ThreadStatus["type"]): void {
+  trackThread(
+    threadId: string,
+    status: ThreadStatus["type"],
+    latestTurnId?: string | null,
+  ): void {
+    this.assertNotDisposed();
     const state = this.getThreadState(threadId);
     state.status = status;
+    if (latestTurnId !== undefined) {
+      if (latestTurnId === null) {
+        state.latestTurnId = null;
+      } else {
+        const validated = boundedNonblankString(latestTurnId, 512);
+        if (!validated) throw new Error("latestTurnId must be a bounded non-empty string or null");
+        state.latestTurnId = validated;
+      }
+      state.latestTurnKnown = true;
+      state.externalActiveTurnId = undefined;
+    }
   }
 
   async cancelTurn(threadId: string, callbacks: AppServerTurnCallbacks): Promise<void> {
+    this.assertNotDisposed();
     const state = this.threads.get(threadId);
     if (!state) return;
 
@@ -174,18 +267,26 @@ export class AppServerTurnManager {
       return;
     }
 
-    const activeJob = state.activeJob;
-    if (activeJob?.request.callbacks === callbacks && activeJob.turnId) {
+    const runningJob = state.activeJob ?? state.startingJob;
+    if (runningJob?.request.callbacks === callbacks && runningJob.turnId) {
       await this.client.request("turn/interrupt", {
         threadId,
-        turnId: activeJob.turnId,
+        turnId: runningJob.turnId,
       });
     }
   }
 
+  async interruptTurn(threadId: string, turnId: string): Promise<void> {
+    this.assertNotDisposed();
+    await this.client.request("turn/interrupt", { threadId, turnId });
+  }
+
   dispose(): void {
-    this.unsubscribe();
-    const error = new Error("App-server turn manager disposed");
+    if (this.disposed) return;
+    this.disposed = true;
+    this.unsubscribeNotification();
+    this.unsubscribeDisconnect();
+    const error = disposedError();
     for (const state of this.threads.values()) {
       if (state.scheduledJob?.schedulerCallbacks && !state.activeJob && !state.startingJob) {
         this.scheduler.cancel(
@@ -193,35 +294,52 @@ export class AppServerTurnManager {
           state.scheduledJob.schedulerCallbacks,
         );
       }
-      if (state.activeJob) this.rejectJob(state.activeJob, error);
-      if (state.startingJob && state.startingJob !== state.activeJob) {
-        this.rejectJob(state.startingJob, error);
-      }
-      if (
-        state.scheduledJob &&
-        state.scheduledJob !== state.activeJob &&
-        state.scheduledJob !== state.startingJob
-      ) {
-        this.rejectJob(state.scheduledJob, error);
-      }
-      for (const job of state.queue) {
+      const jobs = new Set(
+        [state.activeJob, state.startingJob, state.scheduledJob, ...state.queue].filter(
+          (job): job is TurnJob => Boolean(job),
+        ),
+      );
+      for (const job of jobs) {
         this.rejectJob(job, error);
+        this.releaseJobSlot(job);
       }
+      state.queue.length = 0;
+      state.activeJob = undefined;
+      state.startingJob = undefined;
+      state.scheduledJob = undefined;
+      state.initializePromise = undefined;
+      state.reconcilePromise = undefined;
     }
     this.threads.clear();
   }
 
   private async enqueue(job: TurnJob): Promise<void> {
+    this.assertNotDisposed();
     const state = this.getThreadState(job.request.threadId);
+    if (state.dispatchAmbiguous) {
+      state.queue.push(job);
+      this.notifyQueued(job, {
+        position: state.queue.length,
+        reason: "thread-active",
+      });
+      return;
+    }
     await this.ensureThread(job.request, state);
+    this.assertNotDisposed();
 
-    if (state.status === "idle" && !state.activeJob && !state.startingJob) {
+    if (
+      state.status === "idle" &&
+      !state.activeJob &&
+      !state.startingJob &&
+      !state.scheduledJob &&
+      state.queue.length === 0
+    ) {
       this.scheduleJob(state, job);
       return;
     }
 
     state.queue.push(job);
-    job.request.callbacks.onQueued?.({
+    this.notifyQueued(job, {
       position: state.queue.length,
       reason: "thread-active",
     });
@@ -230,43 +348,62 @@ export class AppServerTurnManager {
   private getThreadState(threadId: string): ThreadState {
     let state = this.threads.get(threadId);
     if (!state) {
-      state = { status: "unknown", queue: [] };
+      state = {
+        status: "unknown",
+        dispatchAmbiguous: false,
+        latestTurnId: null,
+        latestTurnKnown: false,
+        queue: [],
+      };
       this.threads.set(threadId, state);
     }
     return state;
   }
 
   private async ensureThread(request: AppServerTurnRequest, state: ThreadState): Promise<void> {
+    this.assertNotDisposed();
     if (state.status !== "unknown") {
       return;
     }
     if (state.initializePromise) {
       await state.initializePromise;
+      this.assertNotDisposed();
       return;
     }
 
     state.initializePromise = (async () => {
       await this.client.connect();
+      this.assertNotDisposed();
       const response = await this.client.request<ThreadResumeResponse>("thread/resume", {
         threadId: request.threadId,
       });
+      this.assertNotDisposed();
       state.status = response.thread.status.type;
+      if (Array.isArray(response.thread.turns)) {
+        state.latestTurnId = latestTurnIdFromTurns(response.thread.turns);
+        state.latestTurnKnown = true;
+      }
     })();
 
     try {
       await state.initializePromise;
     } finally {
-      state.initializePromise = undefined;
+      if (!this.disposed) state.initializePromise = undefined;
     }
   }
 
   private scheduleJob(state: ThreadState, job: TurnJob): void {
+    if (state.dispatchAmbiguous) {
+      state.queue.unshift(job);
+      this.notifyQueued(job, { position: 1, reason: "thread-active" });
+      return;
+    }
     state.scheduledJob = job;
     const slot = deferred();
     job.releaseSlot = slot.resolve;
     const schedulerCallbacks: TurnSchedulerCallbacks = {
       onQueued: ({ position, active, limit }) => {
-        job.request.callbacks.onQueued?.({
+        this.notifyQueued(job, {
           position,
           active,
           limit,
@@ -279,11 +416,37 @@ export class AppServerTurnManager {
     void this.scheduler.run(
       job.request.threadId,
       async () => {
-        if (state.status !== "idle" || state.activeJob || state.startingJob) {
+        if (this.disposed || job.settled) return;
+        if (state.dispatchAmbiguous) {
           state.scheduledJob = undefined;
           job.releaseSlot = undefined;
           state.queue.unshift(job);
-          job.request.callbacks.onQueued?.({ position: 1, reason: "thread-active" });
+          this.notifyQueued(job, { position: 1, reason: "thread-active" });
+          return;
+        }
+        if (state.status === "unknown" && !state.activeJob && !state.startingJob) {
+          try {
+            await this.ensureThread(job.request, state);
+          } catch (error) {
+            if (this.disposed || job.settled) return;
+            state.scheduledJob = undefined;
+            job.releaseSlot = undefined;
+            this.rejectJob(job, asError(error));
+            void this.drain(state);
+            return;
+          }
+        }
+        if (this.disposed || job.settled) return;
+        if (
+          state.dispatchAmbiguous ||
+          state.status !== "idle" ||
+          state.activeJob ||
+          state.startingJob
+        ) {
+          state.scheduledJob = undefined;
+          job.releaseSlot = undefined;
+          state.queue.unshift(job);
+          this.notifyQueued(job, { position: 1, reason: "thread-active" });
           return;
         }
         const started = await this.startJob(state, job);
@@ -296,36 +459,80 @@ export class AppServerTurnManager {
   }
 
   private async startJob(state: ThreadState, job: TurnJob): Promise<boolean> {
+    if (this.disposed || job.settled) return false;
     state.startingJob = job;
     state.status = "active";
 
     try {
-      const response = await this.client.request<TurnStartResponse>("turn/start", {
-        threadId: job.request.threadId,
-        input: job.request.input,
-        cwd: job.request.cwd,
-        model: job.request.model,
-        effort: job.request.reasoningEffort,
-        approvalPolicy: job.request.approvalPolicy,
-        sandboxPolicy: toSandboxPolicy(job.request.sandbox, job.request.cwd),
-      });
-      job.turnId = response.turn.id;
+      const response = await this.startTurnWithRecovery(state, job);
+      if (this.disposed || job.settled) return false;
+      this.confirmTurnIdentity(state, job, response.turn.id);
+      if (this.disposed || job.settled) return false;
       state.activeJob = job;
       state.startingJob = undefined;
-      job.request.callbacks.onStarted?.(response.turn.id);
       return true;
     } catch (error) {
-      state.startingJob = undefined;
-      if (isBusyError(error)) {
+      if (this.disposed || job.settled) return false;
+      if (isAppServerFailure(error, "APP_SERVER_NOT_SENT")) {
+        state.startingJob = undefined;
         state.scheduledJob = undefined;
-        state.status = "active";
+        state.status = "unknown";
         state.queue.unshift(job);
-        job.request.callbacks.onQueued?.({ position: 1, reason: "thread-active" });
+        this.notifyQueued(job, {
+          position: 1,
+          reason: "app-server-unavailable",
+        });
         this.releaseJobSlot(job);
         return false;
       }
+      if (isAppServerFailure(error, "APP_SERVER_ACCEPTANCE_UNKNOWN")) {
+        state.startingJob = undefined;
+        state.scheduledJob = undefined;
+        state.status = "active";
+        state.dispatchAmbiguous = true;
+        this.rejectJob(job, asError(error));
+        this.releaseJobSlot(job);
+        return false;
+      }
+      if (isConnectionClosedError(error)) {
+        try {
+          const reconciliation = await this.reconcileLostTurnStart(state, job);
+          if (this.disposed) return false;
+          state.startingJob = undefined;
+          if (reconciliation === "active") {
+            if (job.settled) return false;
+            state.activeJob = job;
+            return true;
+          }
+          state.scheduledJob = undefined;
+          this.releaseJobSlot(job);
+          void this.drain(state);
+          return false;
+        } catch (reconciliationError) {
+          if (this.disposed || job.settled) return false;
+          state.startingJob = undefined;
+          state.scheduledJob = undefined;
+          state.status = "active";
+          state.dispatchAmbiguous = true;
+          this.rejectJob(job, asError(reconciliationError));
+          this.releaseJobSlot(job);
+          return false;
+        }
+      }
+      state.startingJob = undefined;
+      if (isBusyError(error)) {
+        state.scheduledJob = undefined;
+        const externalCompleted = job.provisionalExternalCompleted === true;
+        job.provisionalExternalCompleted = undefined;
+        state.status = externalCompleted ? "idle" : "active";
+        state.queue.unshift(job);
+        this.notifyQueued(job, { position: 1, reason: "thread-active" });
+        this.releaseJobSlot(job);
+        if (externalCompleted) void this.drain(state);
+        return false;
+      }
       state.scheduledJob = undefined;
-      state.status = "idle";
+      state.status = isThreadNotFoundError(error) ? "unknown" : "idle";
       this.rejectJob(job, asError(error));
       this.releaseJobSlot(job);
       void this.drain(state);
@@ -333,7 +540,336 @@ export class AppServerTurnManager {
     }
   }
 
-  private handleNotification(notification: AppServerNotification): void {
+  private async reconcileLostTurnStart(
+    state: ThreadState,
+    job: TurnJob,
+  ): Promise<"active" | "settled"> {
+    try {
+      const resumed = await this.client.request<ThreadResumeResponse>("thread/resume", {
+        threadId: job.request.threadId,
+      });
+      this.assertNotDisposed();
+      state.status = resumed.thread.status.type;
+      const response = await this.client.request<ThreadReadResponse>("thread/read", {
+        threadId: job.request.threadId,
+        includeTurns: true,
+      });
+      this.assertNotDisposed();
+      if (!job.previousTurnKnown) {
+        throw new AppServerRequestError("APP_SERVER_ACCEPTANCE_UNKNOWN");
+      }
+      const candidates = turnsAfter(response.thread.turns, job.previousTurnId ?? null);
+      if (candidates.length !== 1) {
+        throw new AppServerRequestError("APP_SERVER_ACCEPTANCE_UNKNOWN");
+      }
+      const turn = candidates[0]!;
+      const turnId = boundedNonblankString(turn.id, 512);
+      if (!turnId) throw new AppServerRequestError("APP_SERVER_ACCEPTANCE_UNKNOWN");
+      const status = readString(turn, "status");
+      if (status === "inProgress" || status === "active") {
+        this.confirmTurnIdentity(state, job, turnId);
+        if (job.settled) return "settled";
+        state.status = "active";
+        return "active";
+      }
+      if (job.provisionalTurnId && job.provisionalTurnId !== turnId) {
+        throw new AppServerRequestError("APP_SERVER_ACCEPTANCE_UNKNOWN");
+      }
+      job.provisionalTurnId = undefined;
+      job.provisionalNotifications = undefined;
+      this.bindTurnIdentity(state, job, turnId);
+      if (this.disposed || job.settled) return "settled";
+      state.status = "idle";
+      try {
+        this.replayTurn(job, turn);
+      } catch (error) {
+        this.rejectJob(job, asError(error));
+      }
+      return "settled";
+    } catch {
+      if (this.disposed) throw disposedError();
+      state.status = "unknown";
+      throw new AppServerRequestError("APP_SERVER_ACCEPTANCE_UNKNOWN");
+    }
+  }
+
+  private async startTurnWithRecovery(
+    state: ThreadState,
+    job: TurnJob,
+  ): Promise<TurnStartResponse> {
+    const params = {
+      threadId: job.request.threadId,
+      input: job.request.input,
+      cwd: job.request.cwd,
+      model: job.request.model,
+      effort: job.request.reasoningEffort,
+      approvalPolicy: job.request.approvalPolicy,
+      sandboxPolicy: toSandboxPolicy(job.request.sandbox, job.request.cwd),
+    };
+
+    try {
+      return await this.dispatchTurnStart(state, job, params);
+    } catch (error) {
+      if (!isThreadNotFoundError(error)) throw error;
+    }
+
+    this.assertNotDisposed();
+    let resumed: ThreadResumeResponse;
+    try {
+      resumed = await this.client.request<ThreadResumeResponse>("thread/resume", {
+        threadId: job.request.threadId,
+      });
+    } catch (error) {
+      if (
+        isAppServerFailure(error, "APP_SERVER_NOT_SENT") ||
+        isAppServerFailure(error, "APP_SERVER_ACCEPTANCE_UNKNOWN")
+      ) {
+        throw new AppServerRequestError("APP_SERVER_NOT_SENT");
+      }
+      throw error;
+    }
+    this.assertNotDisposed();
+    state.status = resumed.thread.status.type;
+    if (Array.isArray(resumed.thread.turns)) {
+      state.latestTurnId = latestTurnIdFromTurns(resumed.thread.turns);
+      state.latestTurnKnown = true;
+    }
+    return this.dispatchTurnStart(state, job, params);
+  }
+
+  private async dispatchTurnStart(
+    state: ThreadState,
+    job: TurnJob,
+    params: object,
+  ): Promise<TurnStartResponse> {
+    if (job.previousTurnId === undefined) {
+      job.previousTurnId = state.latestTurnId;
+      job.previousTurnKnown = state.latestTurnKnown;
+    }
+    const attempt = (job.dispatchAttempt ?? 0) + 1;
+    job.dispatchAttempt = attempt;
+    job.dispatchWritten = false;
+    this.notifyObserver(() => job.request.callbacks.onDispatching?.({
+      previousTurnId: job.previousTurnId!,
+      attempt,
+    }));
+    this.assertNotDisposed();
+    if (job.settled) throw disposedError();
+
+    let value: unknown;
+    try {
+      value = await this.client.request<unknown>(
+        "turn/start",
+        params,
+        {
+          beforeSend: () => job.request.callbacks.beforeDispatchWrite?.({
+            threadId: job.request.threadId,
+            previousTurnId: job.previousTurnId!,
+            previousTurnKnown: job.previousTurnKnown === true,
+            attempt,
+          }),
+          onWritten: () => {
+            job.dispatchWritten = true;
+            this.notifyObserver(job.request.callbacks.onDispatchWritten);
+          },
+        },
+      );
+    } catch (error) {
+      if (isBusyError(error) && job.provisionalTurnId) {
+        const provisionalTurnId = job.provisionalTurnId;
+        const completed = job.provisionalNotifications?.some(({ notification }) => {
+          if (notification.method !== "turn/completed") return false;
+          const notificationParams = asRecord(notification.params);
+          const completedTurnId = boundedNonblankString(notificationParams.turnId, 512) ??
+            boundedNonblankString(asRecord(notificationParams.turn).id, 512);
+          return completedTurnId === provisionalTurnId;
+        }) === true;
+        if (completed) {
+          state.latestTurnId = provisionalTurnId;
+          state.latestTurnKnown = true;
+          state.externalActiveTurnId = undefined;
+          job.provisionalExternalCompleted = true;
+        } else {
+          state.externalActiveTurnId = provisionalTurnId;
+        }
+      }
+      if (
+        isAppServerFailure(error, "APP_SERVER_NOT_SENT") ||
+        isAppServerFailure(error, "APP_SERVER_REJECTED") ||
+        isBusyError(error) ||
+        isThreadNotFoundError(error)
+      ) {
+        job.provisionalTurnId = undefined;
+        job.provisionalNotifications = undefined;
+        job.previousTurnId = undefined;
+        job.previousTurnKnown = undefined;
+      }
+      throw error;
+    }
+    const response = turnStartResponse(value);
+    if (job.turnId && job.turnId !== response.turn.id) {
+      throw new AppServerRequestError("APP_SERVER_ACCEPTANCE_UNKNOWN");
+    }
+    return response;
+  }
+
+  private confirmTurnIdentity(state: ThreadState, job: TurnJob, turnId: string): void {
+    if (job.provisionalTurnId && job.provisionalTurnId !== turnId) {
+      throw new AppServerRequestError("APP_SERVER_ACCEPTANCE_UNKNOWN");
+    }
+    const buffered = job.provisionalNotifications ?? [];
+    job.provisionalTurnId = undefined;
+    job.provisionalNotifications = undefined;
+    this.bindTurnIdentity(state, job, turnId);
+    if (this.disposed || job.settled) return;
+    for (const { notification, receiptAt } of buffered) {
+      this.handleNotification(notification, receiptAt);
+      if (this.disposed || job.settled) return;
+    }
+  }
+
+  private bindTurnIdentity(state: ThreadState, job: TurnJob, turnId: string): void {
+    if (job.turnId && job.turnId !== turnId) {
+      throw new AppServerRequestError("APP_SERVER_ACCEPTANCE_UNKNOWN");
+    }
+    job.turnId = turnId;
+    state.latestTurnId = turnId;
+    state.latestTurnKnown = true;
+    state.externalActiveTurnId = undefined;
+    if (job.startedNotified) return;
+    job.startedNotified = true;
+    this.notifyObserver(() => job.request.callbacks.onStarted?.(turnId));
+  }
+
+  private bindRecoveredTurnIdentity(state: ThreadState, job: TurnJob, turnId: string): void {
+    if (job.turnId && job.turnId !== turnId) {
+      throw new AppServerRequestError("APP_SERVER_ACCEPTANCE_UNKNOWN");
+    }
+    job.turnId = turnId;
+    if (!state.latestTurnKnown) {
+      state.latestTurnId = turnId;
+      state.latestTurnKnown = true;
+    }
+    if (job.startedNotified) return;
+    job.startedNotified = true;
+    this.notifyObserver(() => job.request.callbacks.onStarted?.(turnId));
+  }
+
+  private notifyQueued(job: TurnJob, status: AppServerQueueStatus): void {
+    try {
+      job.request.callbacks.onQueued?.(status);
+    } catch {
+      // Queue observers cannot corrupt job or scheduler state.
+    }
+  }
+
+  private notifyObserver(observer: (() => void) | undefined): void {
+    try {
+      observer?.();
+    } catch {
+      // Observers cannot alter execution state or scheduler ownership.
+    }
+  }
+
+  private handleDisconnect(): void {
+    if (this.disposed) return;
+    for (const state of this.threads.values()) {
+      if (state.activeJob?.turnId) {
+        state.status = "unknown";
+        this.reconcileActiveJob(state, state.activeJob);
+        continue;
+      }
+      if (state.activeJob || state.startingJob) continue;
+
+      state.status = "unknown";
+      if (!state.scheduledJob && state.queue.length > 0) void this.drain(state);
+    }
+  }
+
+  private reconcileActiveJob(state: ThreadState, job: TurnJob): void {
+    if (state.reconcilePromise) return;
+
+    state.reconcilePromise = this.reconcileActiveJobAfterDisconnect(state, job).finally(() => {
+      if (!this.disposed) state.reconcilePromise = undefined;
+    });
+  }
+
+  private async reconcileActiveJobAfterDisconnect(
+    state: ThreadState,
+    job: TurnJob,
+  ): Promise<void> {
+    try {
+      const resumed = await this.client.request<ThreadResumeResponse>("thread/resume", {
+        threadId: job.request.threadId,
+      });
+      if (this.disposed || job.settled || state.activeJob !== job) return;
+
+      state.status = resumed.thread.status.type;
+      if (state.status === "active") {
+        const response = await this.client.request<ThreadReadResponse>("thread/read", {
+          threadId: job.request.threadId,
+          includeTurns: true,
+        });
+        if (this.disposed || job.settled || state.activeJob !== job) return;
+
+        const activeTurnId = findActiveTurnId(response);
+        if (activeTurnId === job.turnId) return;
+
+        state.activeJob = undefined;
+        state.startingJob = undefined;
+        state.scheduledJob = undefined;
+        const detail = activeTurnId
+          ? `thread resumed with different active turn ${activeTurnId}`
+          : "thread resumed active but the original active turn could not be confirmed";
+        this.rejectJob(
+          job,
+          new Error(
+            `Codex connection was lost while recovering turn ${job.turnId}: ${detail}. ` +
+            "Reopen the thread to recover the original result.",
+          ),
+        );
+        this.releaseJobSlot(job);
+        void this.drain(state);
+        return;
+      }
+
+      state.activeJob = undefined;
+      state.startingJob = undefined;
+      state.scheduledJob = undefined;
+      try {
+        await this.replayStoredTurn(state, job);
+      } catch (error) {
+        this.rejectJob(
+          job,
+          new Error(
+            `Codex connection was lost while recovering turn ${job.turnId}: ${asError(error).message}`,
+          ),
+        );
+      }
+      this.releaseJobSlot(job);
+      void this.drain(state);
+    } catch (error) {
+      if (this.disposed || job.settled || state.activeJob !== job) return;
+      state.activeJob = undefined;
+      state.startingJob = undefined;
+      state.scheduledJob = undefined;
+      state.status = "unknown";
+      this.rejectJob(
+        job,
+        new Error(
+          `Codex connection was lost while recovering turn ${job.turnId}: ${asError(error).message}`,
+        ),
+      );
+      this.releaseJobSlot(job);
+      void this.drain(state);
+    }
+  }
+
+  private handleNotification(
+    notification: AppServerNotification,
+    receiptAt = this.now(),
+  ): void {
+    if (this.disposed) return;
     const params = asRecord(notification.params);
     const threadId = readString(params, "threadId");
     if (!threadId) {
@@ -345,44 +881,151 @@ export class AppServerTurnManager {
     }
 
     if (notification.method === "thread/status/changed") {
+      this.emitActivity(state.activeJob, notification, params, receiptAt);
+      if (this.disposed) return;
       const status = asRecord(params.status);
       const statusType = readString(status, "type") as ThreadState["status"] | undefined;
       if (statusType) {
         state.status = statusType;
         if (statusType === "idle") {
+          const active = state.activeJob;
+          if (active?.errorObserved) this.reconcileTerminalAfterError(state, active);
           void this.drain(state);
         }
       }
       return;
     }
 
-    const turnId = readString(params, "turnId") ?? readString(asRecord(params.turn), "id");
+    const turnId = boundedNonblankString(params.turnId, 512) ??
+      boundedNonblankString(asRecord(params.turn).id, 512);
     if (!turnId) {
       return;
     }
 
-    const job = findJobForTurn(state, turnId);
+    let job = findJobForTurn(state, turnId);
+    if (
+      !job &&
+      state.startingJob &&
+      !state.startingJob.turnId &&
+      state.startingJob.dispatchWritten
+    ) {
+      const startingJob = state.startingJob;
+      if (notification.method === "turn/started" && !startingJob.provisionalTurnId) {
+        startingJob.provisionalTurnId = turnId;
+      }
+      if (startingJob.provisionalTurnId === turnId) {
+        const buffered = startingJob.provisionalNotifications ?? [];
+        startingJob.provisionalNotifications = buffered;
+        if (buffered.length >= MAX_PROVISIONAL_NOTIFICATIONS) {
+          state.startingJob = undefined;
+          state.scheduledJob = undefined;
+          state.status = "active";
+          state.dispatchAmbiguous = true;
+          this.rejectJob(
+            startingJob,
+            new AppServerRequestError("APP_SERVER_ACCEPTANCE_UNKNOWN"),
+          );
+          this.releaseJobSlot(startingJob);
+          return;
+        }
+        buffered.push({ notification, receiptAt });
+        return;
+      }
+    }
+    if (notification.method === "turn/started") {
+      if (
+        !job &&
+        !state.activeJob &&
+        !state.startingJob &&
+        !state.scheduledJob &&
+        !state.dispatchAmbiguous
+      ) {
+        state.externalActiveTurnId = turnId;
+      }
+      this.emitActivity(job, notification, params, receiptAt);
+      return;
+    }
     if (notification.method === "turn/completed") {
-      this.completeTurn(state, job, params);
+      const completesObservedExternal = !job && state.externalActiveTurnId === turnId;
+      if (job || completesObservedExternal || (state.latestTurnKnown && state.latestTurnId === null)) {
+        state.latestTurnId = turnId;
+        state.latestTurnKnown = true;
+      }
+      if (completesObservedExternal) state.externalActiveTurnId = undefined;
+      this.emitActivity(job, notification, params, receiptAt);
+      if (this.disposed || job?.settled) return;
+      const eventAt = isUtcMilliseconds(notification.emittedAtMs)
+        ? notification.emittedAtMs
+        : receiptAt;
+      this.completeTurn(state, job, params, eventAt);
       return;
     }
     if (!job) {
       return;
     }
 
-    this.routeJobNotification(job, notification.method, params);
+    this.emitActivity(job, notification, params, receiptAt);
+    if (this.disposed || job.settled) return;
+    this.routeJobNotification(state, job, notification.method, params);
+  }
+
+  private emitActivity(
+    job: TurnJob | undefined,
+    notification: AppServerNotification,
+    params: Record<string, unknown>,
+    receiptAt: number,
+  ): void {
+    if (!job || job.settled) return;
+    const mapping = mapAppServerActivity(notification.method, params);
+    if (!mapping) return;
+    const previous = job.lastActivityObservation;
+    if (
+      mapping.sample &&
+      previous?.sample === true &&
+      previous?.activity === mapping.activity &&
+      receiptAt - previous.receiptAt < this.activityCoalesceMs
+    ) {
+      return;
+    }
+    job.lastActivityObservation = {
+      activity: mapping.activity,
+      receiptAt,
+      sample: mapping.sample,
+    };
+    const eventAt = isUtcMilliseconds(notification.emittedAtMs)
+      ? notification.emittedAtMs
+      : receiptAt;
+    this.notifyObserver(() => job.request.callbacks.onActivity?.({
+      activity: mapping.activity,
+      eventAt,
+      method: notification.method,
+    }));
   }
 
   private async recoverJob(job: TurnJob): Promise<void> {
+    this.assertNotDisposed();
     const state = this.getThreadState(job.request.threadId);
     await this.ensureThread(job.request, state);
-
-    if (state.status !== "active") {
-      await this.replayStoredTurn(job);
-      return;
-    }
+    this.assertNotDisposed();
+    const recoveredTurnId = boundedNonblankString(job.turnId, 512);
+    if (!recoveredTurnId) throw new Error("Recovered turn id must be a bounded non-empty string");
     if (state.activeJob || state.startingJob || state.scheduledJob) {
       throw new Error(`Cannot recover turn ${job.turnId ?? "unknown"}: thread already tracked`);
+    }
+    state.startingJob = job;
+    this.bindRecoveredTurnIdentity(state, job, recoveredTurnId);
+    if (this.disposed || job.settled) return;
+
+    if (state.status !== "active") {
+      try {
+        await this.replayStoredTurn(state, job);
+      } finally {
+        if (!this.disposed && state.startingJob === job) {
+          state.startingJob = undefined;
+          void this.drain(state);
+        }
+      }
+      return;
     }
 
     const slot = deferred();
@@ -390,6 +1033,7 @@ export class AppServerTurnManager {
     const schedulerCallbacks: TurnSchedulerCallbacks = {};
     job.schedulerCallbacks = schedulerCallbacks;
     state.activeJob = job;
+    state.startingJob = undefined;
     state.scheduledJob = job;
     void this.scheduler.run(
       job.request.threadId,
@@ -398,19 +1042,28 @@ export class AppServerTurnManager {
     ).catch((error) => {
       if (!job.settled) this.rejectJob(job, asError(error));
     });
-    job.request.callbacks.onStarted?.(job.turnId!);
   }
 
-  private async replayStoredTurn(job: TurnJob): Promise<void> {
+  private async replayStoredTurn(state: ThreadState, job: TurnJob): Promise<void> {
     const response = await this.client.request<ThreadReadResponse>("thread/read", {
       threadId: job.request.threadId,
       includeTurns: true,
     });
+    this.assertNotDisposed();
     const turns = Array.isArray(response.thread.turns) ? response.thread.turns : [];
-    const turn = turns.map(asRecord).find((entry) => readString(entry, "id") === job.turnId);
+    state.latestTurnId = latestTurnIdFromTurns(turns);
+    state.latestTurnKnown = true;
+    const turn = turns
+      .map(asRecord)
+      .find((entry) => boundedNonblankString(entry.id, 512) === job.turnId);
     if (!turn) throw new Error(`No rollout found for turn ${job.turnId ?? "unknown"}`);
 
+    this.replayTurn(job, turn);
+  }
+
+  private replayTurn(job: TurnJob, turn: Record<string, unknown>): void {
     const status = readString(turn, "status");
+    if (status) this.notifyObserver(() => job.request.callbacks.onTurnOutcome?.({ status, eventAt: this.now() }));
     if (status !== "completed") {
       throw new Error(readString(asRecord(turn.error), "message") ?? `Codex turn ${status ?? "failed"}`);
     }
@@ -438,11 +1091,16 @@ export class AppServerTurnManager {
         job.request.callbacks.onToolEnd(itemId, false);
       }
     }
-    job.request.callbacks.onAgentEnd();
+    this.notifyObserver(job.request.callbacks.onAgentEnd);
     this.resolveJob(job);
   }
 
-  private routeJobNotification(job: TurnJob, method: string, params: Record<string, unknown>): void {
+  private routeJobNotification(
+    state: ThreadState,
+    job: TurnJob,
+    method: string,
+    params: Record<string, unknown>,
+  ): void {
     const callbacks = job.request.callbacks;
     if (method === "item/agentMessage/delta") {
       const delta = readString(params, "delta");
@@ -478,6 +1136,8 @@ export class AppServerTurnManager {
     }
     if (method === "error") {
       job.errorMessage = readString(asRecord(params.error), "message") ?? "Codex turn failed";
+      job.errorObserved = true;
+      if (state.status === "idle") this.reconcileTerminalAfterError(state, job);
       return;
     }
     if (method === "turn/plan/updated") {
@@ -545,7 +1205,62 @@ export class AppServerTurnManager {
     }
   }
 
-  private completeTurn(state: ThreadState, job: TurnJob | undefined, params: Record<string, unknown>): void {
+  private reconcileTerminalAfterError(state: ThreadState, job: TurnJob): void {
+    if (job.terminalReconciliation || job.settled || !job.turnId) return;
+    const promise = this.reconcileTerminalAfterErrorNow(state, job).finally(() => {
+      if (job.terminalReconciliation === promise) job.terminalReconciliation = undefined;
+    });
+    job.terminalReconciliation = promise;
+    void promise.catch(() => undefined);
+  }
+
+  private async reconcileTerminalAfterErrorNow(state: ThreadState, job: TurnJob): Promise<void> {
+    const turnId = job.turnId;
+    if (!turnId) return;
+    let response: ThreadReadResponse;
+    try {
+      response = await this.client.request<ThreadReadResponse>("thread/read", {
+        threadId: job.request.threadId,
+        includeTurns: true,
+      });
+    } catch {
+      return;
+    }
+    if (this.disposed || job.settled || state.activeJob !== job) return;
+    const turns = Array.isArray(response.thread?.turns) ? response.thread.turns : [];
+    const exact = turns.map(asRecord)
+      .filter((turn) => boundedNonblankString(turn.id, 512) === turnId);
+    if (exact.length !== 1) return;
+    const turn = exact[0]!;
+    const status = boundedNonblankString(turn.status, 128);
+    if (!status || !TERMINAL_TURN_STATUSES.has(status)) return;
+
+    state.latestTurnId = turnId;
+    state.latestTurnKnown = true;
+    state.status = "idle";
+    state.activeJob = undefined;
+    state.startingJob = undefined;
+    state.scheduledJob = undefined;
+    try {
+      const replay = Object.hasOwn(turn, "error") || !job.errorMessage
+        ? turn : { ...turn, error: { message: job.errorMessage } };
+      this.replayTurn(job, replay);
+    } catch (error) {
+      this.rejectJob(job, asError(error));
+    } finally {
+      this.releaseJobSlot(job);
+      void this.drain(state);
+    }
+  }
+
+  private completeTurn(
+    state: ThreadState,
+    job: TurnJob | undefined,
+    params: Record<string, unknown>,
+    eventAt: number,
+  ): void {
+    if (this.disposed) return;
+    if (!job && state.dispatchAmbiguous) return;
     state.status = "idle";
     if (!job) {
       void this.drain(state);
@@ -556,10 +1271,13 @@ export class AppServerTurnManager {
     state.startingJob = undefined;
     state.scheduledJob = undefined;
     const turn = asRecord(params.turn);
-    const status = readString(turn, "status");
+    const status = boundedNonblankString(turn.status, 128);
+    if (status) this.notifyObserver(() => job.request.callbacks.onTurnOutcome?.({ status, eventAt }));
     if (status === "completed") {
-      if (job.usage) job.request.callbacks.onTurnComplete?.(job.usage);
-      job.request.callbacks.onAgentEnd();
+      if (job.usage) {
+        this.notifyObserver(() => job.request.callbacks.onTurnComplete?.(job.usage!));
+      }
+      this.notifyObserver(job.request.callbacks.onAgentEnd);
       this.resolveJob(job);
     } else {
       const message = job.errorMessage ?? readString(asRecord(turn.error), "message") ?? `Codex turn ${status ?? "failed"}`;
@@ -570,6 +1288,31 @@ export class AppServerTurnManager {
   }
 
   private async drain(state: ThreadState): Promise<void> {
+    if (this.disposed) return;
+    if (state.dispatchAmbiguous) return;
+    if (
+      state.activeJob ||
+      state.startingJob ||
+      state.scheduledJob ||
+      state.initializePromise
+    ) {
+      return;
+    }
+
+    if (state.status === "unknown") {
+      const queued = state.queue[0];
+      if (!queued) return;
+      try {
+        await this.ensureThread(queued.request, state);
+      } catch (error) {
+        if (this.disposed) return;
+        if (state.queue[0] === queued) state.queue.shift();
+        this.rejectJob(queued, asError(error));
+        void this.drain(state);
+        return;
+      }
+    }
+
     if (state.status !== "idle" || state.activeJob || state.startingJob || state.scheduledJob) {
       return;
     }
@@ -577,6 +1320,10 @@ export class AppServerTurnManager {
     if (next) {
       this.scheduleJob(state, next);
     }
+  }
+
+  private assertNotDisposed(): void {
+    if (this.disposed) throw disposedError();
   }
 
   private resolveJob(job: TurnJob): void {
@@ -620,6 +1367,39 @@ function findJobForTurn(state: ThreadState, turnId: string): TurnJob | undefined
   return undefined;
 }
 
+function findActiveTurnId(response: ThreadReadResponse): string | undefined {
+  const turns = Array.isArray(response.thread.turns) ? response.thread.turns : [];
+  for (const value of turns) {
+    const turn = asRecord(value);
+    const status = readString(turn, "status");
+    if (status === "inProgress" || status === "active") {
+      return boundedNonblankString(turn.id, 512);
+    }
+  }
+  return undefined;
+}
+
+function latestTurnIdFromTurns(turns: unknown[]): string | null {
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const id = boundedNonblankString(asRecord(turns[index]).id, 512);
+    if (id) return id;
+  }
+  return null;
+}
+
+function turnsAfter(
+  value: unknown,
+  previousTurnId: string | null,
+): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  const turns = value.map(asRecord);
+  if (previousTurnId === null) return turns;
+  const previousIndex = turns.findIndex(
+    (turn) => boundedNonblankString(turn.id, 512) === previousTurnId,
+  );
+  return previousIndex < 0 ? [] : turns.slice(previousIndex + 1);
+}
+
 function toSandboxPolicy(sandbox: string, cwd: string): object {
   if (sandbox === "danger-full-access") return { type: "dangerFullAccess" };
   if (sandbox === "read-only") return { type: "readOnly", networkAccess: true };
@@ -643,8 +1423,38 @@ function summarizeFileChanges(value: unknown): string {
 }
 
 function isBusyError(error: unknown): boolean {
-  const message = asError(error).message.toLowerCase();
-  return message.includes("active turn") || message.includes("already running") || message.includes("busy");
+  if (appServerReason(error) === "THREAD_BUSY") return true;
+  const message = asError(error).message
+    .replace(/ \(code -?\d+\)$/, "")
+    .trim()
+    .toLowerCase();
+  return (
+    message === "thread busy" ||
+    message === "thread has an active turn" ||
+    message === "turn is already running"
+  );
+}
+
+function isThreadNotFoundError(error: unknown): boolean {
+  if (appServerReason(error) === "THREAD_NOT_FOUND") return true;
+  return /^thread not found: .+ \(code -32600\)$/i.test(asError(error).message);
+}
+
+function isAppServerFailure(error: unknown, code: string): boolean {
+  return asRecord(error).code === code;
+}
+
+function appServerReason(error: unknown): string | undefined {
+  const value = asRecord(error).reason;
+  return typeof value === "string" ? value : undefined;
+}
+
+function isConnectionClosedError(error: unknown): boolean {
+  return asError(error).message === "App-server connection closed";
+}
+
+function disposedError(): Error {
+  return new Error("App-server turn manager disposed");
 }
 
 function asError(error: unknown): Error {
@@ -653,6 +1463,42 @@ function asError(error: unknown): Error {
 
 function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+}
+
+function turnStartResponse(value: unknown): TurnStartResponse {
+  if (!isPlainRecord(value)) throw new AppServerRequestError("APP_SERVER_ACCEPTANCE_UNKNOWN");
+  const turn = value.turn;
+  if (!isPlainRecord(turn)) throw new AppServerRequestError("APP_SERVER_ACCEPTANCE_UNKNOWN");
+  const id = boundedNonblankString(turn.id, 512);
+  const status = boundedNonblankString(turn.status, 128);
+  if (!id || !status) throw new AppServerRequestError("APP_SERVER_ACCEPTANCE_UNKNOWN");
+  return { turn: { id, status } };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    Object.getPrototypeOf(value) === Object.prototype
+  );
+}
+
+function boundedNonblankString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string" || value.length > maxLength || value.trim().length === 0) {
+    return undefined;
+  }
+  return value;
+}
+
+function isUtcMilliseconds(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function nonNegativeInterval(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error("activityCoalesceMs must be a non-negative safe integer");
+  }
+  return value;
 }
 
 function readString(record: Record<string, unknown>, key: string): string | undefined {

@@ -1,7 +1,9 @@
 import {
   buildStatusSnapshot,
   groupRunningThreads,
+  renderMiniAppLauncher,
   renderStatusBoard,
+  telegramRetryAfterMs,
   type HostThreadView,
   type StatusJobView,
   type StatusSnapshot,
@@ -45,6 +47,112 @@ const host = (overrides: Partial<HostThreadView> = {}): HostThreadView => ({
   ...overrides,
 });
 
+describe("telegramRetryAfterMs", () => {
+  it("reads direct Telegram retry_after seconds as milliseconds", () => {
+    expect(telegramRetryAfterMs({
+      error_code: 429,
+      parameters: { retry_after: 12 },
+    })).toBe(12_000);
+  });
+
+  it("reads retry_after through a typical grammY error wrapper", () => {
+    expect(telegramRetryAfterMs({
+      error: {
+        error_code: 429,
+        parameters: { retry_after: 23 },
+      },
+    })).toBe(23_000);
+  });
+
+  it("uses retry_after from the explicit 429 candidate instead of its wrapper", () => {
+    expect(telegramRetryAfterMs({
+      parameters: { retry_after: 3_600 },
+      error: { error_code: 429, parameters: { retry_after: 2 } },
+    })).toBe(2_000);
+  });
+
+  it("uses an inner explicit 429 candidate when its wrapper has a non-429 code", () => {
+    expect(telegramRetryAfterMs({
+      error_code: 403,
+      parameters: { retry_after: 3_600 },
+      error: { error_code: 429, parameters: { retry_after: 2 } },
+    })).toBe(2_000);
+  });
+
+  it("does not borrow wrapper parameters for an explicit 429 candidate", () => {
+    expect(telegramRetryAfterMs({
+      parameters: { retry_after: 3_600 },
+      error: { error_code: 429 },
+    })).toBe(30_000);
+  });
+
+  it("uses the first valid delay among explicit 429 candidates", () => {
+    expect(telegramRetryAfterMs({
+      error_code: 429,
+      error: { error_code: 429, parameters: { retry_after: 2 } },
+    })).toBe(2_000);
+  });
+
+  it("uses retry_after from the text-only rate-limit candidate", () => {
+    expect(telegramRetryAfterMs({
+      parameters: { retry_after: 3_600 },
+      error: {
+        description: "Too Many Requests: retry later",
+        parameters: { retry_after: 2 },
+      },
+    })).toBe(2_000);
+  });
+
+  it("does not borrow nested parameters for a text-only rate-limit candidate", () => {
+    expect(telegramRetryAfterMs({
+      description: "Too Many Requests: retry later",
+      error: { parameters: { retry_after: 2 } },
+    })).toBe(30_000);
+  });
+
+  it("uses the first valid delay among text-only rate-limit candidates", () => {
+    expect(telegramRetryAfterMs({
+      description: "Too Many Requests: retry later",
+      error: {
+        message: "429 rate limited",
+        parameters: { retry_after: 2 },
+      },
+    })).toBe(2_000);
+  });
+
+  it.each([
+    { error_code: 429 },
+    { error_code: 429, parameters: { retry_after: 0 } },
+    { error_code: 429, parameters: { retry_after: -1 } },
+    { error_code: 429, parameters: { retry_after: 0.5 } },
+    { error_code: 429, parameters: { retry_after: Number.NaN } },
+    { error_code: 429, parameters: { retry_after: Number.POSITIVE_INFINITY } },
+    { error_code: 429, parameters: { retry_after: Number.MAX_SAFE_INTEGER + 1 } },
+    { error_code: 429, parameters: { retry_after: 7_200 } },
+    { error_code: 429, parameters: { retry_after: "20" } },
+  ])("uses the 30 second fallback for a 429 without valid retry_after", (error) => {
+    expect(telegramRetryAfterMs(error)).toBe(30_000);
+  });
+
+  it.each([
+    [1, 1_000],
+    [3_600, 3_600_000],
+  ])("accepts the retry_after boundary %i seconds", (retryAfter, expectedMs) => {
+    expect(telegramRetryAfterMs({
+      error_code: 429,
+      parameters: { retry_after: retryAfter },
+    })).toBe(expectedMs);
+  });
+
+  it("does not attach retry delay to a non-429 error", () => {
+    expect(telegramRetryAfterMs({
+      error_code: 500,
+      description: "Too Many Requests from an upstream dependency",
+      parameters: { retry_after: 12 },
+    })).toBeUndefined();
+  });
+});
+
 describe("groupRunningThreads", () => {
   it("nests an active subagent under its parent", () => {
     const tasks = groupRunningThreads([
@@ -54,6 +162,7 @@ describe("groupRunningThreads", () => {
 
     expect(tasks).toHaveLength(1);
     expect(tasks[0].children).toHaveLength(1);
+    expect(tasks[0].children[0].threadId).toBe("child");
     expect(tasks[0].children[0].label).toContain("Rawls");
   });
 
@@ -338,6 +447,19 @@ describe("renderStatusBoard", () => {
       text: expect.stringContaining("＋"),
       callbackData: "projopen:recent-1",
     });
+  });
+});
+
+describe("renderMiniAppLauncher", () => {
+  it("renders one stable Dashboard launcher button", () => {
+    expect(renderMiniAppLauncher("https://t.me/telecodex_bot/dashboard?startapp=dashboard"))
+      .toEqual({
+        body: "📊 <b>TeleCodex Dashboard</b>\n\nСтатусы и действия теперь доступны в Mini App.",
+        buttons: [{
+          text: "Открыть Dashboard",
+          url: "https://t.me/telecodex_bot/dashboard?startapp=dashboard",
+        }],
+      });
   });
 });
 

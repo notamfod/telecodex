@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   GitLabClient,
+  buildReviewBootstrapPrompt,
   buildReviewPrompt,
   formatChanges,
   mergeRequestButtons,
@@ -231,6 +232,19 @@ describe("buildReviewPrompt", () => {
     const prompt = buildReviewPrompt(mr(), [], 10_000);
 
     expect(prompt).toMatch(/рабочая копия.*не переключена|дифф.*источник правды/i);
+  });
+});
+
+describe("buildReviewBootstrapPrompt", () => {
+  it("identifies the exact MR and requires a fresh read-only diff", () => {
+    const prompt = buildReviewBootstrapPrompt(mr());
+
+    expect(prompt).toContain("!19");
+    expect(prompt).toContain("project id 48");
+    expect(prompt).toContain("https://gitlab.example.com/acme/apps/api/-/merge_requests/19");
+    expect(prompt).toMatch(/fresh|свеж/i);
+    expect(prompt).toMatch(/read-only|ничего не меняй/i);
+    expect(prompt).toMatch(/не.*инструкц/i);
   });
 });
 

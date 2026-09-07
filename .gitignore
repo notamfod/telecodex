@@ -3,6 +3,7 @@ node_modules/
 
 # Build output
 dist/
+dist-web/
 
 # Environment / secrets
 .env
@@ -16,6 +17,13 @@ workspace/
 
 # Agent tooling (local dev only)
 agent-tools/
+.superpowers/
+graphify-out/
+
+# Generated visual artifacts
+/mircli-traffic-*.png
+/mircli-traffic-*.svg
+/telecodex-mini-app-cover.png
 
 # macOS
 .DS_Store

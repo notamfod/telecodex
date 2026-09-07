@@ -283,6 +283,108 @@ describe("CodexSessionService", () => {
     );
   });
 
+  it("uses the OpenAI default for a new thread after GLM was selected", async () => {
+    const dependencies = createDependencies();
+    const service = await CodexSessionService.create(
+      createConfig({
+        modelChoices: [
+          {
+            id: "openai-default",
+            label: "OpenAI",
+            provider: "openai",
+            model: "gpt-5.6-sol",
+            supportsImages: true,
+          },
+          {
+            id: "glm-53",
+            label: "GLM",
+            provider: "zai",
+            model: "glm-5.3",
+            supportsImages: false,
+          },
+        ],
+        defaultModelChoiceId: "openai-default",
+      }),
+      { deferThreadStart: true },
+      dependencies,
+    );
+    service.setModelChoice("glm-53");
+
+    await service.newThread("/workspace/openai");
+
+    expect(dependencies.client.request).toHaveBeenCalledWith(
+      "thread/start",
+      expect.objectContaining({
+        cwd: "/workspace/openai",
+        model: "gpt-5.6-sol",
+        modelProvider: "openai",
+      }),
+    );
+  });
+
+  it("uses legacy CODEX_MODEL after resuming GLM when choices are not configured", async () => {
+    const dependencies = createDependencies();
+    const service = await CodexSessionService.create(
+      createConfig({ modelChoices: [], defaultModelChoiceId: undefined, codexModel: "o3" }),
+      {
+        model: "glm-5.3",
+        modelProvider: "zai",
+        resumeThreadId: "thread-glm",
+      },
+      dependencies,
+    );
+
+    await service.newThread("/workspace/openai");
+
+    expect(dependencies.client.request).toHaveBeenLastCalledWith(
+      "thread/start",
+      expect.objectContaining({ model: "o3", modelProvider: "openai" }),
+    );
+  });
+
+  it("lets OpenAI choose its default after resuming GLM without model config", async () => {
+    const dependencies = createDependencies();
+    dependencies.client.request.mockImplementation(async (method: string, params?: unknown) => {
+      const request = params as Record<string, unknown> | undefined;
+      if (method === "thread/resume") {
+        return { thread: { id: request?.threadId, status: { type: "idle" } } };
+      }
+      if (method === "thread/start") {
+        return {
+          thread: { id: "thread-openai", status: { type: "idle" } },
+          cwd: request?.cwd,
+        };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    const service = await CodexSessionService.create(
+      createConfig({ modelChoices: [], defaultModelChoiceId: undefined, codexModel: undefined }),
+      {
+        model: "glm-5.3",
+        modelProvider: "zai",
+        resumeThreadId: "thread-glm",
+      },
+      dependencies,
+    );
+
+    const info = await service.newThread("/workspace/openai");
+
+    expect(dependencies.client.request).toHaveBeenLastCalledWith(
+      "thread/start",
+      expect.objectContaining({ model: undefined, modelProvider: "openai" }),
+    );
+    expect(info).toEqual(expect.objectContaining({
+      threadId: "thread-openai",
+      modelProvider: "openai",
+    }));
+    expect(info.model).toBeUndefined();
+
+    await service.prompt("continue", createCallbacks());
+    expect(dependencies.turnManager.runTurn).toHaveBeenLastCalledWith(
+      expect.objectContaining({ model: undefined }),
+    );
+  });
+
   it("reports and persists the selected choice before a thread exists", async () => {
     const service = await CodexSessionService.create(
       createConfig({
@@ -405,10 +507,9 @@ describe("CodexSessionService", () => {
     await prompt;
   });
 
-  it("starts new threads with the selected model, effort, and profile", async () => {
+  it("starts new threads with the default model, effort, and profile", async () => {
     const dependencies = createDependencies();
     const service = await CodexSessionService.create(createConfig(), undefined, dependencies);
-    service.setModel("gpt-5.6-sol");
     service.setReasoningEffort("high");
     service.setLaunchProfile("readonly");
 
@@ -416,7 +517,7 @@ describe("CodexSessionService", () => {
 
     expect(dependencies.client.request).toHaveBeenLastCalledWith("thread/start", {
       cwd: "/workspace/other",
-      model: "gpt-5.6-sol",
+      model: "o3",
       modelProvider: "openai",
       approvalPolicy: "never",
       sandbox: "read-only",
@@ -426,7 +527,7 @@ describe("CodexSessionService", () => {
     expect(info).toEqual(expect.objectContaining({
       threadId: "thread-2",
       workspace: "/workspace/other",
-      model: "gpt-5.6-sol",
+      model: "o3",
       reasoningEffort: "high",
       launchProfileId: "readonly",
     }));

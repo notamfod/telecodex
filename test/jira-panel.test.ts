@@ -1,7 +1,13 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 
 import {
   JiraPanel,
+  jiraMiniAppLaunchUrl,
+  moveJiraPanelMessage,
   renderFilter,
   renderFilters,
   renderHome,
@@ -10,6 +16,7 @@ import {
   type JiraPanelMessage,
 } from "../src/jira-panel.js";
 import type { JiraClientPort } from "../src/jira-client.js";
+import { createJiraPanelStore } from "../src/jira-panel-store.js";
 
 const CHAT_ID = -1003981282865;
 const TOPIC_ID = 999;
@@ -75,24 +82,22 @@ const source = (): JiraClientPort => ({
 
 describe("Jira panel rendering", () => {
   it("renders the agreed home controls", () => {
-    const message = renderHome();
+    const launchUrl = "https://t.me/dofmatbot/dashboard?startapp=jira";
+    const message = renderHome(launchUrl);
 
     expect(message.html).toContain("Jira");
-    expect(message.rows.flat().map((button) => button.text)).toEqual([
-      "📋 Мой спринт",
-      "🏃 Текущий спринт",
-      "🗂 Канбан",
-      "⭐ Мои фильтры",
-      "🔄 Обновить",
-    ]);
-    expect(message.rows.flat()).toContainEqual({
-      text: "📋 Мой спринт",
-      callbackData: "jira:my-sprint:0",
-    });
-    expect(message.rows.flat()).toContainEqual({
-      text: "🏃 Текущий спринт",
-      callbackData: "jira:sprint:0",
-    });
+    expect(message.html).toContain("Mini App");
+    expect(message.rows).toEqual([[{ text: "Открыть Jira", url: launchUrl }]]);
+  });
+
+  it("puts the Jira start parameter into the configured direct Mini App link", () => {
+    const launchUrl = jiraMiniAppLaunchUrl(
+      "https://t.me/dofmatbot/dashboard?startapp=dashboard&mode=compact",
+    );
+    const message = renderHome(launchUrl);
+
+    expect(launchUrl).toBe("https://t.me/dofmatbot/dashboard?startapp=jira&mode=compact");
+    expect(message.rows[0]).toEqual([{ text: "Открыть Jira", url: launchUrl }]);
   });
 
   it("renders sprint issues as Jira links and reports cache age", () => {
@@ -177,19 +182,23 @@ describe("JiraPanel lifecycle", () => {
     const send = vi.fn<(message: JiraPanelMessage) => Promise<number>>().mockResolvedValue(777);
     const edit = vi.fn<(messageId: number, message: JiraPanelMessage) => Promise<void>>().mockResolvedValue(undefined);
     const pin = vi.fn<(messageId: number) => Promise<void>>().mockResolvedValue(undefined);
+    const remove = vi.fn<(messageId: number) => Promise<void>>().mockResolvedValue(undefined);
+    const logger = { warn: vi.fn() };
     const panel = new JiraPanel({
       chatId: CHAT_ID,
       topicId: TOPIC_ID,
       client,
       send,
       edit,
-      pin,
+      remove,
       store: {
         read: () => state,
         write: (next) => { state = next; },
+        withLock: (action) => action(),
       },
+      logger,
     });
-    return { panel, client, send, edit, pin, state: () => state };
+    return { panel, client, send, edit, pin, remove, logger, state: () => state };
   };
 
   it("recognises only the configured Telegram topic", () => {
@@ -200,21 +209,42 @@ describe("JiraPanel lifecycle", () => {
     expect(panel.matches(-1001, TOPIC_ID)).toBe(false);
   });
 
-  it("creates, pins and remembers the panel message", async () => {
+  it("creates an unpinned launcher and remembers its message", async () => {
     const { panel, send, pin, state } = createPanel();
 
     expect(await panel.open()).toBe("sent");
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ html: expect.stringContaining("Jira") }));
-    expect(pin).toHaveBeenCalledWith(777);
+    expect(pin).not.toHaveBeenCalled();
     expect(state()).toEqual({ messageId: 777 });
   });
 
-  it("restores the saved panel message after restart", async () => {
-    const { panel, edit, pin } = createPanel(555);
+  it("moves the launcher below fresh tasks and removes the previous message", async () => {
+    const { panel, send, edit, pin, remove, state } = createPanel(555);
 
-    expect(await panel.open()).toBe("edited");
-    expect(edit).toHaveBeenCalledWith(555, expect.any(Object));
-    expect(pin).toHaveBeenCalledWith(555);
+    expect(await panel.open()).toBe("sent");
+    expect(send).toHaveBeenCalledOnce();
+    expect(edit).not.toHaveBeenCalled();
+    expect(pin).not.toHaveBeenCalled();
+    expect(remove).toHaveBeenCalledWith(555);
+    expect(state()).toEqual({ messageId: 777 });
+  });
+
+  it("keeps the new launcher active when deleting the previous one fails", async () => {
+    const { panel, remove, logger, state } = createPanel(555);
+    remove.mockRejectedValue(new Error("message already gone"));
+
+    await expect(panel.open()).resolves.toBe("sent");
+    expect(state()).toEqual({ messageId: 777, cleanupMessageIds: [555] });
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("message already gone"));
+  });
+
+  it("does not remove the previous launcher when the new state cannot be persisted", async () => {
+    const { panel, remove } = createPanel(555);
+    const store = (panel as unknown as { options: { store: { write(): void } } }).options.store;
+    store.write = () => { throw new Error("disk full"); };
+
+    await expect(panel.open()).rejects.toThrow("disk full");
+    expect(remove).not.toHaveBeenCalledWith(555);
   });
 
   it("refreshes Jira explicitly from a callback", async () => {
@@ -224,6 +254,29 @@ describe("JiraPanel lifecycle", () => {
     expect(client.getSprint).toHaveBeenCalledWith(true);
     expect(edit).toHaveBeenCalledWith(555, expect.objectContaining({ html: expect.stringContaining("MIR-6789") }));
     expect(pin).not.toHaveBeenCalled();
+  });
+
+  it("renders the home view in place without moving the launcher", async () => {
+    const { panel, send, edit, remove, state } = createPanel(555);
+
+    expect(await panel.handleCallback("jira:home")).toBe(true);
+
+    expect(edit).toHaveBeenCalledWith(555, expect.objectContaining({
+      html: expect.stringContaining("Jira"),
+    }));
+    expect(send).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+    expect(state()).toEqual({ messageId: 555 });
+  });
+
+  it("never recreates the launcher from a callback when panel state is missing", async () => {
+    const { panel, send, edit, state } = createPanel();
+
+    expect(await panel.handleCallback("jira:sprint:0")).toBe(true);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(edit).not.toHaveBeenCalled();
+    expect(state()).toEqual({});
   });
 
   it("opens the My Sprint saved filter instead of the whole active sprint", async () => {
@@ -256,5 +309,48 @@ describe("JiraPanel lifecycle", () => {
 
     expect(await panel.handleCallback("jira:noop")).toBe(true);
     expect(edit).not.toHaveBeenCalled();
+  });
+});
+
+describe("Jira launcher serialization", () => {
+  it("serializes simultaneous moves across store instances", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "telecodex-jira-launcher-lock-"));
+    const file = path.join(directory, "jira-panel.json");
+    const firstStore = createJiraPanelStore(file);
+    const secondStore = createJiraPanelStore(file);
+    firstStore.write({ messageId: 100 });
+    let releaseFirst!: () => void;
+    const firstMayFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const firstSend = vi.fn(async () => {
+      await firstMayFinish;
+      return 200;
+    });
+    const secondSend = vi.fn(async () => 300);
+    const remove = vi.fn(async () => undefined);
+
+    try {
+      const first = moveJiraPanelMessage(renderHome(), {
+        store: firstStore,
+        send: firstSend,
+        remove,
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      const second = moveJiraPanelMessage(renderHome(), {
+        store: secondStore,
+        send: secondSend,
+        remove,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(secondSend).not.toHaveBeenCalled();
+      releaseFirst();
+      await Promise.all([first, second]);
+
+      expect(secondStore.read()).toEqual({ messageId: 300 });
+      expect(remove.mock.calls.map(([messageId]) => messageId)).toEqual([100, 200]);
+    } finally {
+      releaseFirst?.();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

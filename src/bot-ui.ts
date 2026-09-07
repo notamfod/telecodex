@@ -31,7 +31,6 @@ export function renderHelpMessage(): DualText {
       title: "🤖 Model",
       commands: [
         ["/launch_profiles", "Select launch profile"],
-        ["/model", "View & change model"],
         ["/effort", "Set reasoning effort"],
       ],
     },
@@ -87,7 +86,7 @@ export function renderWelcomeFirstTime(authWarning?: string): DualText {
   const htmlLines = [
     "<b>👋 TeleCodex is ready.</b>",
     "",
-    "Send a message, then choose a model to start a thread.",
+    "Send a message to start an OpenAI thread.",
     "You can also send voice notes, photos, or documents.",
     "",
     "Type /help for all commands.",
@@ -95,7 +94,7 @@ export function renderWelcomeFirstTime(authWarning?: string): DualText {
   const plainLines = [
     "👋 TeleCodex is ready.",
     "",
-    "Send a message, then choose a model to start a thread.",
+    "Send a message to start an OpenAI thread.",
     "You can also send voice notes, photos, or documents.",
     "",
     "Type /help for all commands.",

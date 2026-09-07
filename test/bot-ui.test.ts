@@ -21,12 +21,13 @@ describe("bot-ui", () => {
       expect(plain).toContain("/retry");
       expect(plain).toContain("/launch_profiles");
       expect(plain).toContain("/jira");
+      expect(plain).not.toContain("/model");
     });
 
-    it("lists all 21 commands", () => {
+    it("lists all 20 commands", () => {
       const { plain } = renderHelpMessage();
       const commandMatches = plain.match(/\/\w+/g) ?? [];
-      expect(commandMatches.length).toBe(21);
+      expect(commandMatches.length).toBe(20);
     });
 
     it("returns valid HTML with bold tags", () => {
@@ -61,7 +62,8 @@ describe("bot-ui", () => {
       const { html, plain } = renderWelcomeFirstTime();
       expect(html).toContain("TeleCodex is ready");
       expect(plain).toContain("/help");
-      expect(plain).toContain("Send a message, then choose a model to start a thread.");
+      expect(plain).toContain("Send a message to start an OpenAI thread.");
+      expect(plain).not.toContain("choose a model");
       expect(html).not.toContain("⚠️");
     });
 

@@ -28,7 +28,7 @@ describe("registerInboxHandlers", () => {
       safeReply: vi.fn(),
     });
 
-    expect(commands).toEqual(["inbox", "tickets", "title", "sentry"]);
+    expect(commands).toEqual(["inbox", "tickets", "title"]);
     expect(callbacks).toEqual([
       "^inbox_batch:(\\d+):(one|each|cancel)$",
       "^ticket_dup:(\\d+):(reuse|new)$",
@@ -37,5 +37,127 @@ describe("registerInboxHandlers", () => {
       "^ticket_done:(\\d+)$",
     ]);
     expect(events).toEqual(["message"]);
+  });
+
+  it("durably accepts a ticket callback before marking it started or opening a session", async () => {
+    const callbacks = new Map<string, (ctx: any) => Promise<void>>();
+    const bot = {
+      command: vi.fn(),
+      callbackQuery: (pattern: RegExp, handler: (ctx: any) => Promise<void>) => {
+        callbacks.set(pattern.source, handler);
+      },
+      on: vi.fn(),
+      api: {},
+    };
+    const ticket = {
+      id: 7,
+      inboxContextKey: "-1001:7",
+      workTopicId: 7,
+      workspace: "/work",
+      launchProfileId: "default",
+      prompt: "Investigate ticket safely",
+      source: "telegram",
+      createdAt: 1,
+    };
+    const markStarted = vi.fn(() => { (ticket as typeof ticket & { startedAt?: number }).startedAt = 2; });
+    const accept = vi.fn(async () => undefined);
+    const getContextSession = vi.fn(async () => { throw new Error("session must not open"); });
+    const setContextDefaults = vi.fn();
+
+    registerInboxHandlers({
+      bot: bot as never,
+      config: { workspace: "/work", defaultLaunchProfileId: "default" } as never,
+      registry: { listContexts: vi.fn(() => []), setContextDefaults } as never,
+      inbox: {
+        getTicket: vi.fn(() => ticket),
+        get: vi.fn(() => ({ launchProfileId: "full-access", realm: "mircli" })),
+        markStarted,
+      } as never,
+      topicActivity: { rememberIdleIcon: vi.fn() },
+      getContextSession,
+      isBusy: vi.fn(),
+      handleTicketPrompt: vi.fn(),
+      handleCanonicalTicketPrompt: accept,
+      topicIsAlive: vi.fn(),
+      sendText: vi.fn(),
+      safeReply: vi.fn(),
+    });
+    const ctx = {
+      match: ["ticket_start:7", "7"],
+      chat: { id: -1001 },
+      callbackQuery: { message: { message_thread_id: 7 } },
+      answerCallbackQuery: vi.fn(async () => undefined),
+      editMessageReplyMarkup: vi.fn(async () => undefined),
+    };
+
+    await callbacks.get("^ticket_start:(\\d+)$")!(ctx);
+
+    expect(accept).toHaveBeenCalledWith(ctx, expect.objectContaining({
+      id: ticket.id,
+      launchProfileId: "full-access",
+      prompt: expect.stringContaining("используй все подходящие доступные инструменты"),
+    }));
+    expect(accept.mock.calls[0]?.[1].prompt).toContain("dofbox --realm mircli");
+    expect(setContextDefaults).toHaveBeenCalledWith("-1001:7", {
+      workspace: "/work",
+      launchProfileId: "full-access",
+    });
+    expect(accept.mock.invocationCallOrder[0]).toBeLessThan(markStarted.mock.invocationCallOrder[0]);
+    expect(getContextSession).not.toHaveBeenCalled();
+  });
+
+  it("repairs a stale started flag without launching a second analysis for a bound thread", async () => {
+    const callbacks = new Map<string, (ctx: any) => Promise<void>>();
+    const bot = {
+      command: vi.fn(),
+      callbackQuery: (pattern: RegExp, handler: (ctx: any) => Promise<void>) => {
+        callbacks.set(pattern.source, handler);
+      },
+      on: vi.fn(),
+      api: {},
+    };
+    const ticket = {
+      id: 9,
+      inboxContextKey: "-1001:3",
+      workTopicId: 11,
+      workspace: "/work",
+      launchProfileId: "default",
+      prompt: "Investigate",
+      source: "telegram",
+      createdAt: 1,
+    };
+    const markStarted = vi.fn(() => { (ticket as typeof ticket & { startedAt?: number }).startedAt = 2; });
+    const accept = vi.fn(async () => undefined);
+    const ctx = {
+      match: ["ticket_start:9", "9"],
+      chat: { id: -1001 },
+      callbackQuery: { message: { message_thread_id: 11 } },
+      answerCallbackQuery: vi.fn(async () => undefined),
+      editMessageReplyMarkup: vi.fn(async () => undefined),
+    };
+
+    registerInboxHandlers({
+      bot: bot as never,
+      config: { workspace: "/work", defaultLaunchProfileId: "default" } as never,
+      registry: {
+        listContexts: vi.fn(() => [{ contextKey: "-1001:11", threadId: "thread-existing" }]),
+        setContextDefaults: vi.fn(),
+      } as never,
+      inbox: { getTicket: vi.fn(() => ticket), get: vi.fn(() => undefined), markStarted } as never,
+      topicActivity: { rememberIdleIcon: vi.fn() },
+      getContextSession: vi.fn(),
+      isBusy: vi.fn(),
+      handleTicketPrompt: vi.fn(),
+      handleCanonicalTicketPrompt: accept,
+      topicIsAlive: vi.fn(),
+      sendText: vi.fn(),
+      safeReply: vi.fn(),
+    });
+
+    await callbacks.get("^ticket_start:(\\d+)$")!(ctx);
+
+    expect(markStarted).toHaveBeenCalledWith(9);
+    expect(accept).not.toHaveBeenCalled();
+    expect(ctx.answerCallbackQuery).toHaveBeenCalledWith({ text: "Разбор уже запускали" });
   });
 });

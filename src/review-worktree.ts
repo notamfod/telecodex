@@ -56,6 +56,8 @@ export async function discoverReviewProjects(
     const sourcePath = path.join(root, name);
     try {
       await git(sourcePath, ["rev-parse", "--git-dir"]);
+      const topLevel = (await git(sourcePath, ["rev-parse", "--show-toplevel"])).trim();
+      if (path.resolve(topLevel) !== path.resolve(sourcePath)) continue;
       projects.push({ name, sourcePath });
     } catch {
       // First-level non-repository directories are outside the review portfolio.

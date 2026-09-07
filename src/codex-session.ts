@@ -80,7 +80,7 @@ export interface CodexSessionDependencies {
     Partial<
       Pick<
         AppServerTurnManager,
-        "cancelTurn" | "dispose" | "trackThread" | "recoverTurn" | "reloadThread"
+        "cancelTurn" | "dispose" | "trackThread" | "recoverTurn" | "reloadThread" | "interruptTurn"
       >
     >;
 }
@@ -92,7 +92,11 @@ export type CodexPromptInput = string | {
 };
 
 interface ThreadResponse {
-  thread: { id: string; status: { type: "notLoaded" | "idle" | "systemError" | "active" } };
+  thread: {
+    id: string;
+    status: { type: "notLoaded" | "idle" | "systemError" | "active" };
+    turns?: unknown[];
+  };
   cwd?: string;
   model?: string;
   modelProvider?: string;
@@ -136,7 +140,7 @@ export class CodexSessionService {
   ): Promise<CodexSessionService> {
     const service = new CodexSessionService(
       config,
-      dependencies ?? createCodexSessionDependencies(config.telegramMaxActiveTopics),
+      dependencies ?? createCodexSessionDependencies(config.telegramMaxActiveTopics, config.reliabilityTimeouts),
     );
     service.currentWorkspace = options?.workspace ?? config.workspace;
     if (options?.modelChoiceId) {
@@ -223,6 +227,19 @@ export class CodexSessionService {
     return this.currentWorkspace;
   }
 
+  applyDeferredDefaults(input: {
+    readonly workspace: string;
+    readonly launchProfileId?: string;
+    readonly topicName?: string;
+  }): void {
+    if (this.currentThreadId || this.processing) {
+      throw new Error("Cannot change defaults for an active Codex thread");
+    }
+    this.currentWorkspace = input.workspace;
+    if (input.launchProfileId) this.currentLaunchProfile = getLaunchProfile(this.config, input.launchProfileId);
+    if (input.topicName !== undefined) this.topicName = input.topicName;
+  }
+
   /** Re-reads this thread from disk, so the next turn sees what is actually there. */
   async reloadThread(): Promise<void> {
     if (!this.currentThreadId) {
@@ -294,11 +311,21 @@ export class CodexSessionService {
     }
   }
 
+  async abortTurn(threadId: string, turnId: string): Promise<void> {
+    if (!this.currentThreadId || this.currentThreadId !== threadId) {
+      throw new Error("Codex thread identity changed");
+    }
+    if (!this.dependencies.turnManager.interruptTurn) {
+      throw new Error("Exact Codex turn interruption is not available");
+    }
+    await this.dependencies.turnManager.interruptTurn(threadId, turnId);
+  }
+
   async newThread(workspace?: string, modelChoiceId?: string): Promise<CodexSessionInfo> {
     this.ensureIdle("start a new thread");
     const effectiveWorkspace = workspace ?? this.currentWorkspace;
     const choice = this.resolveSelectedModelChoice(modelChoiceId);
-    const effectiveModel = choice?.model ?? this.currentModel;
+    const effectiveModel = choice?.model;
     const modelProvider = choice?.provider ?? "openai";
     const threadConfig = {
       ...(this.currentReasoningEffort
@@ -319,9 +346,33 @@ export class CodexSessionService {
     this.currentWorkspace = effectiveWorkspace;
     this.currentModel = effectiveModel;
     this.currentModelProvider = modelProvider;
-    if (choice) this.selectedModelChoice = choice;
-    this.applyThreadResponse(response, this.currentLaunchProfile, choice);
+    this.selectedModelChoice = choice;
+    this.activeModelChoice = null;
+    this.applyThreadResponse(response, this.currentLaunchProfile, choice ?? null);
     await this.nameThread(response.thread.id);
+    return this.getInfo();
+  }
+
+  async forkThread(launchProfileId: string): Promise<CodexSessionInfo> {
+    this.ensureIdle("fork the active thread");
+    if (!this.currentThreadId) throw new Error("Codex thread is not initialized");
+
+    const profile = getLaunchProfile(this.config, launchProfileId);
+    const threadConfig = this.currentReasoningEffort
+      ? { model_reasoning_effort: this.currentReasoningEffort }
+      : undefined;
+    await this.dependencies.client.connect();
+    const response = await this.dependencies.client.request<ThreadResponse>("thread/fork", {
+      threadId: this.currentThreadId,
+      cwd: this.currentWorkspace,
+      model: this.activeModelChoice?.model ?? this.currentModel,
+      modelProvider: this.activeModelChoice?.provider ?? this.currentModelProvider,
+      approvalPolicy: profile.approvalPolicy,
+      sandbox: profile.sandboxMode,
+      ...(threadConfig ? { config: threadConfig } : {}),
+    });
+    this.currentLaunchProfile = profile;
+    this.applyThreadResponse(response, profile);
     return this.getInfo();
   }
 
@@ -448,7 +499,15 @@ export class CodexSessionService {
     fallbackChoice: CodexModelChoice | null = this.activeModelChoice,
   ): void {
     this.currentThreadId = response.thread.id;
-    this.dependencies.turnManager.trackThread?.(response.thread.id, response.thread.status.type);
+    if (Array.isArray(response.thread.turns)) {
+      this.dependencies.turnManager.trackThread?.(
+        response.thread.id,
+        response.thread.status.type,
+        latestTurnId(response.thread.turns),
+      );
+    } else {
+      this.dependencies.turnManager.trackThread?.(response.thread.id, response.thread.status.type);
+    }
     if (response.cwd) this.currentWorkspace = response.cwd;
     if (response.model) this.currentModel = response.model;
     if (response.modelProvider) this.currentModelProvider = response.modelProvider;
@@ -466,11 +525,14 @@ export class CodexSessionService {
   private createTrackedCallbacks(callbacks: CodexSessionCallbacks): CodexSessionCallbacks {
     return {
       ...callbacks,
+      onDispatching: isolatedObserver(callbacks.onDispatching),
+      onDispatchWritten: isolatedObserver(callbacks.onDispatchWritten),
+      onActivity: isolatedObserver(callbacks.onActivity),
       onTurnComplete: (usage) => {
         this.sessionTokens.input += usage.inputTokens;
         this.sessionTokens.cached += usage.cachedInputTokens;
         this.sessionTokens.output += usage.outputTokens;
-        callbacks.onTurnComplete?.(usage);
+        isolatedObserver(callbacks.onTurnComplete)(usage);
       },
     };
   }
@@ -483,10 +545,15 @@ export class CodexSessionService {
     if (choiceId) {
       return this.requireModelChoice(choiceId);
     }
-    if (this.selectedModelChoice) {
-      return this.selectedModelChoice;
-    }
-    return this.currentModel ? createLegacyChoice(this.currentModel, "openai") : undefined;
+    const configured = resolveDefaultModelChoice(
+      this.config.modelChoices,
+      this.config.defaultModelChoiceId,
+      this.config.codexModel,
+    );
+    if (configured) return configured;
+    return this.config.codexModel
+      ? createLegacyChoice(this.config.codexModel, "openai")
+      : undefined;
   }
 
   private requireModelChoice(choiceId: string): CodexModelChoice {
@@ -509,10 +576,18 @@ export class CodexSessionService {
   }
 }
 
-export function createCodexSessionDependencies(maxActiveTopics = 4): CodexSessionDependencies {
+export function createCodexSessionDependencies(
+  maxActiveTopics = 4,
+  timeouts?: TeleCodexConfig["reliabilityTimeouts"],
+): CodexSessionDependencies {
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
   const client = new AppServerClient(
     path.join(codexHome, "app-server-control", "app-server-control.sock"),
+    timeouts ? {
+      connectMs: timeouts.appServerConnectMs,
+      requestMs: timeouts.appServerRequestMs,
+      turnStartMs: timeouts.appServerTurnStartMs,
+    } : {},
   );
   return { client, turnManager: new AppServerTurnManager(client, maxActiveTopics) };
 }
@@ -564,4 +639,26 @@ function mapSandboxMode(type: string | undefined): CodexSandboxMode | undefined 
   if (type === "readOnly") return "read-only";
   if (type === "workspaceWrite") return "workspace-write";
   return undefined;
+}
+
+function latestTurnId(turns: unknown[]): string | null {
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = turns[index];
+    if (typeof turn !== "object" || turn === null) continue;
+    const id = (turn as Record<string, unknown>).id;
+    if (typeof id === "string" && id.trim().length > 0 && id.length <= 512) return id;
+  }
+  return null;
+}
+
+function isolatedObserver<T extends unknown[]>(
+  observer: ((...args: T) => void) | undefined,
+): (...args: T) => void {
+  return (...args) => {
+    try {
+      observer?.(...args);
+    } catch {
+      // Session fact observers cannot alter turn execution or token accounting.
+    }
+  };
 }

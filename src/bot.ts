@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -23,7 +23,6 @@ import {
   renderWelcomeFirstTime,
   renderWelcomeReturning,
 } from "./bot-ui.js";
-import type { CodexModelChoice } from "./codex-model.js";
 import {
   type CodexPromptInput,
   type CodexReasoningEffort,
@@ -32,6 +31,14 @@ import {
   type CodexSessionService,
 } from "./codex-session.js";
 import { checkAuthStatus, startLogin, startLogout } from "./codex-auth.js";
+import {
+  createDashboardController,
+  createPeriodicDashboardCollector,
+  createSharedAsyncLoader,
+  type DashboardController,
+} from "./dashboard-controller.js";
+import type { DashboardReliabilitySnapshot } from "./dashboard-api.js";
+import type { DashboardSessionStatus } from "./dashboard-api.js";
 import {
   findLaunchProfile,
   formatLaunchProfileBehavior,
@@ -42,6 +49,7 @@ import { threadLabel } from "./topic-sync.js";
 import {
   GitLabClient,
   buildDoneComment,
+  buildReviewBootstrapPrompt,
   buildReviewPrompt,
   linkedMergeRequests,
   mergeRequestButtons,
@@ -54,11 +62,13 @@ import {
   InboxStore,
   extractTicketKey,
   ticketActionButtons,
+  ticketHeading,
   type Ticket,
 } from "./inbox.js";
 import { registerInboxHandlers } from "./bot-inbox.js";
 import {
   ensureThreadTopic,
+  findBoundTopic,
   findLiveBoundTopic,
   groupThreadsByProject,
   partitionJobsByTopicLiveness,
@@ -80,12 +90,12 @@ import {
 } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, splitTelegramMarkdown } from "./format.js";
-import {
-  canUseChoiceForInput,
-  parsePromptModelCallback,
-  promptModelCallback,
-} from "./model-picker.js";
+import { registerGuardianCallbacks } from "./guardian-bot-adapter.js";
 import { JiraClient } from "./jira-client.js";
+import {
+  createJiraMiniAppController,
+  type JiraMiniAppController,
+} from "./jira-mini-app.js";
 import {
   JiraCommentClient,
   canPostTicketToJira,
@@ -99,6 +109,8 @@ import {
 } from "./jira-task-thread.js";
 import {
   JiraPanel,
+  jiraMiniAppLaunchUrl,
+  removeJiraLauncherMessage,
   type JiraPanelButton,
   type JiraPanelMessage,
 } from "./jira-panel.js";
@@ -119,13 +131,19 @@ import {
 } from "./recipe-review-digest.js";
 import { buildFixPrompt, fingerprintFinding, fixTopicName, type Finding } from "./recipes.js";
 import { parseRecipes, RECIPE_CONFIG_PATH } from "./recipe-config.js";
+import {
+  buildSentryAnalysisPrompt,
+  openSentryTaskThread,
+  parseSentryTaskCallback,
+  sentryTaskTopicName,
+} from "./sentry-task-thread.js";
 import { SessionRegistry } from "./session-registry.js";
-import type { SentryBridge } from "./sentry-bridge.js";
 import { listHostThreads } from "./host-threads.js";
 import {
   buildStatusSnapshot,
-  STATUS_BOARD_BUTTON_LIMIT,
   StatusBoard,
+  STATUS_BOARD_BUTTON_LIMIT,
+  telegramRetryAfterMs,
   type BoardButton,
   type HostThreadView,
   type StatusJobView,
@@ -136,10 +154,18 @@ import {
   TelegramJobStore,
   type PersistentTelegramJob,
 } from "./telegram-job-store.js";
+import type { TelegramWorkSource, TelegramWorkTargetContext } from "./telegram-job-ingress.js";
+import {
+  createTelegramInboxCompletionProcessor,
+  type TelegramCompletionProcessor,
+} from "./telegram-inbox-completion.js";
+import type { TelegramAttachmentRef } from "./telegram-job-types.js";
+import type { TelegramBackgroundWriteGate } from "./telegram-background-write-gate.js";
 import type { AppServerHookBlock } from "./app-server-turn-manager.js";
 import { buildMarkdownDocument } from "./markdown-document.js";
 import { parseReopenCommand, runReopenCommand } from "./thread-reopen.js";
 import { TurnProgressPresenter } from "./turn-progress.js";
+import type { TelegramStatusAction } from "./telegram-status-projection.js";
 import {
   isTopicActivityEligible,
   TopicActivityIndicator,
@@ -187,9 +213,179 @@ type TextOptions = {
 
 interface PromptDispatchOptions {
   cleanupInbox?: { workspace: string; turnId: string };
-  requireModelSelection?: boolean;
   transformFinalText?: (text: string) => string | Promise<string>;
   afterFinalResponse?: (text: string, job: PersistentTelegramJob) => void | Promise<void>;
+}
+
+export const TELEGRAM_RETRY_OPTIONS = {
+  maxRetryAttempts: 3,
+  maxDelaySeconds: 60,
+} as const;
+
+export const DISABLED_MODEL_SELECTION_CALLBACK_PATTERN =
+  /^(?:jobmodel:|startmodel:|model_)/;
+
+export const CANONICAL_STATUS_ACTION_PATTERN =
+  /^tcj:([arfdigys]):([A-Za-z0-9_-]{1,40}):([1-9]\d{0,15})(?::([A-Za-z0-9_.:-]{1,24}))?$/;
+
+const IMPLEMENTATION_VERB = "(?:приступай|делай|сделай|начинай|реализуй|исправляй|исправь|implement)";
+const IMPLEMENTATION_TICKET = "(?:NO-TICKET|[A-Z][A-Z0-9]{1,15}-\\d+)";
+const IMPLEMENTATION_AUTHORIZATION_PATTERN = new RegExp(
+  `^(?:${IMPLEMENTATION_TICKET}[\\s,:-]+)?${IMPLEMENTATION_VERB}(?:[\\s,:-]+${IMPLEMENTATION_TICKET})?[.!]?$`,
+  "iu",
+);
+
+export function isImplementationAuthorization(text: string): boolean {
+  return IMPLEMENTATION_AUTHORIZATION_PATTERN.test(text.trim());
+}
+
+export function shouldBlockTextDuringSessionTransition(state: { switching: boolean }): boolean {
+  return state.switching;
+}
+
+interface ImplementationHandoffInput {
+  text: string;
+  session: Pick<CodexSessionService, "getInfo" | "forkThread">;
+  launchProfiles: TeleCodexConfig["launchProfiles"];
+  defaultLaunchProfileId: string;
+}
+
+interface PrepareImplementationHandoffInput extends ImplementationHandoffInput {
+  persistSession(info: CodexSessionInfo): void;
+  dispatchPrompt(info: CodexSessionInfo): Promise<void>;
+  notify(info: CodexSessionInfo): Promise<void>;
+  onNotificationError(error: unknown): void;
+}
+
+type PreparedImplementationHandoff = CodexSessionInfo & { prompt: Promise<void> };
+
+export async function maybeForkImplementationThread(
+  input: ImplementationHandoffInput,
+): Promise<CodexSessionInfo | undefined> {
+  if (
+    input.session.getInfo().sandboxMode !== "read-only"
+    || !isImplementationAuthorization(input.text)
+  ) {
+    return undefined;
+  }
+
+  const profileId = writableImplementationProfileId({
+    launchProfiles: input.launchProfiles,
+    defaultLaunchProfileId: input.defaultLaunchProfileId,
+  });
+  if (!profileId) {
+    throw new Error("No writable launch profile with non-interactive approvals is configured");
+  }
+
+  return input.session.forkThread(profileId);
+}
+
+function writableImplementationProfileId(
+  config: Pick<TeleCodexConfig, "launchProfiles" | "defaultLaunchProfileId">,
+): string | undefined {
+  const configuredDefault = config.launchProfiles.find(
+    (profile) => profile.id === config.defaultLaunchProfileId,
+  );
+  const profile = configuredDefault?.sandboxMode !== "read-only"
+    && configuredDefault?.approvalPolicy === "never"
+    ? configuredDefault
+    : config.launchProfiles.find(
+      (candidate) => candidate.sandboxMode !== "read-only" && candidate.approvalPolicy === "never",
+    );
+  return profile?.id;
+}
+
+export async function prepareImplementationHandoff(
+  input: PrepareImplementationHandoffInput,
+): Promise<PreparedImplementationHandoff | undefined> {
+  const info = await maybeForkImplementationThread(input);
+  if (!info) {
+    return undefined;
+  }
+
+  input.persistSession(info);
+  const prompt = input.dispatchPrompt(info);
+  try {
+    void input.notify(info).catch(input.onNotificationError);
+  } catch (error) {
+    input.onNotificationError(error);
+  }
+
+  return { ...info, prompt };
+}
+
+interface PromptSuccessDelivery {
+  deliverResponse(): Promise<void>;
+  deliverImages(): Promise<void>;
+  completeProgress(): Promise<void>;
+  onProgressError(error: unknown): void;
+}
+
+export async function deliverPromptSuccess(actions: PromptSuccessDelivery): Promise<void> {
+  await actions.deliverResponse();
+  await actions.deliverImages();
+  await actions.completeProgress().catch(actions.onProgressError);
+}
+
+interface PromptErrorDelivery {
+  deliverResponse(): Promise<void>;
+  failProgress(): Promise<void>;
+  onDeliveryError(error: unknown): void;
+  onProgressError(error: unknown): void;
+}
+
+export async function deliverPromptError(actions: PromptErrorDelivery): Promise<void> {
+  await actions.deliverResponse().catch(actions.onDeliveryError);
+  await actions.failProgress().catch(actions.onProgressError);
+}
+
+interface LiveStatusTopicRow {
+  threadId: string;
+  messageThreadId?: number;
+}
+
+export async function bindLiveStatusTopics(
+  rows: LiveStatusTopicRow[],
+  cache: Map<string, number>,
+  validate: boolean,
+  lookup: (threadId: string) => Promise<number | undefined>,
+): Promise<void> {
+  if (validate) {
+    const visibleThreadIds = new Set(rows.map((row) => row.threadId));
+    for (const threadId of cache.keys()) {
+      if (!visibleThreadIds.has(threadId)) cache.delete(threadId);
+    }
+    for (const row of rows) {
+      const messageThreadId = await lookup(row.threadId);
+      if (messageThreadId === undefined) cache.delete(row.threadId);
+      else cache.set(row.threadId, messageThreadId);
+    }
+  } else {
+    for (const row of rows) {
+      if (row.messageThreadId !== undefined) {
+        cache.set(row.threadId, row.messageThreadId);
+        continue;
+      }
+      if (cache.has(row.threadId)) continue;
+      const messageThreadId = await lookup(row.threadId);
+      if (messageThreadId !== undefined) cache.set(row.threadId, messageThreadId);
+    }
+  }
+  for (const row of rows) {
+    row.messageThreadId = cache.get(row.threadId);
+  }
+}
+
+export async function removeStatusBoardMessage(
+  unpin: () => Promise<unknown>,
+  remove: () => Promise<unknown>,
+): Promise<void> {
+  try {
+    await unpin();
+  } catch (error) {
+    if (telegramRetryAfterMs(error) !== undefined) throw error;
+  }
+  await remove();
 }
 
 type RenderedText = {
@@ -205,8 +401,46 @@ type RenderedChunk = RenderedText & {
 export interface TeleCodexBot extends Bot<Context> {
   recoverPendingJobs(): Promise<void>;
   statusBoard?: StatusBoard;
+  dashboard?: DashboardController;
   jiraPanel?: JiraPanel;
-  sentryBridge?: SentryBridge;
+  jiraMiniApp?: JiraMiniAppController;
+}
+
+export interface TeleCodexBotOptions {
+  readonly backgroundWriteGate?: Pick<TelegramBackgroundWriteGate, "run">;
+}
+
+export interface TelegramCanonicalJobRef {
+  readonly jobId: string;
+  readonly version: number;
+}
+
+export interface TelegramCanonicalContext {
+  readonly botId: string;
+  readonly chatId: number;
+  readonly messageThreadId: number | null;
+}
+
+export interface TelegramCanonicalControlSource extends TelegramCanonicalContext {
+  readonly updateId: number;
+  readonly messageId: number;
+}
+
+export interface TelegramBotReliability {
+  handleWork(source: TelegramWorkSource): Promise<TelegramWorkTargetContext | null>;
+  registerCompletionProcessor?(processor: TelegramCompletionProcessor): void;
+  latestJob(context: TelegramCanonicalContext): Promise<TelegramCanonicalJobRef | null>;
+  retry(input: {
+    readonly source: TelegramCanonicalControlSource;
+    readonly target: TelegramCanonicalJobRef;
+  }): Promise<void>;
+  abort(input: {
+    readonly source: TelegramCanonicalControlSource;
+    readonly target: TelegramCanonicalJobRef;
+  }): Promise<void>;
+  loadDashboardReliability?(limit?: number): Promise<DashboardReliabilitySnapshot>;
+  loadDashboardSessionStatuses?(): Promise<readonly DashboardSessionStatus[]>;
+  runDashboardAction?(action: TelegramStatusAction, context?: TelegramCanonicalContext): Promise<void>;
 }
 
 function boardKeyboard(buttons: BoardButton[]): InlineKeyboard | undefined {
@@ -250,22 +484,6 @@ function promptText(input: CodexPromptInput): string {
   return typeof input === "string" ? input : input.text ?? "";
 }
 
-function modelChoiceKeyboard(
-  choices: CodexModelChoice[],
-  callbackData: (choice: CodexModelChoice) => string,
-  selectedChoiceId?: string,
-): InlineKeyboard {
-  const keyboard = new InlineKeyboard();
-  choices.forEach((choice, index) => {
-    if (index > 0) keyboard.row();
-    keyboard.text(
-      `${choice.id === selectedChoiceId ? "✓ " : ""}${choice.label}`,
-      callbackData(choice),
-    );
-  });
-  return keyboard;
-}
-
 function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): InlineKeyboard {
   const totalPages = Math.max(1, Math.ceil(items.length / KEYBOARD_PAGE_SIZE));
   const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
@@ -293,10 +511,135 @@ function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): 
   return keyboard;
 }
 
-export function createBot(config: TeleCodexConfig, registry: SessionRegistry): TeleCodexBot {
+function canonicalControlSource(ctx: Context): TelegramCanonicalControlSource | null {
+  const chatId = ctx.chat?.id;
+  const messageId = ctx.message?.message_id ?? ctx.callbackQuery?.message?.message_id;
+  if (chatId === undefined || messageId === undefined) return null;
+  const messageThreadId = ctx.message?.message_thread_id
+    ?? ctx.callbackQuery?.message?.message_thread_id
+    ?? null;
+  return {
+    botId: String(ctx.me.id),
+    updateId: ctx.update.update_id,
+    chatId,
+    messageThreadId,
+    messageId,
+  };
+}
+
+function canonicalContext(source: TelegramCanonicalControlSource): TelegramCanonicalContext {
+  return {
+    botId: source.botId,
+    chatId: source.chatId,
+    messageThreadId: source.messageThreadId,
+  };
+}
+
+function checkedCanonicalJobRef(value: TelegramCanonicalJobRef | null): TelegramCanonicalJobRef | null {
+  if (value === null) return null;
+  if (!value.jobId || value.jobId.length > 128 || !Number.isInteger(value.version) || value.version < 1) {
+    throw new Error("Invalid canonical Telegram job reference");
+  }
+  return value;
+}
+
+function isCanonicalVersionConflict(error: unknown): boolean {
+  return error instanceof Error && error.message === "Telegram job version conflict";
+}
+
+function isCanonicalStaleAction(error: unknown): boolean {
+  return error instanceof Error && (
+    isCanonicalVersionConflict(error)
+    || error.message === "Telegram job source mismatch"
+    || error.message === "Unknown Telegram job"
+  );
+}
+
+function attachmentRef(
+  kind: TelegramAttachmentRef["kind"],
+  file: {
+    file_id: string;
+    file_unique_id?: string;
+    file_name?: string;
+    mime_type?: string;
+    file_size?: number;
+  },
+  defaults: { readonly name?: string; readonly mimeType?: string } = {},
+): TelegramAttachmentRef {
+  const stableFileId = file.file_unique_id ?? file.file_id;
+  return {
+    id: `${kind}:${stableFileId}`,
+    kind,
+    telegramFileId: file.file_id,
+    ...(file.file_unique_id === undefined ? {} : { telegramFileUniqueId: file.file_unique_id }),
+    ...(file.file_name === undefined && defaults.name === undefined
+      ? {} : { name: file.file_name ?? defaults.name }),
+    ...(file.mime_type === undefined && defaults.mimeType === undefined
+      ? {} : { mimeType: file.mime_type ?? defaults.mimeType }),
+    ...(file.file_size === undefined ? {} : { size: file.file_size }),
+  };
+}
+
+function captionText(ctx: Context): string | null {
+  const text = ctx.message?.caption?.trim();
+  return text ? text : null;
+}
+
+function canonicalWorkSource(
+  ctx: Context,
+  kind: TelegramWorkSource["kind"],
+  text: string | null,
+  attachment: TelegramAttachmentRef | null,
+  sessionDefaults?: TelegramWorkSource["sessionDefaults"],
+  implementationHandoffProfileId?: string,
+  targetContext?: TelegramWorkSource["targetContext"],
+  targetProvision?: TelegramWorkSource["targetProvision"],
+): TelegramWorkSource | null {
+  const source = canonicalControlSource(ctx);
+  return source ? {
+    ...source, kind, text, attachment, retryOfJobId: null,
+    ...(sessionDefaults ? { sessionDefaults } : {}),
+    ...(implementationHandoffProfileId ? { implementationHandoffProfileId } : {}),
+    ...(targetContext ? { targetContext } : {}),
+    ...(targetProvision ? { targetProvision } : {}),
+  } : null;
+}
+
+function canonicalCallbackWorkSource(source: TelegramWorkSource, intent: string): TelegramWorkSource {
+  const digest = createHash("sha256").update([
+    source.botId,
+    String(source.chatId),
+    String(source.messageThreadId ?? "main"),
+    String(source.messageId),
+    intent,
+  ].join(":"), "utf8").digest("hex");
+  const updateId = 5_000_000_000_000_000
+    + (Number.parseInt(digest.slice(0, 12), 16) % 500_000_000_000_000);
+  return { ...source, updateId };
+}
+
+export function createBot(
+  config: TeleCodexConfig,
+  registry: SessionRegistry,
+  reliability?: TelegramBotReliability,
+  options: TeleCodexBotOptions = {},
+): TeleCodexBot {
   const bot = new Bot<Context>(config.telegramBotToken) as TeleCodexBot;
-  bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
-  const jobStore = new TelegramJobStore(path.join(config.workspace, ".telecodex", "jobs.json"));
+  const loadCanonicalReliability = reliability?.loadDashboardReliability
+    ? createSharedAsyncLoader(
+        () => reliability.loadDashboardReliability!(STATUS_BOARD_BUTTON_LIMIT),
+      )
+    : undefined;
+  if (!reliability) bot.api.config.use(autoRetry(TELEGRAM_RETRY_OPTIONS));
+  // JSON storage is a rollback-only compatibility path. Canonical mode must not
+  // construct a second correctness owner beside the SQLite ledger.
+  const jobStore = reliability
+    ? undefined
+    : new TelegramJobStore(path.join(config.workspace, ".telecodex", "jobs.json"));
+  const legacyJobStore = (): TelegramJobStore => {
+    if (!jobStore) throw new Error("Legacy Telegram job store is unavailable in canonical mode");
+    return jobStore;
+  };
   const usageStore = new UsageStore(path.join(config.workspace, ".telecodex", "token-usage.jsonl"));
   try {
     usageStore.compact();
@@ -316,8 +659,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     },
   });
 
+  let jiraPanelClient: JiraClient | undefined;
   if (config.jiraPanel) {
     const panelConfig = config.jiraPanel;
+    jiraPanelClient = new JiraClient(panelConfig.clientPath);
     const messageOptions = (message: JiraPanelMessage) => ({
       parse_mode: "HTML" as const,
       link_preview_options: { is_disabled: true },
@@ -326,7 +671,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     bot.jiraPanel = new JiraPanel({
       chatId: panelConfig.chatId,
       topicId: panelConfig.topicId,
-      client: new JiraClient(panelConfig.clientPath),
+      client: jiraPanelClient,
       send: async (message) => {
         const sent = await bot.api.sendMessage(panelConfig.chatId, message.html, {
           ...messageOptions(message),
@@ -346,12 +691,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           if (!isMessageNotModifiedError(error)) throw error;
         }
       },
-      pin: async (messageId) => {
-        await bot.api.pinChatMessage(panelConfig.chatId, messageId, {
-          disable_notification: true,
-        });
+      remove: async (messageId) => {
+        await removeJiraLauncherMessage(
+          () => bot.api.unpinChatMessage(panelConfig.chatId, messageId),
+          () => bot.api.deleteMessage(panelConfig.chatId, messageId),
+        );
       },
       store: createJiraPanelStore(path.join(config.workspace, ".telecodex", "jira-panel.json")),
+      miniAppLaunchUrl: config.miniApp
+        ? jiraMiniAppLaunchUrl(config.miniApp.launchUrl)
+        : undefined,
     });
   }
 
@@ -377,16 +726,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   const pendingProjectSessionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingSessionPicks = new Map<TelegramContextKey, string[]>();
   const pendingWorkspacePicks = new Map<TelegramContextKey, string[]>();
-  const pendingNewThreads = new Map<TelegramContextKey, { workspace: string }>();
   const pendingSessionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingWorkspaceButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingLaunchPicks = new Map<TelegramContextKey, string[]>();
   const pendingLaunchButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingUnsafeLaunchConfirmations = new Map<TelegramContextKey, string>();
-  const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
-  const promptTails = new Map<TelegramContextKey, Promise<void>>();
+  const promptTails = reliability
+    ? undefined
+    : new Map<TelegramContextKey, Promise<void>>();
   const activeJobIds = new Map<TelegramContextKey, string>();
 
   const ticketFinalTextTransformer = (
@@ -437,7 +786,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
               !jiraComment
               || !current
               || !canPostTicketToJira(current)
-              || jobStore.hasPart(job.id, "jira-confirm")
+              || legacyJobStore().hasPart(job.id, "jira-confirm")
             ) {
               return;
             }
@@ -453,23 +802,39 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
                 replyMarkup: keyboard,
               },
             );
-            jobStore.markPartSent(job.id, "jira-confirm");
+            legacyJobStore().markPartSent(job.id, "jira-confirm");
           }
         : undefined,
     };
   };
+
+  reliability?.registerCompletionProcessor?.(createTelegramInboxCompletionProcessor({
+    getTicket: (ticketId) => inbox.getTicket(ticketId),
+    jiraConfigured: jiraComment !== undefined,
+    answerWorkspace: config.workspace,
+    renameTopic: async (chatId, messageThreadId, name) => {
+      try {
+        await bot.api.editForumTopic(chatId, messageThreadId, { name });
+        return true;
+      } catch (error) {
+        if (/TOPIC_NOT_MODIFIED/i.test(formatError(error))) return true;
+        console.warn("Inbox completion topic rename failed: TELEGRAM_TOPIC_RENAME_FAILED");
+        return false;
+      }
+    },
+    setTopicTitle: (ticketId, title) => inbox.setTopicTitle(ticketId, title),
+    saveAnswer: saveTicketAnswer,
+  }));
 
   registry.onRemove((key) => {
     contextBusy.delete(key);
     pendingLaunchPicks.delete(key);
     pendingLaunchButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
-    pendingNewThreads.delete(key);
     pendingWorkspacePicks.delete(key);
     pendingWorkspaceButtons.delete(key);
-    pendingModelButtons.delete(key);
     lastPromptInput.delete(key);
-    promptTails.delete(key);
+    promptTails?.delete(key);
     activeJobIds.delete(key);
   });
 
@@ -513,50 +878,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     pendingLaunchPicks.delete(contextKey);
     pendingLaunchButtons.delete(contextKey);
     pendingUnsafeLaunchConfirmations.delete(contextKey);
-  };
-
-  const selectedChoiceId = (session: CodexSessionService): string | undefined => {
-    const info = session.getInfo();
-    return info.nextModelChoiceId ?? info.modelChoiceId ?? config.defaultModelChoiceId;
-  };
-
-  const sendPromptModelPicker = async (
-    job: PersistentTelegramJob,
-    session: CodexSessionService,
-  ): Promise<void> => {
-    if (!job.selectionToken) throw new Error(`Telegram job ${job.id} has no selection token`);
-    const choices = session.listModelChoices();
-    if (!choices.length) throw new Error("No models available");
-    await bot.api.sendMessage(job.chatId, "Choose a model for this new thread:", {
-      ...(job.messageThreadId ? { message_thread_id: job.messageThreadId } : {}),
-      reply_markup: modelChoiceKeyboard(
-        choices,
-        (choice) => promptModelCallback(job.selectionToken!, choice.id),
-        selectedChoiceId(session),
-      ),
-    });
-  };
-
-  const sendStartModelPicker = async (
-    ctx: Context,
-    contextKey: TelegramContextKey,
-    session: CodexSessionService,
-    workspace: string,
-  ): Promise<void> => {
-    const choices = session.listModelChoices();
-    if (!choices.length) {
-      await safeReply(ctx, escapeHTML("No models available."), { fallbackText: "No models available." });
-      return;
-    }
-    pendingNewThreads.set(contextKey, { workspace });
-    await safeReply(ctx, "<b>Select model for new thread:</b>", {
-      fallbackText: "Select model for new thread:",
-      replyMarkup: modelChoiceKeyboard(
-        choices,
-        (choice) => `startmodel:${choice.id}`,
-        selectedChoiceId(session),
-      ),
-    });
   };
 
   const cleanupJobInbox = async (job: PersistentTelegramJob | undefined): Promise<void> => {
@@ -651,6 +972,40 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
   };
 
+  const startNewThread = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    session: CodexSessionService,
+    workspace: string,
+    messageId?: number,
+  ): Promise<void> => {
+    const chatId = ctx.chat?.id;
+    if (!chatId) return;
+
+    const busyState = getBusyState(contextKey);
+    busyState.switching = true;
+    try {
+      const info = await session.newThread(workspace);
+      updateSessionMetadata(contextKey, session);
+      const label = isTopicContext(contextKey)
+        ? "New OpenAI thread created for this topic."
+        : "New OpenAI thread created.";
+      const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
+      const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
+      if (messageId) {
+        await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plainText });
+      } else {
+        await safeReply(ctx, html, { fallbackText: plainText });
+      }
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    } finally {
+      busyState.switching = false;
+    }
+  };
+
   const executeUserPrompt = async (
     ctx: Context,
     contextKey: TelegramContextKey,
@@ -660,7 +1015,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     persistentJob: PersistentTelegramJob,
     options: PromptDispatchOptions,
   ): Promise<void> => {
-    if (jobStore.get(persistentJob.id)?.state === "aborted") return;
+    if (legacyJobStore().get(persistentJob.id)?.state === "aborted") return;
     const parsed = parseContextKey(contextKey);
     const messageThreadId = parsed.messageThreadId;
 
@@ -754,7 +1109,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
 
       for (const [index, chunk] of chunks.entries()) {
         const partKey = `final:${index}`;
-        if (jobStore.hasPart(persistentJob.id, partKey)) continue;
+        if (legacyJobStore().hasPart(persistentJob.id, partKey)) continue;
         await sendTextMessage(bot.api, chatId, chunk.text, {
           parseMode: chunk.parseMode,
           fallbackText: chunk.fallbackText,
@@ -765,7 +1120,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           ),
           messageThreadId,
         });
-        jobStore.markPartSent(persistentJob.id, partKey);
+        legacyJobStore().markPartSent(persistentJob.id, partKey);
       }
     };
 
@@ -777,7 +1132,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
      */
     const deliverMarkdownDocument = async (markdown: string): Promise<boolean> => {
       const partKey = "final:document";
-      if (jobStore.hasPart(persistentJob.id, partKey)) {
+      if (legacyJobStore().hasPart(persistentJob.id, partKey)) {
         return true;
       }
 
@@ -794,7 +1149,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
             reply_markup: finalChunkThreadKeyboard(markdown, 0, 1),
           },
         );
-        jobStore.markPartSent(persistentJob.id, partKey);
+        legacyJobStore().markPartSent(persistentJob.id, partKey);
         return true;
       } catch (error) {
         console.error("Failed to send the answer as a document:", formatError(error));
@@ -840,7 +1195,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     const deliverGeneratedImages = async (): Promise<void> => {
       for (const [index, image] of generatedImages.entries()) {
         const partKey = `image:${index}`;
-        if (jobStore.hasPart(persistentJob.id, partKey)) continue;
+        if (legacyJobStore().hasPart(persistentJob.id, partKey)) continue;
         let imagePath = image.path;
         let temporary = false;
         if (!imagePath && image.base64) {
@@ -854,13 +1209,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           await bot.api.sendPhoto(chatId, new InputFile(imagePath), {
             ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
           });
-          jobStore.markPartSent(persistentJob.id, partKey);
+          legacyJobStore().markPartSent(persistentJob.id, partKey);
         } catch (photoError) {
           try {
             await bot.api.sendDocument(chatId, new InputFile(imagePath, path.basename(imagePath)), {
               ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
             });
-            jobStore.markPartSent(persistentJob.id, partKey);
+            legacyJobStore().markPartSent(persistentJob.id, partKey);
           } catch (documentError) {
             console.error("Failed to send generated image", { photoError, documentError });
           }
@@ -884,7 +1239,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         });
       },
       onStarted: (turnId) => {
-        jobStore.update(persistentJob.id, { state: "active", turnId });
+        legacyJobStore().update(persistentJob.id, { state: "active", turnId });
         if (isTopicActivityEligible(messageThreadId)) {
           void topicActivity.start(parsed.chatId, messageThreadId);
         }
@@ -1022,15 +1377,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
 
     try {
       if (!(await ensureActiveThread(ctx, contextKey, session))) {
-        jobStore.update(persistentJob.id, { state: "failed" });
+        legacyJobStore().update(persistentJob.id, { state: "failed" });
         return;
       }
 
-      jobStore.update(persistentJob.id, { threadId: session.getInfo().threadId });
+      legacyJobStore().update(persistentJob.id, { threadId: session.getInfo().threadId });
       if ((session.getInfo().modelProvider ?? "openai") === "openai") {
         const authStatus = await checkAuthStatus(config.codexApiKey);
         if (!authStatus.authenticated) {
-          jobStore.update(persistentJob.id, { state: "failed" });
+          legacyJobStore().update(persistentJob.id, { state: "failed" });
           await safeReply(
             ctx,
             [
@@ -1055,7 +1410,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }
 
       await progress.start();
-      const latestJob = jobStore.get(persistentJob.id)!;
+      const latestJob = legacyJobStore().get(persistentJob.id)!;
       if (
         latestJob.turnId &&
         (latestJob.state === "active" || latestJob.state === "delivering")
@@ -1072,35 +1427,43 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         await session.prompt(userInput, callbacks);
       }
       codexCompleted = true;
-      jobStore.update(persistentJob.id, { state: "delivering" });
+      legacyJobStore().update(persistentJob.id, { state: "delivering" });
       updateSessionMetadata(contextKey, session);
       if (!accumulatedText.trim()) accumulatedText = fallbackAccumulatedText;
-      await progress.complete();
-      await finalizeResponse();
-      await deliverGeneratedImages();
-      jobStore.update(persistentJob.id, { state: "completed" });
+      await deliverPromptSuccess({
+        deliverResponse: finalizeResponse,
+        deliverImages: deliverGeneratedImages,
+        completeProgress: () => progress.complete(),
+        onProgressError: (progressError) => {
+          console.error("Failed to mark progress checkpoint as completed", progressError);
+        },
+      });
+      legacyJobStore().update(persistentJob.id, { state: "completed" });
     } catch (error) {
       stopTyping();
       if (!accumulatedText.trim()) accumulatedText = fallbackAccumulatedText;
-      await progress.fail(friendlyErrorText(error)).catch((progressError) => {
-        console.error("Failed to mark progress checkpoint as failed", progressError);
-      });
-      if (jobStore.get(persistentJob.id)?.state !== "aborted") {
-        jobStore.update(persistentJob.id, { state: codexCompleted ? "delivering" : "failed" });
+      if (legacyJobStore().get(persistentJob.id)?.state !== "aborted") {
+        legacyJobStore().update(persistentJob.id, { state: codexCompleted ? "delivering" : "failed" });
       }
-      if (finalized) {
-        console.error("Codex prompt error after finalization:", formatError(error));
-      } else {
-        finalized = true;
-
-        const combinedText = buildFinalResponseText(renderPromptFailure(accumulatedText, error));
-        const chunks = splitMarkdownForTelegram(combinedText);
-        try {
+      await deliverPromptError({
+        deliverResponse: async () => {
+          if (finalized) {
+            console.error("Codex prompt error after finalization:", formatError(error));
+            return;
+          }
+          finalized = true;
+          const combinedText = buildFinalResponseText(renderPromptFailure(accumulatedText, error));
+          const chunks = splitMarkdownForTelegram(combinedText);
           await deliverRenderedChunks(chunks, combinedText);
-        } catch (telegramError) {
+        },
+        failProgress: () => progress.fail(friendlyErrorText(error)),
+        onDeliveryError: (telegramError) => {
           console.error("Failed to send error message to Telegram:", telegramError);
-        }
-      }
+        },
+        onProgressError: (progressError) => {
+          console.error("Failed to mark progress checkpoint as failed", progressError);
+        },
+      });
     } finally {
       stopTyping();
       busyState.processing = false;
@@ -1120,7 +1483,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     options: PromptDispatchOptions = {},
   ): Promise<void> => {
     const parsed = parseContextKey(contextKey);
-    const persistentJob = recoveredJob ?? jobStore.create({
+    const persistentJob = recoveredJob ?? legacyJobStore().create({
       contextKey,
       chatId: parsed.chatId,
       messageThreadId: parsed.messageThreadId,
@@ -1128,17 +1491,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       input: userInput,
       cleanupInbox: options.cleanupInbox,
     });
-    if (
-      !session.hasActiveThread() &&
-      !persistentJob.modelChoiceId &&
-      options.requireModelSelection !== false
-    ) {
-      const awaiting = persistentJob.state === "awaiting-model"
-        ? persistentJob
-        : jobStore.awaitModelSelection(persistentJob.id);
-      return sendPromptModelPicker(awaiting, session);
-    }
-    const previous = promptTails.get(contextKey) ?? Promise.resolve();
+    const previous = promptTails?.get(contextKey) ?? Promise.resolve();
     const current = previous
       .catch(() => undefined)
       .then(async () => {
@@ -1175,7 +1528,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           } catch (artifactError) {
             console.error("Failed to deliver artifacts:", artifactError);
           }
-          const finishedJob = jobStore.get(persistentJob.id);
+          const finishedJob = legacyJobStore().get(persistentJob.id);
           if (
             finishedJob &&
             (finishedJob.state === "completed" ||
@@ -1189,9 +1542,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     const tail = current
       .catch(() => undefined)
       .finally(() => {
-        if (promptTails.get(contextKey) === tail) promptTails.delete(contextKey);
+        if (promptTails?.get(contextKey) === tail) promptTails.delete(contextKey);
       });
-    promptTails.set(contextKey, tail);
+    promptTails?.set(contextKey, tail);
     return current;
   };
 
@@ -1241,8 +1594,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         iconChange.iconCustomEmojiId,
       );
     }
-    if (bot.statusBoard?.isDashboardTopic(messageThreadId)) {
+    if (bot.statusBoard?.isDashboardTopic(ctx.chat?.id, messageThreadId)) {
       await bot.statusBoard.protectTopicMessage(
+        ctx.chat?.id,
         messageThreadId,
         isTopicLifecycleMessage(ctx.message) ? undefined : ctx.message?.message_id,
       );
@@ -1254,7 +1608,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
 
     const fromId = ctx.from?.id;
-    if (!fromId || !config.telegramAllowedUserIdSet.has(fromId)) {
+    const guardianCallback = ctx.callbackQuery?.data?.startsWith("guardian_restore:") ?? false;
+    const guardianChatRejected = guardianCallback
+      && ctx.chat?.id !== config.telegramForumChatId;
+    if (!fromId || !config.telegramAllowedUserIdSet.has(fromId) || guardianChatRejected) {
       if (ctx.callbackQuery) {
         await ctx.answerCallbackQuery({ text: "Unauthorized" }).catch(() => {});
       } else if (ctx.chat) {
@@ -1265,6 +1622,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
 
     await next();
   });
+
+  if (config.sessionGuardianSocketPath) {
+    registerGuardianCallbacks(bot, {
+      socketPath: config.sessionGuardianSocketPath,
+      requestTimeoutMs: 15_000,
+    });
+  }
 
   bot.command("start", async (ctx) => {
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
@@ -1307,6 +1671,26 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     if (!panel || !config.jiraPanel) {
       await safeReply(ctx, "<b>Jira panel is not configured.</b>", {
         fallbackText: "Jira panel is not configured.",
+      });
+      return;
+    }
+    const miniAppUrl = config.miniApp
+      ? jiraMiniAppLaunchUrl(config.miniApp.launchUrl)
+      : undefined;
+    if (miniAppUrl) {
+      if (panel.matches(chatId, topicId)) {
+        try {
+          await panel.open();
+        } catch (error) {
+          await safeReply(ctx, `<b>Jira panel failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+            fallbackText: `Jira panel failed: ${friendlyErrorText(error)}`,
+          });
+        }
+        return;
+      }
+      await safeReply(ctx, "<b>Jira · mircli</b>", {
+        fallbackText: `Jira · mircli: ${miniAppUrl}`,
+        replyMarkup: new InlineKeyboard().url("Открыть Jira", miniAppUrl),
       });
       return;
     }
@@ -1521,7 +1905,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
 
     const workspaces = session.listWorkspaces();
     if (workspaces.length <= 1) {
-      await sendStartModelPicker(
+      await startNewThread(
         ctx,
         contextKey,
         session,
@@ -1545,7 +1929,39 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     });
   });
 
+  bot.command("model", async (ctx) => {
+    await safeReply(
+      ctx,
+      "<b>Model selection is disabled.</b> New threads use the OpenAI default.",
+      { fallbackText: "Model selection is disabled. New threads use the OpenAI default." },
+    );
+  });
+
   bot.command("abort", async (ctx) => {
+    if (reliability) {
+      const source = canonicalControlSource(ctx);
+      if (!source) return;
+      const target = checkedCanonicalJobRef(await reliability.latestJob(canonicalContext(source)));
+      if (!target) {
+        await safeReply(ctx, escapeHTML("Nothing to abort"), { fallbackText: "Nothing to abort" });
+        return;
+      }
+      try {
+        await reliability.abort({ source, target });
+      } catch (error) {
+        if (!isCanonicalVersionConflict(error)) throw error;
+        await safeReply(ctx, escapeHTML("Status changed, refresh and try again"), {
+          fallbackText: "Status changed, refresh and try again",
+        });
+        return;
+      }
+      await safeReply(ctx, escapeHTML("Aborted current operation"), {
+        fallbackText: "Aborted current operation",
+      });
+      return;
+    }
+
+    // Compatibility-only path until the canonical reliability runtime is enabled.
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -1553,12 +1969,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
 
     const { contextKey, session } = contextSession;
     try {
-      const queuedJob = [...jobStore.listRecoverable(), ...jobStore.listAwaitingModel()]
+      const queuedJob = [...legacyJobStore().listRecoverable(), ...legacyJobStore().listAwaitingModel()]
         .filter((job) => job.contextKey === contextKey)
         .sort((left, right) => left.createdAt - right.createdAt)
         .at(-1);
       if (queuedJob && activeJobIds.get(contextKey) !== queuedJob.id) {
-        jobStore.update(queuedJob.id, { state: "aborted" });
+        legacyJobStore().update(queuedJob.id, { state: "aborted" });
         await cleanupJobInbox(queuedJob);
         await safeReply(ctx, escapeHTML("Aborted queued operation"), {
           fallbackText: "Aborted queued operation",
@@ -1566,7 +1982,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         return;
       }
       const activeJobId = activeJobIds.get(contextKey);
-      if (activeJobId) jobStore.update(activeJobId, { state: "aborted" });
+      if (activeJobId) legacyJobStore().update(activeJobId, { state: "aborted" });
       await session.abort();
       await safeReply(ctx, escapeHTML("Aborted current operation"), {
         fallbackText: "Aborted current operation",
@@ -1579,6 +1995,28 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   });
 
   bot.command("retry", async (ctx) => {
+    if (reliability) {
+      const source = canonicalControlSource(ctx);
+      if (!source) return;
+      const target = checkedCanonicalJobRef(await reliability.latestJob(canonicalContext(source)));
+      if (!target) {
+        await safeReply(ctx, escapeHTML("Nothing to retry. Send a message first."), {
+          fallbackText: "Nothing to retry. Send a message first.",
+        });
+        return;
+      }
+      try {
+        await reliability.retry({ source, target });
+      } catch (error) {
+        if (!isCanonicalVersionConflict(error)) throw error;
+        await safeReply(ctx, escapeHTML("Status changed, refresh and try again"), {
+          fallbackText: "Status changed, refresh and try again",
+        });
+      }
+      return;
+    }
+
+    // Compatibility-only path until the canonical reliability runtime is enabled.
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -2232,8 +2670,113 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     });
   });
 
+  const launchedSentryMessages = new Set<string>();
+
+  bot.callbackQuery(/^sentry_task:/, async (ctx) => {
+    const callback = parseSentryTaskCallback(ctx.callbackQuery.data);
+    const chatId = ctx.chat?.id;
+    const sourceTopicId = ctx.callbackQuery.message?.message_thread_id;
+    const sourceMessageId = ctx.callbackQuery.message?.message_id;
+    if (!callback || !chatId || !sourceTopicId || !sourceMessageId) {
+      await ctx.answerCallbackQuery({ text: "Некорректная кнопка Sentry", show_alert: true });
+      return;
+    }
+
+    const launchKey = `${chatId}:${sourceMessageId}`;
+    if (launchedSentryMessages.has(launchKey)) {
+      await ctx.answerCallbackQuery({ text: "Разбор уже запущен" });
+      return;
+    }
+    launchedSentryMessages.add(launchKey);
+
+    try {
+      const configPath = process.env.RECIPES_CONFIG?.trim() || RECIPE_CONFIG_PATH;
+      const recipes = parseRecipes(await readFile(configPath, "utf8"));
+      const recipe = recipes.find((candidate) =>
+        candidate.kind === "sentry-top"
+        && candidate.deliver.chatId === chatId
+        && candidate.deliver.messageThreadId === sourceTopicId
+      );
+      if (!recipe || recipe.kind !== "sentry-top") {
+        throw new Error("Эта кнопка работает только в топике Sentry-рецепта");
+      }
+
+      if (reliability) {
+        const topicName = sentryTaskTopicName(callback.shortId);
+        const rawSource = canonicalWorkSource(
+          ctx,
+          "confirmation",
+          buildSentryAnalysisPrompt(callback.issueId, callback.shortId, recipe.realm),
+          null,
+          { workspace: recipe.cwd, launchProfileId: "readonly", topicName },
+          undefined,
+          undefined,
+          { kind: "forum_topic", topicName, state: "planned" },
+        );
+        if (!rawSource) throw new Error("Некорректная кнопка Sentry");
+        const source = canonicalCallbackWorkSource(rawSource, ctx.callbackQuery.data);
+        const target = await reliability.handleWork(source);
+        if (!target) throw new Error("Не удалось закрепить топик Sentry");
+        registry.setContextDefaults(contextKeyFromMessage(target.chatId, target.messageThreadId), {
+          workspace: recipe.cwd, launchProfileId: "readonly", topicName,
+        });
+        await ctx.answerCallbackQuery({ text: "Тред создан, разбор запущен" });
+        const url = topicUrl(target.chatId, target.messageThreadId);
+        await safeReply(ctx, `Разбор <a href="${url}">${escapeHTML(callback.shortId)}</a> запущен.`, {
+          fallbackText: `Разбор ${callback.shortId}: ${url}`,
+        });
+        return;
+      }
+
+      await ctx.answerCallbackQuery({ text: "Создаю тред и запускаю разбор..." });
+      const result = await openSentryTaskThread(callback, {
+        createTopic: async (topicName) => {
+          const topic = await bot.api.createForumTopic(chatId, topicName);
+          return topic.message_thread_id;
+        },
+        initializeTopic: async (topicId, topicName) => {
+          registry.setContextDefaults(contextKeyFromMessage(chatId, topicId), {
+            workspace: recipe.cwd,
+            launchProfileId: "readonly",
+            topicName,
+          });
+          const card = [
+            `🔎 <b>Sentry-разбор</b> · ${escapeHTML(callback.shortId)}`,
+            `Проект: <code>${escapeHTML(recipe.cwd)}</code>`,
+            "Режим: только диагностика, без изменений.",
+          ].join("\n");
+          await sendTextMessage(bot.api, chatId, card, {
+            messageThreadId: topicId,
+            fallbackText: `Sentry-разбор ${callback.shortId}`,
+          });
+        },
+        startAnalysis: async (topicId, prompt) => {
+          const workContextKey = contextKeyFromMessage(chatId, topicId);
+          const session = await registry.getOrCreate(workContextKey, { deferThreadStart: true });
+          void handleUserPrompt(ctx, workContextKey, chatId, session, prompt);
+        },
+      }, recipe.realm);
+
+      const url = topicUrl(chatId, result.topicId);
+      await safeReply(
+        ctx,
+        `Разбор <a href="${url}">${escapeHTML(callback.shortId)}</a> запущен.`,
+        { fallbackText: `Разбор ${callback.shortId}: ${url}` },
+      );
+    } catch (error) {
+      launchedSentryMessages.delete(launchKey);
+      const text = `Не вышло: ${friendlyErrorText(error)}`;
+      try {
+        await ctx.answerCallbackQuery({ text: text.slice(0, 200), show_alert: true });
+      } catch {
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      }
+    }
+  });
+
   /** Big enough for a real review, small enough not to blow up the turn. */
   const MR_DIFF_LIMIT = 60_000;
+  const launchedMergeRequestMessages = new Set<string>();
 
   const repoWorkspace = (project: string): string => {
     const root = config.gitlabWorkspaceRoot;
@@ -2396,13 +2939,46 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       return;
     }
 
-    await ctx.answerCallbackQuery({ text: "Тяну дифф..." });
+    const sourceMessageId = ctx.callbackQuery.message?.message_id;
+    const launchKey = `${chatId}:${sourceMessageId ?? 0}:${key}`;
+    if (launchedMergeRequestMessages.has(launchKey)) {
+      await ctx.answerCallbackQuery({ text: "Ревью уже запущено" });
+      return;
+    }
+    launchedMergeRequestMessages.add(launchKey);
     try {
-      const changes = await gitlab.fetchChanges(mr.projectId, mr.iid);
       const topicName = mergeRequestTopicName(mr);
+      const workspace = repoWorkspace(mr.project);
+      if (reliability) {
+        const rawSource = canonicalWorkSource(
+          ctx,
+          "confirmation",
+          buildReviewBootstrapPrompt(mr),
+          null,
+          { workspace, launchProfileId: "readonly", topicName },
+          undefined,
+          undefined,
+          { kind: "forum_topic", topicName, state: "planned" },
+        );
+        if (!rawSource) throw new Error("Некорректная кнопка MR");
+        const source = canonicalCallbackWorkSource(rawSource, ctx.callbackQuery.data);
+        const target = await reliability.handleWork(source);
+        if (!target) throw new Error("Не удалось закрепить топик MR");
+        registry.setContextDefaults(contextKeyFromMessage(target.chatId, target.messageThreadId), {
+          workspace, launchProfileId: "readonly", topicName,
+        });
+        await ctx.answerCallbackQuery({ text: "Тред создан, ревью запущено" });
+        const url = topicUrl(target.chatId, target.messageThreadId);
+        await safeReply(ctx, `Ревью <a href="${url}">!${mr.iid} ${escapeHTML(mr.project)}</a> запущено.`, {
+          fallbackText: `Ревью !${mr.iid}: ${url}`,
+        });
+        return;
+      }
+
+      await ctx.answerCallbackQuery({ text: "Тяну дифф..." });
+      const changes = await gitlab.fetchChanges(mr.projectId, mr.iid);
       const topic = await bot.api.createForumTopic(chatId, topicName);
       const workContextKey = contextKeyFromMessage(chatId, topic.message_thread_id);
-      const workspace = repoWorkspace(mr.project);
       registry.setContextDefaults(workContextKey, {
         workspace,
         launchProfileId: config.defaultLaunchProfileId,
@@ -2429,59 +3005,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         buildReviewPrompt(mr, changes, MR_DIFF_LIMIT),
       );
     } catch (error) {
+      launchedMergeRequestMessages.delete(launchKey);
       await safeReply(ctx, `<b>Не вышло:</b> ${escapeHTML(friendlyErrorText(error))}`, {
         fallbackText: `Не вышло: ${friendlyErrorText(error)}`,
       });
     }
-  });
-
-  bot.command("model", async (ctx) => {
-    const chatId = ctx.chat?.id;
-    if (!chatId) {
-      return;
-    }
-
-    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
-    if (!contextSession) {
-      return;
-    }
-
-    const { contextKey, session } = contextSession;
-    if (isBusy(contextKey)) {
-      await safeReply(ctx, escapeHTML("Cannot change model while a prompt is running."), {
-        fallbackText: "Cannot change model while a prompt is running.",
-      });
-      return;
-    }
-
-    const models = session.listModelChoices();
-    if (models.length === 0) {
-      await safeReply(ctx, escapeHTML("No models available."), {
-        fallbackText: "No models available.",
-      });
-      return;
-    }
-
-    const info = session.getInfo();
-    const currentModel = info.model
-      ? `${info.modelProvider ?? "openai"}/${info.model}`
-      : "(default)";
-    const selectedId = selectedChoiceId(session);
-    const modelButtons = models.map((model) => ({
-      label: `${model.label}${model.id === selectedId ? " ✓" : ""}`,
-      callbackData: `model_${model.id}`,
-    }));
-    pendingModelButtons.set(contextKey, modelButtons);
-    const keyboard = paginateKeyboard(modelButtons, 0, "model");
-
-    await safeReply(
-      ctx,
-      [`<b>Current model:</b> <code>${escapeHTML(currentModel)}</code>`, "", "Select a model for new threads:"].join("\n"),
-      {
-        fallbackText: [`Current model: ${currentModel}`, "", "Select a model for new threads:"].join("\n"),
-        replyMarkup: keyboard,
-      },
-    );
   });
 
   bot.command("effort", async (ctx) => {
@@ -2516,6 +3044,88 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   bot.callbackQuery(NOOP_PAGE_CALLBACK_DATA, async (ctx) => {
     await ctx.answerCallbackQuery();
   });
+  bot.callbackQuery(DISABLED_MODEL_SELECTION_CALLBACK_PATTERN, async (ctx) => {
+    await ctx.answerCallbackQuery({
+      text: "Model selection is disabled. Use /new for OpenAI.",
+    });
+  });
+  if (reliability) {
+    bot.callbackQuery(CANONICAL_STATUS_ACTION_PATTERN, async (ctx) => {
+      const source = canonicalControlSource(ctx);
+      if (!source) {
+        await ctx.answerCallbackQuery();
+        return;
+      }
+      const target = checkedCanonicalJobRef({
+        jobId: ctx.match?.[2] ?? "",
+        version: Number.parseInt(ctx.match?.[3] ?? "", 10),
+      });
+      if (!target) return;
+      const code = ctx.match?.[1];
+      const fromPinnedDashboard = bot.statusBoard?.isDashboardMessage(
+        source.chatId,
+        source.messageThreadId ?? undefined,
+        source.messageId,
+      ) === true;
+      const kinds = {
+        f: "refresh", d: "details", i: "inspect", g: "guardian_restore",
+        y: "retry_delivery", s: "send_again_warning",
+      } as const;
+      try {
+        if (code === "a") {
+          if (fromPinnedDashboard) {
+            if (!reliability.runDashboardAction) {
+              await ctx.answerCallbackQuery({ text: "Action unavailable" });
+              return;
+            }
+            await reliability.runDashboardAction({
+              kind: "abort", jobId: target.jobId, expectedVersion: target.version,
+            });
+          } else {
+            await reliability.abort({ source, target });
+          }
+          await ctx.answerCallbackQuery({ text: "Aborting..." });
+          return;
+        }
+        if (code === "r") {
+          if (fromPinnedDashboard) {
+            if (!reliability.runDashboardAction) {
+              await ctx.answerCallbackQuery({ text: "Action unavailable" });
+              return;
+            }
+            await reliability.runDashboardAction({
+              kind: "retry_new_turn", jobId: target.jobId, expectedVersion: target.version,
+            });
+          } else {
+            await reliability.retry({ source, target });
+          }
+          await ctx.answerCallbackQuery({ text: "Retry queued" });
+          return;
+        }
+        const kind = code && Object.hasOwn(kinds, code) ? kinds[code as keyof typeof kinds] : undefined;
+        if (!kind || !reliability.runDashboardAction) {
+          await ctx.answerCallbackQuery({ text: "Action unavailable" });
+          return;
+        }
+        const partKey = ctx.match?.[4];
+        const action: TelegramStatusAction = {
+          kind, jobId: target.jobId, expectedVersion: target.version,
+          ...(partKey ? { partKey } : {}),
+        };
+        const actionContext = fromPinnedDashboard ? undefined : canonicalContext(source);
+        await reliability.runDashboardAction(action, actionContext);
+        await ctx.answerCallbackQuery({
+          text: kind === "refresh" ? "Status refreshed"
+            : kind === "retry_delivery" ? "Delivery retry queued"
+              : kind === "send_again_warning" ? "Send again queued"
+                : "Open Dashboard for full details",
+        });
+      } catch (error) {
+        if (!isCanonicalStaleAction(error)) throw error;
+        await ctx.answerCallbackQuery({ text: "Status changed, refresh" });
+      }
+    });
+  }
   handlePageCallback(/^sess_page_(\d+)$/, "sess", pendingSessionButtons, "Expired, run /sessions again");
   handlePageCallback(/^proj_page_(\d+)$/, "proj", pendingProjectButtons, "Expired, run /projects again");
   handlePageCallback(/^mrpage_page_(\d+)$/, "mrpage", pendingMergeRequestButtons, "Устарело, вызови /mr заново");
@@ -2527,10 +3137,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     pendingLaunchButtons,
     `Expired, run ${LAUNCH_PROFILES_COMMAND} again`,
   );
-  handlePageCallback(/^model_page_(\d+)$/, "model", pendingModelButtons, "Expired, run /model again");
   handlePageCallback(/^effort_page_(\d+)$/, "effort", pendingEffortButtons, "Expired, run /effort again");
 
   bot.callbackQuery(/^codex_abort:(.+)$/, async (ctx) => {
+    if (reliability) {
+      await ctx.answerCallbackQuery({ text: "Status button expired" });
+      return;
+    }
+
+    // Compatibility-only path until the canonical reliability runtime is enabled.
     const contextKey = ctx.match?.[1];
     if (!contextKey) {
       await ctx.answerCallbackQuery();
@@ -2583,6 +3198,65 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       reopen: (threadId) => bot.api.reopenForumTopic(chatId, threadId),
       close: (threadId) => bot.api.closeForumTopic(chatId, threadId),
     });
+
+  if (config.miniApp && config.jiraPanel && jiraPanelClient) {
+    const panelConfig = config.jiraPanel;
+    const sourceContextKey = contextKeyFromMessage(panelConfig.chatId, panelConfig.topicId);
+    const workspace = panelConfig.workspace ?? config.workspace;
+    bot.jiraMiniApp = createJiraMiniAppController({
+      client: jiraPanelClient,
+      findThreadUrl: (issueKey) => {
+        const ticket = inbox.findTicketByKey(sourceContextKey, issueKey);
+        return ticket?.workTopicId ? topicUrl(panelConfig.chatId, ticket.workTopicId) : undefined;
+      },
+      openThread: (issue) => openJiraTaskThread({
+        chatId: panelConfig.chatId,
+        sourceContextKey,
+        workspace,
+        launchProfileId: config.defaultLaunchProfileId,
+        jiraClient: panelConfig.clientPath,
+        issue,
+      }, {
+        inbox,
+        topicIsAlive: (topicId) => topicIsAlive(panelConfig.chatId, topicId),
+        createTopic: async (topicName) => {
+          const topic = await bot.api.createForumTopic(panelConfig.chatId, topicName);
+          return topic.message_thread_id;
+        },
+        initializeTopic: async (topicId, ticket, task) => {
+          registry.setContextDefaults(contextKeyFromMessage(panelConfig.chatId, topicId), {
+            workspace,
+            launchProfileId: config.defaultLaunchProfileId,
+            topicName: jiraTaskTopicName(task),
+          });
+          await sendTextMessage(bot.api, panelConfig.chatId, renderJiraTaskCardHTML(task), {
+            messageThreadId: topicId,
+            fallbackText: `${task.key}: ${task.summary}`,
+            replyMarkup: ticketKeyboard(ticket).url("Открыть в Jira", task.url),
+          });
+        },
+      }),
+    });
+  }
+
+  const ensureHostThreadTopic = (
+    thread: NonNullable<ReturnType<typeof getThread>>,
+    chatId: number,
+  ) => ensureThreadTopic(thread, {
+    chatId,
+    contexts: registry.listContexts(),
+    topicIsAlive: (messageThreadId) => topicIsAlive(chatId, messageThreadId),
+    createForumTopic: (name) => bot.api.createForumTopic(chatId, name),
+    bindThread: (contextKey, record) => registry.bindThread(contextKey, record),
+    sendWelcome: async (messageThreadId, name) => {
+      await sendTextMessage(
+        bot.api,
+        chatId,
+        `<b>${escapeHTML(name)}</b>\n\nSend a message to continue this session.`,
+        { messageThreadId, fallbackText: name },
+      );
+    },
+  });
 
   bot.callbackQuery(/^jtask:/, async (ctx) => {
     const callback = parseJiraTaskCallback(ctx.callbackQuery.data);
@@ -2688,24 +3362,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
 
     const fromDashboard = bot.statusBoard?.isDashboardTopic(
+      chatId,
       ctx.callbackQuery.message?.message_thread_id,
     ) === true;
     try {
-      const result = await ensureThreadTopic(thread, {
-        chatId,
-        contexts: registry.listContexts(),
-        topicIsAlive: (messageThreadId) => topicIsAlive(chatId, messageThreadId),
-        createForumTopic: (name) => bot.api.createForumTopic(chatId, name),
-        bindThread: (contextKey, record) => registry.bindThread(contextKey, record),
-        sendWelcome: async (messageThreadId, name) => {
-          await sendTextMessage(
-            bot.api,
-            chatId,
-            `<b>${escapeHTML(name)}</b>\n\nSend a message to continue this session.`,
-            { messageThreadId, fallbackText: name },
-          );
-        },
-      });
+      const result = await ensureHostThreadTopic(thread, chatId);
 
       if (fromDashboard) {
         await ctx.answerCallbackQuery({
@@ -2820,150 +3481,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       return;
     }
 
-    const choices = session.listModelChoices();
-    if (!choices.length) {
-      await ctx.answerCallbackQuery({ text: "No models available" });
-      return;
-    }
-    await ctx.answerCallbackQuery({ text: "Workspace selected" });
+    await ctx.answerCallbackQuery({ text: "Creating OpenAI thread..." });
     pendingWorkspacePicks.delete(contextKey);
     pendingWorkspaceButtons.delete(contextKey);
-    pendingNewThreads.set(contextKey, { workspace });
-    const keyboard = modelChoiceKeyboard(
-      choices,
-      (choice) => `startmodel:${choice.id}`,
-      selectedChoiceId(session),
-    );
-    if (messageId) {
-      await safeEditMessage(bot, chatId, messageId, "<b>Select model for new thread:</b>", {
-        fallbackText: "Select model for new thread:",
-        replyMarkup: keyboard,
-      });
-    } else {
-      await safeReply(ctx, "<b>Select model for new thread:</b>", {
-        fallbackText: "Select model for new thread:",
-        replyMarkup: keyboard,
-      });
-    }
-  });
-
-  bot.callbackQuery(/^startmodel:([a-z0-9][a-z0-9_-]{0,31})$/, async (ctx) => {
-    const chatId = ctx.chat?.id;
-    const messageId = ctx.callbackQuery.message?.message_id;
-    const choiceId = ctx.match?.[1];
-    if (!chatId || !choiceId) return;
-
-    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
-    if (!contextSession) return;
-    const { contextKey, session } = contextSession;
-    const intent = pendingNewThreads.get(contextKey);
-    const choice = session.getModelChoice(choiceId);
-    if (!intent || !choice) {
-      await ctx.answerCallbackQuery({ text: "Expired, run /new again" });
-      return;
-    }
-    if (isBusy(contextKey)) {
-      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
-      return;
-    }
-
-    await ctx.answerCallbackQuery({ text: "Creating thread..." });
-    const busyState = getBusyState(contextKey);
-    busyState.switching = true;
-    try {
-      const info = await session.newThread(intent.workspace, choice.id);
-      pendingNewThreads.delete(contextKey);
-      updateSessionMetadata(contextKey, session);
-      const label = isTopicContext(contextKey)
-        ? "New thread created for this topic."
-        : "New thread created.";
-      const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
-      const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
-      if (messageId) {
-        await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plainText });
-      } else {
-        await safeReply(ctx, html, { fallbackText: plainText });
-      }
-    } catch (error) {
-      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed: ${friendlyErrorText(error)}`,
-      });
-    } finally {
-      busyState.switching = false;
-    }
-  });
-
-  bot.callbackQuery(/^jobmodel:/, async (ctx) => {
-    const callback = parsePromptModelCallback(ctx.callbackQuery.data);
-    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
-    if (!callback || !contextSession) {
-      await ctx.answerCallbackQuery({ text: "Invalid model selection" });
-      return;
-    }
-
-    const { contextKey, session } = contextSession;
-    const job = jobStore.findAwaitingModel(callback.token, contextKey);
-    const choice = session.getModelChoice(callback.choiceId);
-    if (!job || !choice) {
-      await ctx.answerCallbackQuery({ text: "Expired, send the prompt again" });
-      return;
-    }
-    if (!canUseChoiceForInput(choice, job.input)) {
-      await ctx.answerCallbackQuery({ text: "This model cannot accept images. Choose OpenAI." });
-      return;
-    }
-    if (isBusy(contextKey)) {
-      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
-      return;
-    }
-
-    await ctx.answerCallbackQuery({ text: `Starting ${choice.label}...` });
-    try {
-      session.setModelChoice(choice.id);
-      if (!session.hasActiveThread()) {
-        await session.newThread(undefined, choice.id);
-      } else {
-        const active = session.getInfo();
-        if (active.model !== choice.model || active.modelProvider !== choice.provider) {
-          throw new Error("A different thread became active; send the prompt again");
-        }
-      }
-      updateSessionMetadata(contextKey, session);
-      const threadId = session.getInfo().threadId;
-      if (!threadId) throw new Error("Codex did not return a thread id");
-      const released = jobStore.selectModel(
-        callback.token,
-        contextKey,
-        choice.id,
-        threadId,
-      );
-      const messageId = ctx.callbackQuery.message?.message_id;
-      if (messageId && ctx.chat?.id) {
-        await safeEditMessage(
-          bot,
-          ctx.chat.id,
-          messageId,
-          `<b>Model selected:</b> <code>${escapeHTML(`${choice.provider}/${choice.model}`)}</code>`,
-          { fallbackText: `Model selected: ${choice.provider}/${choice.model}` },
-        );
-      }
-      await handleUserPrompt(
-        ctx,
-        contextKey,
-        released.chatId,
-        session,
-        released.input,
-        released,
-        {
-          ...ticketPromptOptions(released.messageThreadId),
-          requireModelSelection: false,
-        },
-      );
-    } catch (error) {
-      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed: ${friendlyErrorText(error)}`,
-      });
-    }
+    await startNewThread(ctx, contextKey, session, workspace, messageId);
   });
 
   bot.callbackQuery(/^launch_(\d+)$/, async (ctx) => {
@@ -3143,70 +3664,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plain });
   });
 
-  bot.callbackQuery(/^model_([a-z0-9][a-z0-9_-]{0,31})$/, async (ctx) => {
-    const chatId = ctx.chat?.id;
-    const messageId = ctx.callbackQuery.message?.message_id;
-    const choiceId = ctx.match?.[1];
-
-    if (!chatId || !choiceId) {
-      return;
-    }
-
-    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
-    if (!contextSession) {
-      return;
-    }
-
-    const { contextKey, session } = contextSession;
-    const buttons = pendingModelButtons.get(contextKey);
-    if (!buttons) {
-      await ctx.answerCallbackQuery({ text: "Expired, run /model again" });
-      return;
-    }
-
-    const modelExists = buttons.some((button) => button.callbackData === `model_${choiceId}`);
-    if (!modelExists) {
-      await ctx.answerCallbackQuery({ text: "Expired, run /model again" });
-      return;
-    }
-
-    if (isBusy(contextKey)) {
-      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
-      return;
-    }
-
-    await ctx.answerCallbackQuery({ text: "Setting model..." });
-    pendingModelButtons.delete(contextKey);
-
-    try {
-      const choice = session.setModelChoice(choiceId);
-      updateSessionMetadata(contextKey, session);
-      const pair = `${choice.provider}/${choice.model}`;
-      const html = [
-        `<b>Next model set to ${escapeHTML(choice.label)}</b> <code>(${escapeHTML(pair)})</code>.`,
-        "The active thread was not changed.",
-      ].join("\n");
-      const plainText = [
-        `Next model set to ${choice.label} (${pair}).`,
-        "The active thread was not changed.",
-      ].join("\n");
-
-      if (messageId) {
-        await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plainText });
-      } else {
-        await safeReply(ctx, html, { fallbackText: plainText });
-      }
-    } catch (error) {
-      const errHtml = `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`;
-      const errPlain = `Failed: ${friendlyErrorText(error)}`;
-      if (messageId) {
-        await safeEditMessage(bot, chatId, messageId, errHtml, { fallbackText: errPlain });
-      } else {
-        await safeReply(ctx, errHtml, { fallbackText: errPlain });
-      }
-    }
-  });
-
   bot.callbackQuery(/^effort_(minimal|low|medium|high|xhigh)$/, async (ctx) => {
     const chatId = ctx.chat?.id;
     const messageId = ctx.callbackQuery.message?.message_id;
@@ -3238,7 +3695,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     });
   });
 
-  const inboxRuntime = registerInboxHandlers({
+  registerInboxHandlers({
     bot,
     config,
     registry,
@@ -3257,24 +3714,107 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         undefined,
         ticketPromptOptions(ticket.workTopicId),
       ),
+    handleCanonicalTicketPrompt: reliability
+      ? async (ctx, ticket) => {
+          const source = canonicalWorkSource(ctx, "confirmation", ticket.prompt, null, {
+            workspace: ticket.workspace,
+            launchProfileId: ticket.launchProfileId ?? config.defaultLaunchProfileId,
+            topicName: ticketHeading(ticket),
+          });
+          if (!source) throw new Error("Invalid canonical Telegram ticket source");
+          await reliability.handleWork({
+            ...source,
+            completion: { kind: "inbox_ticket", ticketId: ticket.id },
+          });
+        }
+      : undefined,
     topicIsAlive,
     sendText: (chatId, text, options) => sendTextMessage(bot.api, chatId, text, options),
     safeReply,
   });
-  bot.sentryBridge = inboxRuntime.sentryBridge;
 
   bot.on("message:text", async (ctx) => {
+    const userText = ctx.message.text.trim();
+    if (!userText || userText.startsWith("/")) {
+      return;
+    }
+    if (reliability) {
+      const source = canonicalWorkSource(
+        ctx,
+        "text",
+        userText,
+        null,
+        undefined,
+        isImplementationAuthorization(userText)
+          ? writableImplementationProfileId(config) ?? "missing-writable-profile"
+          : undefined,
+      );
+      if (source) await reliability.handleWork(source);
+      return;
+    }
+
+    // Compatibility-only path until the canonical reliability runtime is enabled.
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
     }
 
-    const userText = ctx.message.text.trim();
-    if (!userText || userText.startsWith("/")) {
+    const { contextKey, session } = contextSession;
+    const busyState = getBusyState(contextKey);
+    if (shouldBlockTextDuringSessionTransition(busyState)) {
+      await safeReply(ctx, escapeHTML("Дождитесь завершения смены сессии."), {
+        fallbackText: "Дождитесь завершения смены сессии.",
+      });
       return;
     }
 
-    const { contextKey, session } = contextSession;
+    const handoffRequested = session.getInfo().sandboxMode === "read-only"
+      && isImplementationAuthorization(userText);
+    if (handoffRequested) {
+      if (isBusy(contextKey)) {
+        await safeReply(ctx, escapeHTML("Дождитесь завершения текущей операции."), {
+          fallbackText: "Дождитесь завершения текущей операции.",
+        });
+        return;
+      }
+
+      busyState.switching = true;
+      await setReaction(ctx, "👀");
+      try {
+        const prepared = await prepareImplementationHandoff({
+          text: userText,
+          session,
+          launchProfiles: config.launchProfiles,
+          defaultLaunchProfileId: config.defaultLaunchProfileId,
+          persistSession: () => updateSessionMetadata(contextKey, session),
+          dispatchPrompt: () => {
+            lastPromptInput.set(contextKey, userText);
+            return handleUserPrompt(ctx, contextKey, ctx.chat.id, session, userText);
+          },
+          notify: async (forked) => {
+            const warning = forked.unsafeLaunch ? " · ⚠️ full access" : "";
+            const text = `🔓 Создан implementation-thread с сохранённой историей · ${forked.launchProfileBehavior}${warning}`;
+            await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+          },
+          onNotificationError: (error) => {
+            console.warn("Failed to send implementation handoff notification:", friendlyErrorText(error));
+          },
+        });
+        if (!prepared) {
+          throw new Error("Implementation handoff was not prepared");
+        }
+        await prepared.prompt;
+        await setReaction(ctx, "👍");
+      } catch (error) {
+        await clearReaction(ctx);
+        const text = `Не удалось перейти к реализации: ${friendlyErrorText(error)}`;
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      } finally {
+        busyState.switching = false;
+      }
+      return;
+    }
+
     lastPromptInput.set(contextKey, userText);
     await setReaction(ctx, "👀");
     try {
@@ -3286,6 +3826,23 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   });
 
   bot.on(["message:voice", "message:audio"], async (ctx) => {
+    if (reliability) {
+      const voice = ctx.message.voice;
+      const audio = ctx.message.audio;
+      const kind = voice ? "voice" : "audio";
+      const file = voice ?? audio;
+      if (!file) return;
+      const source = canonicalWorkSource(
+        ctx,
+        kind,
+        captionText(ctx),
+        attachmentRef(kind, file),
+      );
+      if (source) await reliability.handleWork(source);
+      return;
+    }
+
+    // Compatibility-only path until the canonical reliability runtime is enabled.
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -3350,6 +3907,20 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   });
 
   bot.on("message:photo", async (ctx) => {
+    if (reliability) {
+      const photo = ctx.message.photo.at(-1);
+      if (!photo) return;
+      const source = canonicalWorkSource(
+        ctx,
+        "photo",
+        captionText(ctx),
+        attachmentRef("photo", photo, { name: "telegram-photo.jpg", mimeType: "image/jpeg" }),
+      );
+      if (source) await reliability.handleWork(source);
+      return;
+    }
+
+    // Compatibility-only path until the canonical reliability runtime is enabled.
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -3422,6 +3993,19 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   });
 
   bot.on("message:document", async (ctx) => {
+    if (reliability) {
+      const document = ctx.message.document;
+      const source = canonicalWorkSource(
+        ctx,
+        "document",
+        captionText(ctx),
+        attachmentRef("document", document),
+      );
+      if (source) await reliability.handleWork(source);
+      return;
+    }
+
+    // Compatibility-only path until the canonical reliability runtime is enabled.
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -3512,39 +4096,29 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
 
   bot.recoverPendingJobs = async (): Promise<void> => {
     const awaitingModelPartition = await partitionJobsByTopicLiveness(
-      jobStore.listAwaitingModel(),
+      legacyJobStore().listAwaitingModel(),
       topicIsAlive,
     );
     const awaitingModel = awaitingModelPartition.retained;
     const loggedDeadContexts = new Set<TelegramContextKey>();
     for (const job of awaitingModelPartition.dead) {
-      jobStore.update(job.id, { state: "failed" });
+      legacyJobStore().update(job.id, { state: "failed" });
       if (!loggedDeadContexts.has(job.contextKey)) {
         loggedDeadContexts.add(job.contextKey);
         console.warn(`Dropping Telegram model picker for missing topic: ${job.contextKey}`);
       }
     }
-    const recoverable = jobStore.listRecoverable();
+    for (const job of awaitingModel) {
+      legacyJobStore().useDefaultModel(job.id);
+    }
+    const recoverable = legacyJobStore().listRecoverable();
     await topicActivity.restoreStaleTopics({
       exclude: recoverable
         .filter((job) => job.state === "active" && isTopicActivityEligible(job.messageThreadId))
         .map((job) => ({ chatId: job.chatId, messageThreadId: job.messageThreadId! })),
     });
-    if (awaitingModel.length === 0 && recoverable.length === 0) return;
-
     if (awaitingModel.length) {
-      console.log(`Restoring ${awaitingModel.length} Telegram model picker(s)`);
-      const pickerResults = await Promise.allSettled(
-        awaitingModel.map(async (job) => {
-          const session = await registry.getOrCreate(job.contextKey, { deferThreadStart: true });
-          await sendPromptModelPicker(job, session);
-        }),
-      );
-      for (const result of pickerResults) {
-        if (result.status === "rejected") {
-          console.error("Failed to restore Telegram model picker:", formatError(result.reason));
-        }
-      }
+      console.log(`Queued ${awaitingModel.length} pending prompt(s) with the OpenAI default`);
     }
 
     if (recoverable.length === 0) return;
@@ -3568,10 +4142,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           session,
           job.input,
           job,
-          {
-            ...ticketPromptOptions(job.messageThreadId),
-            requireModelSelection: false,
-          },
+          ticketPromptOptions(job.messageThreadId),
         );
       } catch (error) {
         if (job.state === "active" && isTopicActivityEligible(job.messageThreadId)) {
@@ -3593,6 +4164,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     bot.statusBoard = new StatusBoard({
       chatId: boardChatId,
       intervalMs: config.statusBoardIntervalMs,
+      miniAppLaunchUrl: config.miniApp?.launchUrl,
       collect: collectStatusSnapshot,
       createTopic: async () => {
         const topic = await bot.api.createForumTopic(boardChatId, "Dashboard");
@@ -3627,21 +4199,46 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           if (!/TOPIC_NOT_MODIFIED/i.test(formatError(error))) throw error;
         }
       },
-      remove: async (messageId) => {
-        await bot.api.unpinChatMessage(boardChatId, messageId).catch(() => {});
-        await bot.api.deleteMessage(boardChatId, messageId);
+      remove: async (messageId, backgroundWrite) => {
+        await removeStatusBoardMessage(
+          () => backgroundWrite(() => bot.api.unpinChatMessage(boardChatId, messageId)),
+          () => backgroundWrite(() => bot.api.deleteMessage(boardChatId, messageId)),
+        );
       },
       deleteMessage: async (messageId) => {
         await bot.api.deleteMessage(boardChatId, messageId);
       },
       store: createStatusBoardStore(path.join(config.workspace, ".telecodex", "status.json")),
+      backgroundWriteGate: options.backgroundWriteGate,
     });
+    if (config.miniApp) {
+      bot.dashboard = createDashboardController({
+        chatId: boardChatId,
+        collect: createPeriodicDashboardCollector(collectStatusSnapshot),
+        ...(reliability?.loadDashboardSessionStatuses
+          ? { loadSessionStatuses: () => reliability.loadDashboardSessionStatuses!() }
+          : {}),
+        ...(loadCanonicalReliability
+          ? {
+            loadReliability: loadCanonicalReliability,
+            loadReliabilityForAction: () => reliability!.loadDashboardReliability!(),
+          }
+          : {}),
+        ...(reliability?.runDashboardAction
+          ? { runJobAction: (action: TelegramStatusAction) => reliability.runDashboardAction!(action) }
+          : {}),
+        getThread,
+        ensureThreadTopic: (thread) => ensureHostThreadTopic(thread, boardChatId),
+      });
+    }
   }
 
   // Elapsed times are measured from when a thread was first seen working, so
   // this has to survive between refreshes.
   let activeSince = new Map<string, number>();
   let lastHostThreads: HostThreadView[] = [];
+  let lastCodexAvailable = true;
+  const liveStatusTopicByThreadId = new Map<string, number>();
 
   /**
    * What is running, from the app-server rather than from our own job store.
@@ -3651,7 +4248,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
    * host was busy. The queue and the outcomes still come from the job store:
    * the app-server knows nothing about either.
    */
-  async function collectStatusSnapshot(): Promise<StatusSnapshot> {
+  async function collectStatusSnapshot(
+    options: {
+      validateTopicBindings: boolean;
+      maxRecentThreads?: number;
+      includeCanonicalReliability?: boolean;
+      refreshHostThreads?: boolean;
+    } = {
+      validateTopicBindings: true,
+    },
+  ): Promise<StatusSnapshot> {
     const contexts = registry.listContexts();
     const byContextKey = new Map(contexts.map((meta) => [meta.contextKey, meta]));
     const boardChatId = config.telegramForumChatId;
@@ -3671,7 +4277,29 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }
     }
 
-    const jobs: StatusJobView[] = jobStore.list().map((job) => {
+    const canonicalReliability = loadCanonicalReliability
+      && options.includeCanonicalReliability !== false
+      ? await loadCanonicalReliability()
+      : null;
+    const jobs: StatusJobView[] = canonicalReliability
+      ? canonicalReliability.jobs.map(({ projection }) => {
+          const meta = contexts.find((entry) => entry.threadId === projection.threadId);
+          const context = meta ? parseContextKey(meta.contextKey) : null;
+          return {
+            state: projection.phase === "terminal"
+              ? projection.outcome === "completed" ? "completed"
+                : projection.outcome === "aborted" ? "aborted" : "failed"
+              : projection.phase === "delivering" ? "delivering"
+                : projection.phase === "accepted" || projection.phase === "queued" ? "waiting" : "active",
+            label: `Job ${projection.shortJobId}`,
+            workspace: meta?.workspace ?? config.workspace,
+            ...(context?.messageThreadId === undefined ? {} : { messageThreadId: context.messageThreadId }),
+            createdAt: projection.timestamps.acceptedAt,
+            updatedAt: projection.timestamps.updatedAt,
+            projection,
+          };
+        })
+      : reliability ? [] : legacyJobStore().list().map((job) => {
       const meta = byContextKey.get(job.contextKey);
       const thread = job.threadId ? getThread(job.threadId) : undefined;
       return {
@@ -3685,49 +4313,72 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     });
 
     const now = Date.now();
-    let codexAvailable = true;
-    try {
-      const host = await listHostThreads(registry.getAppServerClient(), { now, activeSince });
-      activeSince = host.activeSince;
-      lastHostThreads = host.threads;
-    } catch {
-      codexAvailable = false;
+    let codexAvailable = canonicalReliability
+      ? canonicalReliability.appServer.connectivity === "connected"
+      : lastCodexAvailable;
+    if (options.refreshHostThreads !== false) {
+      try {
+        const host = await listHostThreads(registry.getAppServerClient(), { now, activeSince });
+        activeSince = host.activeSince;
+        lastHostThreads = host.threads;
+        lastCodexAvailable = true;
+      } catch {
+        if (!canonicalReliability) codexAvailable = false;
+        lastCodexAvailable = codexAvailable;
+      }
     }
 
     // A thread we opened has a topic to jump to, and a name the user chose.
     const hostThreads: HostThreadView[] = lastHostThreads.map((thread) => {
       const topicName = topicNameByThreadId.get(thread.id);
-      return { ...thread, messageThreadId: undefined, label: topicName ?? thread.label };
+      const messageThreadId = boardChatId === undefined
+        ? undefined
+        : findBoundTopic(contexts, boardChatId, thread.id);
+      return {
+        ...thread,
+        ...(messageThreadId === undefined ? {} : { messageThreadId }),
+        label: topicName ?? thread.label,
+      };
     });
     const recentThreads = listRecentRootThreads(
       new Date(now - STATUS_HISTORY_WINDOW_MS),
-      1000,
-    ).map((thread) => ({
-      threadId: thread.id,
-      label: topicNameByThreadId.get(thread.id) ?? threadLabel(thread),
-      workspace: thread.cwd,
-      source: thread.source,
-      updatedAt: thread.updatedAt.getTime(),
-    }));
+    ).map((thread) => {
+      const messageThreadId = boardChatId === undefined
+        ? undefined
+        : findBoundTopic(contexts, boardChatId, thread.id);
+      return {
+        threadId: thread.id,
+        label: topicNameByThreadId.get(thread.id) ?? threadLabel(thread),
+        workspace: thread.cwd,
+        source: thread.source,
+        updatedAt: thread.updatedAt.getTime(),
+        ...(messageThreadId === undefined ? {} : { messageThreadId }),
+      };
+    });
 
     const snapshot = buildStatusSnapshot(jobs, hostThreads, {
       limit: config.telegramMaxActiveTopics,
       now,
       recentThreads,
+      ...(options.maxRecentThreads === undefined
+        ? {}
+        : { maxRecentThreads: options.maxRecentThreads }),
       codexAvailable,
     });
     if (boardChatId !== undefined) {
       const actionable = [...snapshot.running, ...snapshot.recentThreads]
-        .filter((row): row is typeof row & { threadId: string } => Boolean(row.threadId))
-        .slice(0, STATUS_BOARD_BUTTON_LIMIT);
-      for (const row of actionable) {
-        row.messageThreadId = await findLiveBoundTopic(
+        .filter((row): row is typeof row & { threadId: string } => Boolean(row.threadId));
+      await bindLiveStatusTopics(
+        actionable,
+        liveStatusTopicByThreadId,
+        options.maxRecentThreads === undefined && options.validateTopicBindings,
+        (threadId) => findLiveBoundTopic(
           contexts,
           boardChatId,
-          row.threadId,
+          threadId,
           (messageThreadId) => topicIsAlive(boardChatId, messageThreadId),
-        );
-      }
+        ),
+      );
     }
     return snapshot;
   }
@@ -3752,13 +4403,11 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "inbox", description: "Turn this topic into a ticket inbox" },
     { command: "tickets", description: "List unresolved inbox tickets" },
     { command: "usage", description: "Token usage by project" },
-    { command: "sentry", description: "Import unseen Sentry issues" },
     { command: "title", description: "Rename the current ticket topic" },
     { command: "mr", description: "Open merge requests, tap to review" },
     { command: "retry", description: "Resend the last prompt" },
     { command: "abort", description: "Cancel current operation" },
     { command: "launch_profiles", description: "Select launch profile" },
-    { command: "model", description: "View & change model" },
     { command: "effort", description: "Set reasoning effort" },
     { command: "auth", description: "Check auth status" },
     { command: "login", description: "Start authentication" },

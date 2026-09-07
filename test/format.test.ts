@@ -1,3 +1,5 @@
+import { performance } from "node:perf_hooks";
+
 import {
   escapeHTML,
   formatTelegramHTML,
@@ -99,6 +101,33 @@ describe("formatTelegramHTML", () => {
 });
 
 describe("splitTelegramMarkdown", () => {
+  const hasLoneSurrogate = (value: string): boolean =>
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(value);
+  const codePointLength = (value: string): number => Array.from(value).length;
+  const fencedBody = (value: string): string => value.replace(/^```txt\n/, "").replace(/\n```$/, "");
+
+  it.each([
+    { label: "plain target", input: `aaaa😀bbbbb`, target: 5, html: 100, fenced: false },
+    { label: "plain HTML", input: `a😀b`, target: 100, html: 2, fenced: false },
+    { label: "fenced target", input: `\`\`\`txt\na😀b\n\`\`\``, target: 12, html: 100, fenced: true },
+    {
+      label: "fenced HTML", input: `\`\`\`txt\na😀b\n\`\`\``, target: 100,
+      html: codePointLength(formatTelegramHTML("```txt\n\n```")) + 2, fenced: true,
+    },
+  ])("does not split an astral character at the $label boundary", ({ input, target, html, fenced }) => {
+    const chunks = splitTelegramMarkdown(input, target, html);
+    const rejoined = fenced
+      ? chunks.map((chunk) => fencedBody(chunk.sourceText)).join("")
+      : chunks.map((chunk) => chunk.sourceText).join("");
+    const original = fenced ? fencedBody(input) : input;
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((chunk) => !hasLoneSurrogate(chunk.sourceText) && !hasLoneSurrogate(chunk.html))).toBe(true);
+    expect(chunks.every((chunk) => codePointLength(chunk.sourceText) <= target)).toBe(true);
+    expect(chunks.every((chunk) => codePointLength(chunk.html) <= html)).toBe(true);
+    expect(rejoined).toBe(original);
+  });
+
   it("keeps fenced code and links structurally intact", () => {
     const input = [
       "# Отчёт",
@@ -134,5 +163,54 @@ describe("splitTelegramMarkdown", () => {
     expect(chunks.every((chunk) => chunk.html.startsWith('<pre><code class="language-txt">'))).toBe(true);
     expect(chunks.every((chunk) => chunk.html.endsWith("</code></pre>"))).toBe(true);
     expect(chunks.every((chunk) => chunk.html.length <= 500)).toBe(true);
+  });
+
+  it("splits one million ordinary characters with bounded work", () => {
+    const input = "x".repeat(1_000_000);
+    const started = performance.now();
+    const chunks = splitTelegramMarkdown(input, 3_000, 4_096);
+
+    expect(performance.now() - started).toBeLessThan(10_000);
+    expect(chunks).toHaveLength(334);
+    expect(chunks.every((chunk) => chunk.html.length <= 4_096)).toBe(true);
+    expect(chunks.map((chunk) => chunk.sourceText).join("")).toBe(input);
+  });
+
+  it("splits a large fenced block without repeatedly rendering its remaining suffix", () => {
+    const input = `\`\`\`txt\n${"<&>\n".repeat(50_000)}\`\`\``;
+    const started = performance.now();
+    const chunks = splitTelegramMarkdown(input, 3_000, 4_096);
+
+    expect(performance.now() - started).toBeLessThan(10_000);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((chunk) => chunk.html.startsWith('<pre><code class="language-txt">'))).toBe(true);
+    expect(chunks.every((chunk) => chunk.html.endsWith("</code></pre>"))).toBe(true);
+    expect(chunks.every((chunk) => chunk.html.length <= 4_096)).toBe(true);
+  });
+
+  it("drops an unbounded fenced language identifier instead of repeating it per chunk", () => {
+    const language = "a".repeat(5_000);
+    const input = `\`\`\`${language}\nten characters\n\`\`\``;
+    const chunks = splitTelegramMarkdown(input, 3_000, 4_096);
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]?.sourceText).toBe("```\nten characters\n```");
+    expect(chunks[0]?.html).toBe("<pre><code>ten characters\n</code></pre>");
+    expect(chunks.every((chunk) => chunk.html.length <= 4_096)).toBe(true);
+
+    const started = performance.now();
+    const longChunks = splitTelegramMarkdown(`\`\`\`${language}\n${"<&>\n".repeat(50_000)}\`\`\``, 3_000, 4_096);
+    expect(performance.now() - started).toBeLessThan(10_000);
+    expect(longChunks.length).toBeLessThanOrEqual(512);
+    expect(longChunks.every((chunk) => chunk.sourceText.length <= 3_000)).toBe(true);
+    expect(longChunks.every((chunk) => chunk.html.length <= 4_096)).toBe(true);
+  });
+
+  it("stops bounded splitting before generating excess chunks", () => {
+    const boundedSplit = splitTelegramMarkdown as (
+      markdown: string, targetLength: number, maxHtmlLength: number, maximumChunks: number,
+    ) => ReturnType<typeof splitTelegramMarkdown>;
+    expect(() => boundedSplit("x".repeat(10_000), 3_000, 4_096, 2))
+      .toThrow("Telegram markdown split exceeds chunk budget");
   });
 });

@@ -27,7 +27,7 @@ const ERROR_PATTERNS: Array<{ pattern: RegExp; message: string }> = [
   },
   {
     pattern: /404.*model|model.*not.*found|invalid.*model|model.*does not exist/i,
-    message: "Model not available. Use /model to pick a different one.",
+    message: "Model not available. Start a /new thread with the OpenAI default.",
   },
   {
     pattern: /timeout|ETIMEDOUT|ESOCKETTIMEDOUT/i,

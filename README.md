@@ -18,7 +18,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 - **Session browser** — `/sessions` lists recent threads from `~/.codex`, grouped by workspace; tap to switch
 - **Telegram login** — `/login` authenticates against the Codex CLI via device auth flow, no terminal needed
 - **Launch profiles** — `/launch_profiles` selects the sandbox + approval mode for new or reattached threads in the current Telegram context (`/launch` remains an alias)
-- **Model picker** — `/model` shows available models and lets you switch for new threads
+- **OpenAI default** — new threads start with the configured OpenAI model; provider/model selection is disabled
 - **Reasoning effort** — `/effort` lets you dial from `minimal` to `xhigh` for new threads
 - **Optional message reactions** — 👀 while processing, 👍 on success when enabled; silently degrades in chats without reaction support
 - **Friendly errors** — common SDK and network errors are translated to actionable messages with command hints
@@ -66,14 +66,8 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `ENABLE_UNSAFE_LAUNCH_PROFILES` | — | Set to `true` to allow extra `danger-full-access` launch profiles |
    | `TOOL_VERBOSITY` | — | `all`, `summary` *(default)*, `errors-only`, `none` |
    | `SHOW_TURN_TOKEN_USAGE` | — | Show the per-turn `in/cached/out` footer in final replies (`false` by default) |
-   | `TELEGRAM_WEEKLY_TOKEN_LIMIT` | - | Soft weekly token budget used by `/usage` and the digest |
-   | `INBOX_DIGEST_CHAT_ID` | - | Chat that receives the weekday morning digest |
-   | `INBOX_DIGEST_TOPIC_ID` | - | Optional topic for the digest; omitted means General |
+   | `TELEGRAM_WEEKLY_TOKEN_LIMIT` | - | Soft weekly token budget used by `/usage` |
    | `JIRA_COMMENT_SERVER`, `JIRA_COMMENT_LOGIN`, `JIRA_COMMENT_TOKEN` | - | Complete credential set for confirmed Jira comments |
-   | `SENTRY_URL`, `SENTRY_TOKEN`, `SENTRY_ORG` | - | Complete credential set for the Sentry bridge |
-   | `SENTRY_BRIDGE_MAP_JSON` | - | Sentry project to inbox context and workspace map |
-   | `SENTRY_BRIDGE_INTERVAL_SECONDS` | - | Poll interval, at least 300 seconds (default `900`) |
-   | `SENTRY_BRIDGE_LIMIT` | - | Maximum new Sentry tickets per run (default `5`) |
    | `MAX_FILE_SIZE` | — | Max upload size in bytes (default `20971520` = 20 MB) |
    | `ENABLE_TELEGRAM_LOGIN` | — | Allow `/login` and `/logout` from Telegram (`false` by default) |
    | `ENABLE_TELEGRAM_REACTIONS` | — | Enable Telegram emoji reactions like 👀 / 👍 (`false` by default) |
@@ -97,7 +91,6 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/retry` | Resend the last prompt |
 | `/abort` | Cancel the current turn |
 | `/launch_profiles` | Select launch profile for new or reattached threads (`/launch` alias kept) |
-| `/model` | View and change the model |
 | `/effort` | Set reasoning effort: `minimal` · `low` · `medium` · `high` · `xhigh` |
 | `/auth` | Check authentication status |
 | `/login` | Start Codex device-auth flow from Telegram |
@@ -110,7 +103,6 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/tickets` | List unresolved tickets grouped by project |
 | `/title <text>` | Rename the current ticket topic |
 | `/usage [7\|30]` | Token totals and turn count by project |
-| `/sentry [hours]` | Import unseen unresolved Sentry issues now |
 | `/mr` | Open merge requests from GitLab; tap one to open a review topic |
 | `/done` | Draft a "done" comment for the merge request linked to this ticket |
 
@@ -242,35 +234,20 @@ session defaults the inbox was configured with.
   project metadata from dofbox; credentials and kubeconfig values are never copied.
 - The first analysis may return `TOPIC: ...` on its first line. TeleCodex removes the
   marker from the answer and uses it as the topic title.
-- `✅ Решён` closes the topic and removes the ticket from `/tickets` and the digest.
+- `✅ Решён` closes the topic and removes the ticket from `/tickets`.
 
-### Usage and morning digest
+### Usage
 
 Each completed turn appends one line to `.telecodex/token-usage.jsonl`. `/usage 7`
 and `/usage 30` group input, cached input, output, total tokens, and turns by
 workspace. `TELEGRAM_WEEKLY_TOKEN_LIMIT` adds warnings at 80 and 100 percent; it
 never blocks a turn.
 
-Build before running the digest manually:
-
-```bash
-npm run build
-npm run digest -- --dry-run
-```
-
-`systemd/telecodex-inbox-digest.timer` runs at 09:00 Europe/Moscow on weekdays.
-The digest reads `inbox.json`, but does not modify it.
-
-### Jira comments and Sentry tickets
+### Jira comments
 
 For tickets with a Jira key, TeleCodex saves the cleaned analysis under
 `.telecodex/ticket-answers/`. It posts only after `📤 В Jira` is pressed. The
 comment includes a link back to the Telegram topic.
-
-The Sentry bridge polls unresolved issues by frequency. Each unseen issue becomes
-an ordinary inbox ticket with the same start and resolve buttons. Seen issue IDs
-are retained for 90 days in `.telecodex/sentry-bridge.json`. The bridge never starts
-Codex on its own.
 
 ### Runtime backup
 
@@ -364,7 +341,7 @@ TeleCodex/
 ├── src/
 │   ├── index.ts           — startup, signal handling, polling loop
 │   ├── bot.ts             - Telegram bot core and session handlers
-│   ├── bot-inbox.ts       - inbox commands, ticket callbacks, Jira and Sentry wiring
+│   ├── bot-inbox.ts       - inbox commands, ticket callbacks, and Jira wiring
 │   ├── bot-ui.ts          — pure render helpers (/help, /start, session labels)
 │   ├── codex-launch.ts    — launch profile parsing, validation, and formatting
 │   ├── codex-session.ts   — CodexSessionService wrapping the SDK
@@ -381,9 +358,7 @@ TeleCodex/
 │   ├── projects.ts        — thread grouping and topic links for /projects
 │   ├── inbox.ts           — ticket store: inboxes, tickets, dedup by issue key
 │   ├── usage-store.ts     - persistent per-turn token ledger
-│   ├── inbox-digest.ts    - morning digest renderer and Telegram sender
 │   ├── jira-comment.ts    - confirmation-gated Jira comments
-│   ├── sentry-bridge.ts   - polling, deduplication, and inbox mapping
 │   ├── gitlab.ts          — GitLab API client, review prompts, done comments
 │   ├── recipes.ts         — finding parsing, fingerprints, triage, rendering
 │   ├── recipe-config.ts   — recipes.json parsing and validation
@@ -396,8 +371,8 @@ TeleCodex/
 │   └── thread-links.ts    — thread id detection and copy buttons
 ├── recipes/               — review prompts and recipes.example.json
 ├── scripts/               - runtime backup helper
-├── systemd/               - digest and backup services and timers
-├── test/                  - 55 test files, 670+ tests (vitest)
+├── systemd/               - backup service and timer
+├── test/                  - 53 test files, 659 tests (vitest)
 ├── .env.example
 ├── Dockerfile
 ├── docker-compose.yml

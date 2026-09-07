@@ -56,8 +56,95 @@ describe("JiraClient", () => {
 
     const result = await client.getSprint(false);
 
-    expect(execute).toHaveBeenCalledWith("/opt/jira-client", ["sprint", "--limit", "100"]);
+    expect(execute).toHaveBeenCalledWith("/opt/jira-client", [
+      "sprint",
+      "--project",
+      "MIR",
+      "--limit",
+      "500",
+    ]);
     expect(result.issues[0]?.key).toBe("MIR-6789");
+  });
+
+  it("loads one MIR backlog page with newest issues first", async () => {
+    const execute = vi.fn().mockResolvedValue(JSON.stringify({
+      jql: "project = MIR AND statusCategory != Done AND (sprint IS EMPTY OR sprint in futureSprints()) ORDER BY created DESC, key DESC",
+      total: 380,
+      start_at: 50,
+      limit: 50,
+      returned: 1,
+      issues: [{
+        key: "MIR-190",
+        summary: "Backlog task",
+        status: "Сделать",
+        url: "https://jira.fashionhouse.by/browse/MIR-190",
+      }],
+      cached: false,
+      stale: false,
+      cache_age_seconds: 0,
+    }));
+    const client = new JiraClient("/opt/jira-client", execute);
+
+    const result = await client.getBacklog(50, 50, true);
+
+    expect(execute).toHaveBeenCalledWith("/opt/jira-client", [
+      "search",
+      "project = MIR AND statusCategory != Done AND (sprint IS EMPTY OR sprint in futureSprints()) ORDER BY created DESC, key DESC",
+      "--start-at",
+      "50",
+      "--limit",
+      "50",
+      "--refresh",
+    ]);
+    expect(result).toMatchObject({ total: 380, start_at: 50, returned: 1 });
+  });
+
+  it("rejects unsafe backlog page boundaries without launching jira-client", async () => {
+    const execute = vi.fn();
+    const client = new JiraClient("jira-client", execute);
+
+    await expect(client.getBacklog(-1, 50, false)).rejects.toThrow("Invalid Jira backlog page");
+    await expect(client.getBacklog(0, 101, false)).rejects.toThrow("Invalid Jira backlog page");
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed backlog page returned by the external client", async () => {
+    const execute = vi.fn().mockResolvedValue(JSON.stringify({
+      jql: "project = MIR",
+      total: 1,
+      start_at: -1,
+      limit: 50,
+      returned: 2,
+      issues: [],
+      cached: false,
+      stale: false,
+      cache_age_seconds: 0,
+    }));
+    const client = new JiraClient("jira-client", execute);
+
+    await expect(client.getBacklog(0, 50, false)).rejects.toThrow("invalid backlog response");
+  });
+
+  it("rejects a backlog page that does not match the requested cursor and query", async () => {
+    const execute = vi.fn().mockResolvedValue(JSON.stringify({
+      jql: "project = OTHER",
+      total: 100,
+      start_at: 50,
+      limit: 100,
+      returned: 51,
+      issues: Array.from({ length: 51 }, (_, index) => ({
+        key: `MIR-${index + 1}`,
+        summary: "Task",
+        status: "Сделать",
+        url: `https://jira.fashionhouse.by/browse/MIR-${index + 1}`,
+      })),
+      cached: false,
+      stale: false,
+      cache_age_seconds: 0,
+    }));
+    const client = new JiraClient("jira-client", execute);
+
+    await expect(client.getBacklog(0, 50, false)).rejects.toThrow("invalid backlog response");
   });
 
   it("bypasses the cache when refresh is requested", async () => {

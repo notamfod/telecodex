@@ -25,6 +25,7 @@ import {
   groupTicketsByWorkspace,
   hasAttachment,
   parseInboxTemplateCommand,
+  prepareTicketLaunchPrompt,
   ticketActionButtons,
   ticketHeading,
   ticketTopicName,
@@ -41,12 +42,6 @@ import {
 import { isSafeProjectContext, loadDofboxRealmContext } from "./project-context.js";
 import { topicUrl } from "./projects.js";
 import type { SessionRegistry } from "./session-registry.js";
-import {
-  SentryBridge,
-  renderSentryTicketText,
-  type SentryBridgeTarget,
-  type SentryIssue,
-} from "./sentry-bridge.js";
 import { extractTopicRename, renamedTicketTopic } from "./topic-naming.js";
 
 const INBOX_QUIET_MS = 2_000;
@@ -89,23 +84,19 @@ export interface RegisterInboxHandlersDeps {
     session: CodexSessionService,
     ticket: Ticket,
   ): Promise<void>;
+  handleCanonicalTicketPrompt?(ctx: Context, ticket: Ticket): Promise<void>;
   topicIsAlive(chatId: number, messageThreadId: number): Promise<boolean>;
   sendText(chatId: number, text: string, options?: TextOptions): Promise<unknown>;
   safeReply(ctx: Context, text: string, options?: TextOptions): Promise<void>;
 }
 
-export interface InboxHandlerRuntime {
-  sentryBridge?: SentryBridge;
-}
-
-export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): InboxHandlerRuntime {
+export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
   const { bot, config, registry, inbox, jiraComment, topicActivity } = deps;
   const pendingBatches = new Map<string, InboxItem[][]>();
   const pendingDuplicateDecisions = new Map<number, { group: InboxItem[]; previousTicketId: number }>();
   const pendingJiraPosts = new Set<number>();
   let nextBatchId = 1;
   let nextDuplicateDecisionId = 1;
-  let lastSentryTicketAt = 0;
 
   const ticketKeyboard = (ticket: Pick<Ticket, "id" | "startedAt" | "resolvedAt">): InlineKeyboard => {
     const keyboard = new InlineKeyboard();
@@ -156,16 +147,14 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): InboxHan
     skipDuplicateCheck?: boolean;
     supersedesId?: number;
     continueTicketId?: number;
-    externalKeyOverride?: string;
-    sourceOverride?: string;
   } = {}): Promise<void> => {
     const first = group[0];
     if (!first) return;
     const settings = inbox.get(first.contextKey);
     if (!settings) return;
     const text = ticketTextOf(group);
-    const source = options.sourceOverride ?? describeSource(first.message);
-    const externalKey = options.externalKeyOverride ?? extractTicketKey(text);
+    const source = describeSource(first.message);
+    const externalKey = extractTicketKey(text);
     if (externalKey && !options.skipDuplicateCheck) {
       const candidates = inbox.listTicketsByKey(first.contextKey, externalKey);
       for (const candidate of candidates) {
@@ -255,33 +244,7 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): InboxHan
     void (groups.length === 1 ? createTicket(groups[0]) : askHowToSplit(groups)).catch((error) => console.error("Inbox burst failed:", friendlyErrorText(error)));
   });
 
-  const createSentryTicket = async (issue: SentryIssue, target: SentryBridgeTarget, project: string): Promise<void> => {
-    const settings = inbox.get(target.inboxContextKey);
-    if (!settings) throw new Error(`Inbox ${target.inboxContextKey} is not configured`);
-    if (settings.workspace !== target.workspace) throw new Error(`Inbox ${target.inboxContextKey} workspace mismatch: ${settings.workspace}`);
-    const parsed = parseContextKey(target.inboxContextKey);
-    if (!parsed.messageThreadId || !Number.isFinite(parsed.chatId)) throw new Error(`Inbox ${target.inboxContextKey} is not a forum topic`);
-    for (const existing of inbox.listTicketsByKey(target.inboxContextKey, issue.shortId)) {
-      if (existing.workTopicId && await deps.topicIsAlive(parsed.chatId, existing.workTopicId).catch(() => false)) {
-        return;
-      }
-    }
-    const waitMs = INBOX_TOPIC_PAUSE_MS - (Date.now() - lastSentryTicketAt);
-    if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
-    lastSentryTicketAt = Date.now();
-    await createTicket([{ contextKey: target.inboxContextKey, chatId: parsed.chatId, messageId: 0, hasAttachment: false, text: renderSentryTicketText(issue), message: {} }], {
-      skipDuplicateCheck: true,
-      externalKeyOverride: issue.shortId,
-      sourceOverride: `Sentry project ${project}`,
-    });
-  };
-  const sentryBridge = config.sentryBridge ? new SentryBridge({
-    ...config.sentryBridge,
-    statePath: path.join(config.workspace, ".telecodex", "sentry-bridge.json"),
-    createTicket: createSentryTicket,
-  }) : undefined;
-
-  registerInboxCommands(deps, sentryBridge);
+  registerInboxCommands(deps);
   bot.callbackQuery(/^inbox_batch:(\d+):(one|each|cancel)$/, async (ctx) => {
     const batchId = ctx.match?.[1];
     const choice = ctx.match?.[2];
@@ -309,13 +272,45 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): InboxHan
     const ticket = Number.isNaN(ticketId) ? undefined : inbox.getTicket(ticketId);
     if (!ticket) { await ctx.answerCallbackQuery({ text: "Тикет не найден" }); return; }
     if (ticket.startedAt) { await ctx.answerCallbackQuery({ text: "Разбор уже запускали" }); return; }
+    const inboxContext = parseContextKey(ticket.inboxContextKey);
+    if (!inboxContext
+      || ctx.chat?.id !== inboxContext.chatId
+      || ctx.callbackQuery.message?.message_thread_id !== ticket.workTopicId) {
+      await ctx.answerCallbackQuery({ text: "Тикет не найден" });
+      return;
+    }
+    const workContextKey = contextKeyFromMessage(inboxContext.chatId, ticket.workTopicId);
+    const boundThread = registry.listContexts().find((entry) => entry.contextKey === workContextKey)?.threadId;
+    if (boundThread) {
+      inbox.markStarted(ticket.id);
+      await ctx.answerCallbackQuery({ text: "Разбор уже запускали" });
+      await ctx.editMessageReplyMarkup({ reply_markup: ticketKeyboard(inbox.getTicket(ticket.id)!) }).catch(() => {});
+      return;
+    }
+    const currentInbox = inbox.get(ticket.inboxContextKey);
+    const launchTicket = {
+      ...ticket,
+      launchProfileId: currentInbox?.launchProfileId ?? ticket.launchProfileId,
+      prompt: prepareTicketLaunchPrompt(ticket.prompt, currentInbox?.realm),
+    };
+    registry.setContextDefaults(workContextKey, {
+      workspace: launchTicket.workspace,
+      launchProfileId: launchTicket.launchProfileId,
+    });
+    if (deps.handleCanonicalTicketPrompt) {
+      await deps.handleCanonicalTicketPrompt(ctx, launchTicket);
+      await ctx.answerCallbackQuery({ text: "Запускаю разбор..." });
+      inbox.markStarted(ticket.id);
+      await ctx.editMessageReplyMarkup({ reply_markup: ticketKeyboard(inbox.getTicket(ticket.id)!) }).catch(() => {});
+      return;
+    }
     const contextSession = await deps.getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) return;
     if (deps.isBusy(contextSession.contextKey)) { await ctx.answerCallbackQuery({ text: "Дождись окончания текущего прогона" }); return; }
     await ctx.answerCallbackQuery({ text: "Запускаю разбор..." });
     inbox.markStarted(ticket.id);
     await ctx.editMessageReplyMarkup({ reply_markup: ticketKeyboard(inbox.getTicket(ticket.id)!) }).catch(() => {});
-    await deps.handleTicketPrompt(ctx, contextSession.contextKey, ctx.chat!.id, contextSession.session, ticket);
+    await deps.handleTicketPrompt(ctx, contextSession.contextKey, ctx.chat!.id, contextSession.session, launchTicket);
   });
   bot.callbackQuery(/^jira_post:(\d+)$/, async (ctx) => {
     const ticketId = Number.parseInt(ctx.match?.[1] ?? "", 10);
@@ -373,10 +368,9 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): InboxHan
       message,
     });
   });
-  return { sentryBridge };
 }
 
-function registerInboxCommands(deps: RegisterInboxHandlersDeps, sentryBridge?: SentryBridge): void {
+function registerInboxCommands(deps: RegisterInboxHandlersDeps): void {
   const { bot, config, registry, inbox } = deps;
   const usage = [
     "Использование:", "/inbox on [путь] — сделать этот топик инбоксом", "/inbox off — выключить",
@@ -476,14 +470,5 @@ function registerInboxCommands(deps: RegisterInboxHandlersDeps, sentryBridge?: S
     inbox.setTopicTitle(ticket.id, extracted.title);
     const text = `Топик переименован: ${topicName}`;
     await deps.safeReply(ctx, escapeHTML(text), { fallbackText: text });
-  });
-  bot.command("sentry", async (ctx) => {
-    if (!sentryBridge) { await deps.safeReply(ctx, escapeHTML("Sentry bridge не настроен.")); return; }
-    const rawHours = String(ctx.match ?? "").trim();
-    const hours = rawHours ? Number(rawHours) : 24;
-    if (!Number.isInteger(hours) || hours < 1 || hours > 720) { await deps.safeReply(ctx, "Использование: <code>/sentry [hours]</code>, от 1 до 720", { fallbackText: "Использование: /sentry [hours], от 1 до 720" }); return; }
-    const result = await sentryBridge.run(hours);
-    const lines = [`<b>Sentry за ${hours} ч.</b>`, `Получено: ${result.fetched}`, `Создано тикетов: ${result.created}`, `Уже обработано: ${result.skipped}`, result.failures.length ? `Ошибки: ${escapeHTML(result.failures.join("; "))}` : "Ошибок нет."];
-    await deps.safeReply(ctx, lines.join("\n"), { fallbackText: lines.map((line) => line.replace(/<[^>]+>/g, "")).join("\n") });
   });
 }

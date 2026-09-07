@@ -218,11 +218,12 @@ try {
           rebindThreadTopic: (oldContextKey, newContextKey, thread) => {
             registry!.rebindThreadTopic(oldContextKey, newContextKey, thread);
           },
-          sendWelcome: async ({ chatId, messageThreadId }, topicName) => {
+          sendWelcome: async ({ chatId, messageThreadId }, topicName, signal) => {
             await bot!.api.sendMessage(
               chatId,
               `<b>${escapeHTML(topicName)}</b>\n\nSend a message to continue this session.`,
               { message_thread_id: messageThreadId, parse_mode: "HTML" },
+              signal as never,
             );
           },
           creationTimeoutMs: config.reliabilityTimeouts.telegramDeliveryMs,

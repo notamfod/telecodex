@@ -70,12 +70,14 @@ export interface TelegramTopicRecoveryRuntimeOptions {
   readonly sendWelcome: (
     destination: TelegramTopicDestination,
     topicName: string,
+    signal: AbortSignal,
   ) => Promise<void>;
   readonly outboxPump: () => Promise<void>;
   readonly now?: () => number;
   readonly createId?: () => string;
   readonly creationTimeoutMs?: number;
   readonly scheduleWakeup?: (at: number, wake: () => void | Promise<void>) => void;
+  readonly trackEffect?: (effect: Promise<void>) => void;
   readonly reportReason?: (input: {
     readonly jobId: string;
     readonly reasonCode: TelegramTopicRecoveryRuntimeReasonCode;
@@ -108,12 +110,18 @@ export function createTelegramTopicRecoveryRuntime(
     catch { /* Observability must not replace the recovery outcome. */ }
   };
 
+  const track = (effect: Promise<void>): void => {
+    try { options.trackEffect?.(effect); }
+    catch { /* An optional lifecycle observer must not replace recovery. */ }
+  };
+
   const enqueue = (jobId: string, effect: () => Promise<void>): Promise<void> => {
     const previous = effects.get(jobId) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(async () => {
       if (!disposed) await effect();
     });
     effects.set(jobId, next);
+    track(next);
     void next.finally(() => {
       if (effects.get(jobId) === next) effects.delete(jobId);
     }).catch(() => {});
@@ -147,9 +155,15 @@ export function createTelegramTopicRecoveryRuntime(
       chatId: recovery.oldDestination.chatId,
       messageThreadId: recovery.newMessageThreadId!,
     };
-    void Promise.resolve()
-      .then(() => options.sendWelcome(destination, topicName))
-      .catch(() => report(jobId, "TOPIC_RECOVERY_WELCOME_FAILED"));
+    const welcome = runOwnedOperation(
+      (signal) => options.sendWelcome(destination, topicName, signal),
+      "Telegram topic recovery welcome timed out",
+    ).catch((error) => {
+      if (!disposed && error !== OPERATION_CANCELLED) {
+        report(jobId, "TOPIC_RECOVERY_WELCOME_FAILED");
+      }
+    });
+    track(welcome);
     await options.outboxPump();
   };
 

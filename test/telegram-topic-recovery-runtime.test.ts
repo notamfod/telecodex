@@ -269,6 +269,30 @@ describe("TelegramTopicRecoveryRuntime", () => {
     }
   });
 
+  it("bounds and cancels a detached best-effort welcome during dispose", async () => {
+    vi.useFakeTimers();
+    const harness = createHarness({ creationTimeoutMs: 10_000 });
+    let welcomeSignal: AbortSignal | undefined;
+    let resolveWelcome!: () => void;
+    harness.sendWelcome.mockImplementationOnce((_destination, _topicName, signal) => {
+      welcomeSignal = signal;
+      return new Promise<void>((resolve) => { resolveWelcome = resolve; });
+    });
+    const runtime = createTelegramTopicRecoveryRuntime(harness.options);
+
+    await runtime.recover(harness.action);
+    await vi.waitFor(() => expect(harness.sendWelcome).toHaveBeenCalledOnce());
+    expect.soft(vi.getTimerCount()).toBe(1);
+
+    runtime.dispose();
+
+    expect.soft(welcomeSignal?.aborted).toBe(true);
+    expect.soft(vi.getTimerCount()).toBe(0);
+    resolveWelcome();
+    await Promise.resolve();
+    expect(harness.reportReason).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["configured forum differs", { forumChatId: -100999 }],
     ["old registry binding is absent", { bindingPresent: false }],
@@ -421,7 +445,11 @@ function createHarness(options: {
     return NEW;
   });
   const rebindThreadTopic = vi.fn();
-  const sendWelcome = vi.fn(async () => {
+  const sendWelcome = vi.fn(async (
+    _destination: typeof NEW,
+    _topicName: string,
+    _signal: AbortSignal,
+  ) => {
     if (options.welcomeError) throw options.welcomeError;
   });
   const outboxPump = vi.fn(async () => undefined);

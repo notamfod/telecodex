@@ -158,6 +158,7 @@ export function createTelegramReliabilityRuntime(
     "targetProvisionTimeoutMs",
   );
   const effects = new Map<string, Promise<void>>();
+  const topicRecoveryEffects = new Set<Promise<void>>();
   const turns = new Map<string, Promise<void>>();
   const statusCutovers = new Set<string>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
@@ -243,11 +244,17 @@ export function createTelegramReliabilityRuntime(
       return { chatId: destination.chatId, messageThreadId: destination.messageThreadId };
     },
   });
+  const trackTopicRecoveryEffect = (effect: Promise<void>): void => {
+    const drain = effect.catch(() => undefined);
+    topicRecoveryEffects.add(drain);
+    void drain.finally(() => topicRecoveryEffects.delete(drain));
+  };
   const topicRecovery = options.topicRecovery
     ? createTelegramTopicRecoveryRuntime({
         ...options.topicRecovery,
         store,
         outboxPump: () => outbox.pump(),
+        trackEffect: trackTopicRecoveryEffect,
       })
     : undefined;
   const session = trackedAdapter(createTelegramSessionCodexAdapter({
@@ -734,8 +741,9 @@ export function createTelegramReliabilityRuntime(
       coordinator.dispose();
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
-      await Promise.allSettled([...effects.values()]);
+      await Promise.allSettled([...effects.values(), ...topicRecoveryEffects]);
       effects.clear();
+      topicRecoveryEffects.clear();
       turns.clear();
       statusCutovers.clear();
       await status.dispose();

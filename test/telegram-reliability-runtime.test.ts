@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { vi } from "vitest";
 
+import type { CodexThreadRecord } from "../src/codex-state.js";
 import {
   boundedReliabilityProbeTimeoutMs,
   createTelegramReliabilityRuntime,
@@ -16,8 +17,10 @@ import {
   classifyTelegramStatusError,
   createTelegramStatusTransport,
 } from "../src/telegram-grammy-transport.js";
-import { SqliteTelegramJobStore } from "../src/telegram-job-store.js";
+import { SqliteTelegramJobStore, type TelegramJob } from "../src/telegram-job-store.js";
 import { TelegramJobIngress, type TelegramWorkSource } from "../src/telegram-job-ingress.js";
+import { hashTelegramDeliveryPayload } from "../src/telegram-response-plan.js";
+import { planTelegramTopicRecovery } from "../src/telegram-topic-recovery.js";
 
 const NOW = 1_700_000_500_000;
 const THREAD = "11111111-1111-4111-8111-111111111111";
@@ -69,6 +72,61 @@ describe("Telegram reliability runtime", () => {
     expect(listRecoveries).toHaveBeenCalledWith(["in_flight"]);
     expect(listRecoveries).toHaveBeenCalledWith(["retry_wait"]);
     expect(listRecoveries).toHaveBeenCalledWith(["complete"]);
+  });
+
+  it("drains a scheduled recovery outbox pump before shutdown can close the store", async () => {
+    const recovery = seedDueTopicRecovery(store);
+    vi.spyOn(store, "scanReconciliationCandidates").mockReturnValue({
+      jobs: [], quarantined: [], nextCursor: null,
+    });
+    const harness = createHarness(store, directory);
+    let scheduledWake!: () => void | Promise<void>;
+    let deliveryStarted!: () => void;
+    let releaseDelivery!: () => void;
+    const started = new Promise<void>((resolve) => { deliveryStarted = resolve; });
+    runtime = createTelegramReliabilityRuntime({
+      ...harness.options,
+      topicRecovery: {
+        forumChatId: recovery.oldDestination.chatId,
+        hasThreadTopicBinding: vi.fn((_threadId, destination) =>
+          destination.messageThreadId === recovery.oldDestination.messageThreadId),
+        probeForumTopic: vi.fn(async () => false),
+        createForumTopic: vi.fn(async () => recovery.newDestination),
+        getThread: vi.fn(() => structuredClone(recovery.thread)),
+        rebindThreadTopic: vi.fn(),
+        sendWelcome: vi.fn(async () => undefined),
+        scheduleWakeup: (_at, wake) => { scheduledWake = wake; },
+        reportReason: vi.fn(),
+      },
+    });
+    await runtime.reconcile();
+    harness.delivery.deliver.mockImplementationOnce(() => new Promise((resolve) => {
+      deliveryStarted();
+      releaseDelivery = () => resolve({ messageId: 777 });
+    }));
+
+    const waking = Promise.resolve(scheduledWake());
+    await started;
+    let disposeResolved = false;
+    const disposing = runtime.dispose().then(() => { disposeResolved = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect.soft(disposeResolved).toBe(false);
+    releaseDelivery();
+    await Promise.all([waking, disposing]);
+
+    const storeMethods = [
+      vi.spyOn(store, "get"),
+      vi.spyOn(store, "listDueDeliveries"),
+      vi.spyOn(store, "listSendingDeliveries"),
+      vi.spyOn(store, "nextDeliveryWakeupAt"),
+    ];
+    const callsAtResolution = storeMethods.map((spy) => spy.mock.calls.length);
+    store.close();
+    await Promise.resolve(scheduledWake());
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(storeMethods.map((spy) => spy.mock.calls.length)).toEqual(callsAtResolution);
+    runtime = null;
   });
 
   it("uses urgent physical status writes for explicit and Dashboard refreshes", async () => {
@@ -1369,6 +1427,108 @@ function createHarness(store: SqliteTelegramJobStore, directory: string) {
     scheduleDeliveryWakeup: () => {},
   };
   return { options, session, registry, delivery, status };
+}
+
+function seedDueTopicRecovery(store: SqliteTelegramJobStore) {
+  const oldDestination = { chatId: -1001, messageThreadId: 7 } as const;
+  const newDestination = { chatId: oldDestination.chatId, messageThreadId: 99 } as const;
+  const input = source({ updateId: 404, messageId: 404, ...oldDestination });
+  let job: TelegramJob = {
+    schemaVersion: 1 as const,
+    version: 1,
+    id: "recovery-drain",
+    source: { botId: input.botId, updateId: input.updateId },
+    attachments: [],
+    phase: "accepted" as const,
+    health: "healthy" as const,
+    activity: "unknown" as const,
+    attention: { kind: "none" as const },
+    outcome: null,
+    dispatchId: null,
+    threadId: null,
+    turnId: null,
+    responsePlan: undefined,
+    deliveries: [],
+    acceptedAt: NOW - 100,
+    updatedAt: NOW - 100,
+    terminalAt: null,
+    dismissedAt: null,
+    retainUntil: null,
+  };
+  store.acceptUpdate({ job, sourcePayload: input, eventId: "recovery-drain-accepted" });
+  job = store.transition({ jobId: job.id, eventId: "recovery-drain-queued", expectedVersion: job.version,
+    event: { schemaVersion: 1, type: "job.queued", eventAt: NOW - 99 } });
+  job = store.transition({ jobId: job.id, eventId: "recovery-drain-dispatched", expectedVersion: job.version,
+    event: { schemaVersion: 1, type: "dispatch.started", eventAt: NOW - 98, dispatch: {
+      id: "recovery-drain-dispatch", threadId: THREAD, previousTurnId: null, attempt: 1,
+      startedAt: NOW - 98, transportWriteState: "written", nextAttemptAt: null,
+    } } });
+  job = store.transition({ jobId: job.id, eventId: "recovery-drain-started", expectedVersion: job.version,
+    event: { schemaVersion: 1, type: "turn.started", eventAt: NOW - 97,
+      identifiers: { turnId: "recovery-drain-turn" }, codexEventAt: NOW - 97 } });
+  job = store.transition({ jobId: job.id, eventId: "recovery-drain-completed", expectedVersion: job.version,
+    event: { schemaVersion: 1, type: "turn.completed", eventAt: NOW - 96,
+      codexEventAt: NOW - 96, turnResult: { schemaVersion: 1, content: [] } } });
+  const anchor = { operation: "send_text" as const, ...oldDestination, text: "Response follows." };
+  const final = { operation: "send_text" as const, ...oldDestination, text: "Recovered result" };
+  job = store.installDeliveryPlan({
+    jobId: job.id,
+    expectedVersion: job.version,
+    eventId: "recovery-drain-plan",
+    eventAt: NOW - 95,
+    responsePlan: [{ partId: "final:0000", kind: "final" }],
+    parts: [
+      { jobId: job.id, partKey: "status-anchor", ordinal: 0, kind: "status-anchor",
+        state: "pending", payload: anchor, contentHash: hashTelegramDeliveryPayload(anchor), updatedAt: NOW - 95 },
+      { jobId: job.id, partKey: "final:0000", ordinal: 0, kind: "final",
+        state: "pending", payload: final, contentHash: hashTelegramDeliveryPayload(final), updatedAt: NOW - 95 },
+    ],
+  });
+  let changed = store.transitionDeliveryAndProject({
+    jobId: job.id, partKey: "status-anchor", expectedJobVersion: job.version,
+    expectedState: "pending", expectedAttemptCount: 0, state: "sending", attemptCount: 0,
+    eventId: "recovery-drain-anchor-sending", updatedAt: NOW - 94,
+  });
+  changed = store.transitionDeliveryAndProject({
+    jobId: job.id, partKey: "status-anchor", expectedJobVersion: changed.job.version,
+    expectedState: "sending", expectedAttemptCount: 0, state: "failed", attemptCount: 1,
+    lastErrorCode: "telegram_topic_missing", eventId: "recovery-drain-anchor-failed",
+    updatedAt: NOW - 93,
+    attention: { kind: "required", code: "telegram_delivery_failed", actions: ["inspect", "retry"] },
+  });
+  job = changed.job;
+  const thread: CodexThreadRecord = {
+    id: THREAD,
+    title: "Recovery drain",
+    cwd: "/work/telecodex",
+    model: null,
+    modelProvider: null,
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+    firstUserMessage: "recover",
+  };
+  const candidate = planTelegramTopicRecovery({
+    job,
+    source: input,
+    deliveries: store.listDeliveries(job.id),
+    anchorPlan: { payload: anchor, contentHash: hashTelegramDeliveryPayload(anchor) },
+    thread,
+  });
+  if (!candidate) throw new Error("Expected topic recovery drain candidate");
+  const reserved = store.reserveTopicRecovery({
+    candidate,
+    eventId: "recovery-drain-reserved",
+    actionToken: "b".repeat(64),
+    eventAt: NOW - 92,
+  });
+  store.deferTopicRecovery({
+    jobId: job.id,
+    expectedVersion: reserved.job.version,
+    actionToken: reserved.recovery.actionToken,
+    updatedAt: NOW - 1,
+    nextAttemptAt: NOW,
+  });
+  return { oldDestination, newDestination, thread };
 }
 
 function source(overrides: Partial<TelegramWorkSource> = {}): TelegramWorkSource {

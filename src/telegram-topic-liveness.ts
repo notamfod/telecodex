@@ -44,9 +44,18 @@ export function createForumTopicLivenessProbe(options: ForumTopicLivenessOptions
     if (cached && currentTime < cached.expiresAt) return Promise.resolve(cached.value);
     if (cached) cache.delete(key);
     const pending = inFlight.get(key);
-    if (pending) return pending;
+    if (pending) return abortForCaller(pending, callerSignal);
 
-    const request = withDeadline(async (signal) => {
+    let resolveRequest!: (value: boolean) => void;
+    let rejectRequest!: (error: unknown) => void;
+    const request = new Promise<boolean>((resolve, reject) => {
+      resolveRequest = resolve;
+      rejectRequest = reject;
+    });
+    void request.catch(() => {});
+    inFlight.set(key, request);
+
+    void withDeadline(async (signal) => {
       try {
         await options.sendChatAction(
           destination.chatId,
@@ -60,16 +69,43 @@ export function createForumTopicLivenessProbe(options: ForumTopicLivenessOptions
         if (isMissingForumTopicError(error)) return false;
         throw error;
       }
-    }, timeoutMs, callerSignal);
-
-    inFlight.set(key, request);
-    void request.then((value) => {
-      cache.set(key, { value, expiresAt: now() + cacheTtlMs });
-    }).finally(() => {
-      if (inFlight.get(key) === request) inFlight.delete(key);
-    }).catch(() => {});
+    }, timeoutMs, callerSignal).then(
+      (value) => {
+        if (inFlight.get(key) === request) inFlight.delete(key);
+        cache.set(key, { value, expiresAt: now() + cacheTtlMs });
+        resolveRequest(value);
+      },
+      (error) => {
+        if (inFlight.get(key) === request) inFlight.delete(key);
+        rejectRequest(error);
+      },
+    );
     return request;
   };
+}
+
+function abortForCaller<T>(promise: Promise<T>, callerSignal?: AbortSignal): Promise<T> {
+  if (callerSignal === undefined) return promise;
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => callerSignal.removeEventListener("abort", abort);
+    const finish = (complete: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      complete();
+    };
+    const abort = () => finish(() => reject(new Error("Telegram topic probe aborted")));
+    if (callerSignal.aborted) {
+      abort();
+      return;
+    }
+    callerSignal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
 }
 
 function withDeadline<T>(

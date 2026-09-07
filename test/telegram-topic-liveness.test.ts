@@ -13,15 +13,23 @@ describe("forum topic liveness", () => {
 
   it("rejects invalid destinations and timing values", () => {
     const sendChatAction = vi.fn(async () => true);
-    expect(() => createForumTopicLivenessProbe({ sendChatAction, timeoutMs: 0 }))
-      .toThrow("Invalid timeoutMs");
-    expect(() => createForumTopicLivenessProbe({ sendChatAction, cacheTtlMs: 1.5 }))
-      .toThrow("Invalid cacheTtlMs");
+    for (const timeoutMs of [0, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => createForumTopicLivenessProbe({ sendChatAction, timeoutMs }))
+        .toThrow("Invalid timeoutMs");
+    }
+    for (const cacheTtlMs of [0, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => createForumTopicLivenessProbe({ sendChatAction, cacheTtlMs }))
+        .toThrow("Invalid cacheTtlMs");
+    }
 
     const probe = createForumTopicLivenessProbe({ sendChatAction });
-    expect(() => probe({ chatId: 0, messageThreadId: 41 })).toThrow("Invalid Telegram chat id");
-    expect(() => probe({ chatId: -1001, messageThreadId: 0 }))
-      .toThrow("Invalid Telegram topic id");
+    for (const chatId of [0, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => probe({ chatId, messageThreadId: 41 })).toThrow("Invalid Telegram chat id");
+    }
+    for (const messageThreadId of [0, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => probe({ chatId: -1001, messageThreadId }))
+        .toThrow("Invalid Telegram topic id");
+    }
   });
 
   it("uses an ephemeral typing action in the target topic", async () => {
@@ -99,6 +107,55 @@ describe("forum topic liveness", () => {
 
     await expect(probe(destination)).rejects.toThrow("network failed");
     await expect(probe(destination)).resolves.toBe(true);
+    expect(sendChatAction).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears a failed request before its rejection reaches the caller", async () => {
+    const sendChatAction = vi.fn()
+      .mockRejectedValueOnce(new Error("network failed"))
+      .mockResolvedValueOnce(true);
+    const probe = createForumTopicLivenessProbe({ sendChatAction });
+
+    try {
+      await probe(destination);
+    } catch {
+      // The next call must not observe the failed request's stale single-flight entry.
+    }
+    await expect(probe(destination)).resolves.toBe(true);
+    expect(sendChatAction).toHaveBeenCalledTimes(2);
+  });
+
+  it("lets a joining caller abort without cancelling the shared request", async () => {
+    let release!: () => void;
+    const pending = new Promise<true>((resolve) => { release = () => resolve(true); });
+    let requestSignal: AbortSignal | undefined;
+    const sendChatAction = vi.fn((_chatId, _action, _options, signal) => {
+      requestSignal = signal;
+      return pending;
+    });
+    const probe = createForumTopicLivenessProbe({ sendChatAction });
+    const first = probe(destination);
+    const joinerController = new AbortController();
+    const joiner = probe(destination, joinerController.signal);
+
+    joinerController.abort();
+    await expect(joiner).rejects.toThrow("Telegram topic probe aborted");
+    expect(requestSignal?.aborted).toBe(false);
+    release();
+    await expect(first).resolves.toBe(true);
+    expect(sendChatAction).toHaveBeenCalledOnce();
+  });
+
+  it("caches a missing result and expires that negative cache", async () => {
+    let now = 1_000;
+    const sendChatAction = vi.fn().mockRejectedValue(new Error("TOPIC_DELETED"));
+    const probe = createForumTopicLivenessProbe({ sendChatAction, now: () => now });
+
+    await expect(probe(destination)).resolves.toBe(false);
+    await expect(probe(destination)).resolves.toBe(false);
+    expect(sendChatAction).toHaveBeenCalledOnce();
+    now += 5_001;
+    await expect(probe(destination)).resolves.toBe(false);
     expect(sendChatAction).toHaveBeenCalledTimes(2);
   });
 

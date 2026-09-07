@@ -398,6 +398,47 @@ describe("SessionRegistry", () => {
     expect(oldSession.dispose).not.toHaveBeenCalled();
   });
 
+  it("disposes an in-flight stale session instead of resurrecting the old context", async () => {
+    let resolveCreation!: (session: ReturnType<typeof createMockSession>) => void;
+    mockSessionState.create.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveCreation = resolve;
+    }));
+    const registry = new SessionRegistry(createConfig());
+    const thread: CodexThreadRecord = {
+      id: "thread-visible",
+      title: "Visible chat",
+      cwd: "/workspace/project",
+      model: null,
+      modelProvider: null,
+      createdAt: new Date(10_000),
+      updatedAt: new Date(20_000),
+      firstUserMessage: "Visible chat",
+    };
+    registry.bindThread("-100123:41", thread);
+    const pending = registry.getOrCreate("-100123:41");
+
+    registry.rebindThreadTopic("-100123:41", "-100123:99", thread);
+    const staleSession = createMockSession({
+      threadId: thread.id,
+      workspace: thread.cwd,
+      model: undefined,
+      launchProfileId: "default",
+      launchProfileLabel: "Default",
+      launchProfileBehavior: "workspace-write / never",
+      sandboxMode: "workspace-write",
+      approvalPolicy: "never",
+      unsafeLaunch: false,
+    });
+    resolveCreation(staleSession);
+
+    await expect(pending).rejects.toThrow("Telegram session context changed");
+    expect(staleSession.dispose).toHaveBeenCalledOnce();
+    expect(registry.has("-100123:41")).toBe(false);
+    expect(registry.listContexts()).toEqual([
+      expect.objectContaining({ contextKey: "-100123:99", threadId: thread.id }),
+    ]);
+  });
+
   it("two topic contexts in the same chat maintain independent sessions", async () => {
     const registry = new SessionRegistry(createConfig());
 

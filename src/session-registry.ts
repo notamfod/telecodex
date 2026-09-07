@@ -77,6 +77,10 @@ export class SessionRegistry {
 
     try {
       session = await creation;
+      if (this.sessionCreations.get(contextKey) !== creation) {
+        session.dispose();
+        throw new Error("Telegram session context changed");
+      }
       this.sessions.set(contextKey, session);
       if (session.getInfo().threadId) {
         this.updateMetadata(contextKey, session);

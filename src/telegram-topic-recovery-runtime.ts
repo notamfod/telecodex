@@ -130,12 +130,10 @@ export function createTelegramTopicRecoveryRuntime(
   ): Promise<void> => {
     try { bind(recovery, thread); }
     catch { report(jobId, "TOPIC_RECOVERY_BIND_FAILED"); }
-    try {
-      await options.sendWelcome({
+    void Promise.resolve().then(() => options.sendWelcome({
         chatId: recovery.oldDestination.chatId,
         messageThreadId: recovery.newMessageThreadId!,
-      }, topicName);
-    } catch { report(jobId, "TOPIC_RECOVERY_WELCOME_FAILED"); }
+      }, topicName)).catch(() => report(jobId, "TOPIC_RECOVERY_WELCOME_FAILED"));
     await options.outboxPump();
   };
 

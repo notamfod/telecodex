@@ -156,6 +156,24 @@ describe("TelegramTopicRecoveryRuntime", () => {
     );
     expect(harness.outboxPump).toHaveBeenCalledOnce();
   });
+
+  it("does not let a stuck best-effort welcome delay the committed outbox", async () => {
+    const harness = createHarness();
+    let resolveWelcome!: () => void;
+    harness.sendWelcome.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveWelcome = resolve;
+    }));
+    const runtime = createTelegramTopicRecoveryRuntime(harness.options);
+    const recovery = runtime.recover(harness.action);
+
+    await vi.waitFor(() => expect(harness.sendWelcome).toHaveBeenCalledOnce());
+    try {
+      expect(harness.outboxPump).toHaveBeenCalledOnce();
+    } finally {
+      resolveWelcome();
+      await recovery;
+    }
+  });
 });
 
 function createHarness(options: {

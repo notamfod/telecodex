@@ -206,9 +206,9 @@ try {
             (context) => context.contextKey === `${destination.chatId}:${destination.messageThreadId}`
               && context.threadId === threadId,
           ),
-          probeForumTopic: ({ chatId, messageThreadId }) => probeForumTopic(messageThreadId, {
-            reopen: (threadId) => bot!.api.reopenForumTopic(chatId, threadId),
-            close: (threadId) => bot!.api.closeForumTopic(chatId, threadId),
+          probeForumTopic: ({ chatId, messageThreadId }, signal) => probeForumTopic(messageThreadId, {
+            reopen: (threadId) => bot!.api.reopenForumTopic(chatId, threadId, signal as never),
+            close: (threadId) => bot!.api.closeForumTopic(chatId, threadId, signal as never),
           }),
           createForumTopic: async ({ chatId, topicName, signal }) => {
             const topic = await bot!.api.createForumTopic(chatId, topicName, {}, signal as never);

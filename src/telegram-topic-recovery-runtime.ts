@@ -19,7 +19,7 @@ import type { TelegramWorkSource } from "./telegram-job-ingress.js";
 
 const DEFAULT_CREATION_TIMEOUT_MS = 30_000;
 const MAX_CREATION_TIMEOUT_MS = 300_000;
-const CREATION_CANCELLED = Symbol("telegram-topic-recovery-creation-cancelled");
+const OPERATION_CANCELLED = Symbol("telegram-topic-recovery-operation-cancelled");
 
 type TopicRecoveryStore = Pick<
   SqliteTelegramJobStore,
@@ -52,7 +52,10 @@ export interface TelegramTopicRecoveryRuntimeOptions {
     threadId: string,
     destination: TelegramTopicDestination,
   ) => boolean;
-  readonly probeForumTopic: (destination: TelegramTopicDestination) => Promise<boolean>;
+  readonly probeForumTopic: (
+    destination: TelegramTopicDestination,
+    signal: AbortSignal,
+  ) => Promise<boolean>;
   readonly createForumTopic: (input: {
     readonly chatId: number;
     readonly topicName: string;
@@ -97,7 +100,7 @@ export function createTelegramTopicRecoveryRuntime(
   const effects = new Map<string, Promise<void>>();
   const scheduled = new Map<string, number>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
-  const activeCreations = new Set<{ cancel: () => void }>();
+  const activeOperations = new Set<{ cancel: () => void }>();
   let disposed = false;
 
   const report = (jobId: string, reasonCode: TelegramTopicRecoveryRuntimeReasonCode): void => {
@@ -225,10 +228,10 @@ export function createTelegramTopicRecoveryRuntime(
     else markUnknown(result);
   };
 
-  const createTopic = (
-    chatId: number,
-    topicName: string,
-  ): Promise<TelegramTopicDestination> => {
+  const runOwnedOperation = <T>(
+    operation: (signal: AbortSignal) => Promise<T>,
+    timeoutMessage: string,
+  ): Promise<T> => {
     const controller = new AbortController();
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -236,7 +239,7 @@ export function createTelegramTopicRecoveryRuntime(
       const cleanup = (): void => {
         clearTimeout(timeout);
         timers.delete(timeout);
-        activeCreations.delete(activeCreation);
+        activeOperations.delete(activeOperation);
       };
       const finish = (): boolean => {
         if (settled) return false;
@@ -244,31 +247,39 @@ export function createTelegramTopicRecoveryRuntime(
         cleanup();
         return true;
       };
-      const activeCreation = {
+      const activeOperation = {
         cancel: () => {
           controller.abort();
-          if (finish()) reject(CREATION_CANCELLED);
+          if (finish()) reject(OPERATION_CANCELLED);
         },
       };
       timeout = setTimeout(() => {
         controller.abort();
-        if (finish()) reject(new Error("Telegram topic creation result is unknown"));
+        if (finish()) reject(new Error(timeoutMessage));
       }, creationTimeoutMs);
       timers.add(timeout);
-      activeCreations.add(activeCreation);
-      let operation: Promise<TelegramTopicDestination>;
+      activeOperations.add(activeOperation);
+      let result: Promise<T>;
       try {
-        operation = options.createForumTopic({ chatId, topicName, signal: controller.signal });
+        result = operation(controller.signal);
       } catch (error) {
         if (finish()) reject(error);
         return;
       }
-      void operation.then(
-        (destination) => { if (finish()) resolve(destination); },
+      void result.then(
+        (value) => { if (finish()) resolve(value); },
         (error) => { if (finish()) reject(error); },
       );
     });
   };
+
+  const createTopic = (
+    chatId: number,
+    topicName: string,
+  ): Promise<TelegramTopicDestination> => runOwnedOperation(
+    (signal) => options.createForumTopic({ chatId, topicName, signal }),
+    "Telegram topic creation result is unknown",
+  );
 
   const attempt = async (
     result: TelegramTopicRecoveryResult,
@@ -276,14 +287,17 @@ export function createTelegramTopicRecoveryRuntime(
   ): Promise<void> => {
     const candidate = plan.candidate;
     try {
-      const topicExists = await options.probeForumTopic(result.recovery.oldDestination);
+      const topicExists = await runOwnedOperation(
+        (signal) => options.probeForumTopic(result.recovery.oldDestination, signal),
+        "Telegram topic probe timed out",
+      );
       if (disposed) return;
       if (topicExists) {
         fail(result);
         return;
       }
     } catch (error) {
-      if (disposed) return;
+      if (disposed || error === OPERATION_CANCELLED) return;
       handleFailure(result, error);
       return;
     }
@@ -300,7 +314,7 @@ export function createTelegramTopicRecoveryRuntime(
         return;
       }
     } catch (error) {
-      if (disposed || error === CREATION_CANCELLED) return;
+      if (disposed || error === OPERATION_CANCELLED) return;
       handleFailure(result, error);
       return;
     }
@@ -381,8 +395,8 @@ export function createTelegramTopicRecoveryRuntime(
       if (disposed) return;
       disposed = true;
       scheduled.clear();
-      for (const creation of [...activeCreations]) creation.cancel();
-      activeCreations.clear();
+      for (const operation of [...activeOperations]) operation.cancel();
+      activeOperations.clear();
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
     },

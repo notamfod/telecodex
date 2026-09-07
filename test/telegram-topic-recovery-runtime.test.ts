@@ -80,6 +80,41 @@ describe("TelegramTopicRecoveryRuntime", () => {
     expect(harness.outboxPump).not.toHaveBeenCalled();
   });
 
+  it("cancels a never-settling probe on dispose without leaking its deadline", async () => {
+    vi.useFakeTimers();
+    const harness = createHarness({ creationTimeoutMs: 10_000 });
+    let resolveProbe!: (exists: boolean) => void;
+    let probeSignal: AbortSignal | undefined;
+    harness.probeForumTopic.mockImplementationOnce((_destination, signal) => {
+      probeSignal = signal;
+      return new Promise((resolve) => {
+        resolveProbe = resolve;
+      });
+    });
+    const runtime = createTelegramTopicRecoveryRuntime(harness.options);
+
+    const recovery = runtime.recover(harness.action);
+    await vi.waitFor(() => expect(harness.probeForumTopic).toHaveBeenCalledOnce());
+    expect.soft(vi.getTimerCount()).toBe(1);
+
+    runtime.dispose();
+
+    expect.soft(probeSignal?.aborted).toBe(true);
+    expect.soft(vi.getTimerCount()).toBe(0);
+    resolveProbe(false);
+    await recovery;
+    await Promise.resolve();
+
+    expect.soft(harness.createForumTopic).not.toHaveBeenCalled();
+    expect.soft(harness.store.completeTopicRecovery).not.toHaveBeenCalled();
+    expect.soft(harness.store.markTopicRecoveryUnknown).not.toHaveBeenCalled();
+    expect.soft(harness.store.deferTopicRecovery).not.toHaveBeenCalled();
+    expect.soft(harness.store.failTopicRecovery).not.toHaveBeenCalled();
+    expect.soft(harness.rebindThreadTopic).not.toHaveBeenCalled();
+    expect.soft(harness.sendWelcome).not.toHaveBeenCalled();
+    expect(harness.outboxPump).not.toHaveBeenCalled();
+  });
+
   it("cancels an active creation on dispose without committing ambiguous effects", async () => {
     vi.useFakeTimers();
     const harness = createHarness({ creationTimeoutMs: 10_000 });
@@ -376,7 +411,10 @@ function createHarness(options: {
       return { job: structuredClone(job), recovery: structuredClone(recovery), anchor: deliveries[0]! };
     }),
   };
-  const probeForumTopic = vi.fn(async () => options.probeResult ?? false);
+  const probeForumTopic = vi.fn(async (
+    _destination: typeof OLD,
+    _signal: AbortSignal,
+  ) => options.probeResult ?? false);
   const createForumTopic = vi.fn(async () => {
     if (options.creationNeverSettles) return new Promise<never>(() => {});
     if (options.creationError) throw options.creationError;

@@ -46,6 +46,29 @@ describe("Telegram reliability runtime", () => {
     expect(() => boundedReliabilityProbeTimeoutMs(0)).toThrow("Invalid reliability probe timeout");
   });
 
+  it("runs optional topic recovery reconciliation inside startup reconciliation", async () => {
+    const harness = createHarness(store, directory);
+    const listRecoveries = vi.spyOn(store, "listTopicRecoveries");
+    runtime = createTelegramReliabilityRuntime({
+      ...harness.options,
+      topicRecovery: {
+        probeForumTopic: vi.fn(async () => false),
+        createForumTopic: vi.fn(async ({ chatId }) => ({ chatId, messageThreadId: 99 })),
+        getThread: vi.fn(() => null),
+        rebindThreadTopic: vi.fn(),
+        sendWelcome: vi.fn(async () => undefined),
+        scheduleWakeup: vi.fn(),
+        reportReason: vi.fn(),
+      },
+    });
+
+    await runtime.reconcile();
+
+    expect(listRecoveries).toHaveBeenCalledWith(["in_flight"]);
+    expect(listRecoveries).toHaveBeenCalledWith(["retry_wait"]);
+    expect(listRecoveries).toHaveBeenCalledWith(["complete"]);
+  });
+
   it("uses urgent physical status writes for explicit and Dashboard refreshes", async () => {
     const queued = await seedQueued(store, directory, source({ updateId: 90, messageId: 90 }));
     const harness = createHarness(store, directory);

@@ -40,6 +40,10 @@ import {
 import type { TelegramExactTurnReader } from "./telegram-exact-turn-inspector.js";
 import type { TelegramGuardianInspector } from "./telegram-guardian-reconciliation.js";
 import type { TelegramStatusAction } from "./telegram-status-projection.js";
+import {
+  createTelegramTopicRecoveryRuntime,
+  type TelegramTopicRecoveryRuntimeOptions,
+} from "./telegram-topic-recovery-runtime.js";
 import type { TelegramTurnResult } from "./telegram-turn-result.js";
 
 const DASHBOARD_JOB_LIMIT = 200;
@@ -119,6 +123,7 @@ export interface TelegramReliabilityRuntimeOptions {
   readonly prepareCompletion?: TelegramCompletionProcessor;
   readonly scheduleCoordinatorWakeup?: Wakeup;
   readonly scheduleDeliveryWakeup?: Wakeup;
+  readonly topicRecovery?: Omit<TelegramTopicRecoveryRuntimeOptions, "store" | "outboxPump">;
   readonly onRuntimeError?: (input: TelegramReliabilityRuntimeErrorContext) => void;
 }
 
@@ -238,6 +243,13 @@ export function createTelegramReliabilityRuntime(
       return { chatId: destination.chatId, messageThreadId: destination.messageThreadId };
     },
   });
+  const topicRecovery = options.topicRecovery
+    ? createTelegramTopicRecoveryRuntime({
+        ...options.topicRecovery,
+        store,
+        outboxPump: () => outbox.pump(),
+      })
+    : undefined;
   const session = trackedAdapter(createTelegramSessionCodexAdapter({
     store, registry: options.registry, materializationRoot: options.materializationRoot,
   }), turns);
@@ -536,6 +548,7 @@ export function createTelegramReliabilityRuntime(
       assertRunning(disposed);
       let result: Awaited<ReturnType<typeof runReconciliation>>;
       try {
+        await topicRecovery?.reconcile();
         await reconcileTargetProvisions();
         releasePersistedRetryParents();
         result = await runReconciliation();
@@ -717,6 +730,7 @@ export function createTelegramReliabilityRuntime(
     async dispose() {
       if (disposed) return;
       disposed = true;
+      topicRecovery?.dispose();
       coordinator.dispose();
       for (const timer of timers) clearTimeout(timer);
       timers.clear();

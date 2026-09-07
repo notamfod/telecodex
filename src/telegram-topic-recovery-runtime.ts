@@ -19,6 +19,7 @@ import type { TelegramWorkSource } from "./telegram-job-ingress.js";
 
 const DEFAULT_CREATION_TIMEOUT_MS = 30_000;
 const MAX_CREATION_TIMEOUT_MS = 300_000;
+const CREATION_CANCELLED = Symbol("telegram-topic-recovery-creation-cancelled");
 
 type TopicRecoveryStore = Pick<
   SqliteTelegramJobStore,
@@ -96,6 +97,7 @@ export function createTelegramTopicRecoveryRuntime(
   const effects = new Map<string, Promise<void>>();
   const scheduled = new Map<string, number>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
+  const activeCreations = new Set<{ cancel: () => void }>();
   let disposed = false;
 
   const report = (jobId: string, reasonCode: TelegramTopicRecoveryRuntimeReasonCode): void => {
@@ -223,38 +225,82 @@ export function createTelegramTopicRecoveryRuntime(
     else markUnknown(result);
   };
 
+  const createTopic = (
+    chatId: number,
+    topicName: string,
+  ): Promise<TelegramTopicDestination> => {
+    const controller = new AbortController();
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timeout!: ReturnType<typeof setTimeout>;
+      const cleanup = (): void => {
+        clearTimeout(timeout);
+        timers.delete(timeout);
+        activeCreations.delete(activeCreation);
+      };
+      const finish = (): boolean => {
+        if (settled) return false;
+        settled = true;
+        cleanup();
+        return true;
+      };
+      const activeCreation = {
+        cancel: () => {
+          controller.abort();
+          if (finish()) reject(CREATION_CANCELLED);
+        },
+      };
+      timeout = setTimeout(() => {
+        controller.abort();
+        if (finish()) reject(new Error("Telegram topic creation result is unknown"));
+      }, creationTimeoutMs);
+      timers.add(timeout);
+      activeCreations.add(activeCreation);
+      let operation: Promise<TelegramTopicDestination>;
+      try {
+        operation = options.createForumTopic({ chatId, topicName, signal: controller.signal });
+      } catch (error) {
+        if (finish()) reject(error);
+        return;
+      }
+      void operation.then(
+        (destination) => { if (finish()) resolve(destination); },
+        (error) => { if (finish()) reject(error); },
+      );
+    });
+  };
+
   const attempt = async (
     result: TelegramTopicRecoveryResult,
     plan: TelegramTopicRecoveryPlan,
   ): Promise<void> => {
     const candidate = plan.candidate;
     try {
-      if (await options.probeForumTopic(result.recovery.oldDestination)) {
+      const topicExists = await options.probeForumTopic(result.recovery.oldDestination);
+      if (disposed) return;
+      if (topicExists) {
         fail(result);
         return;
       }
     } catch (error) {
+      if (disposed) return;
       handleFailure(result, error);
       return;
     }
 
-    const controller = new AbortController();
     let target: TelegramTopicDestination;
     try {
-      target = await withCreationTimeout(
-        options.createForumTopic({
-          chatId: result.recovery.oldDestination.chatId,
-          topicName: candidate.topicName,
-          signal: controller.signal,
-        }),
-        creationTimeoutMs,
-        controller,
+      target = await createTopic(
+        result.recovery.oldDestination.chatId,
+        candidate.topicName,
       );
+      if (disposed) return;
       if (!validTarget(target, result.recovery.oldDestination)) {
         markUnknown(result);
         return;
       }
     } catch (error) {
+      if (disposed || error === CREATION_CANCELLED) return;
       handleFailure(result, error);
       return;
     }
@@ -335,6 +381,8 @@ export function createTelegramTopicRecoveryRuntime(
       if (disposed) return;
       disposed = true;
       scheduled.clear();
+      for (const creation of [...activeCreations]) creation.cancel();
+      activeCreations.clear();
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
     },
@@ -429,23 +477,6 @@ function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
-}
-
-function withCreationTimeout<T>(
-  operation: Promise<T>,
-  timeoutMs: number,
-  controller: AbortController,
-): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      controller.abort();
-      reject(new Error("Telegram topic creation result is unknown"));
-    }, timeoutMs);
-    void operation.then(
-      (value) => { clearTimeout(timeout); resolve(value); },
-      (error) => { clearTimeout(timeout); reject(error); },
-    );
-  });
 }
 
 function assertRunning(disposed: boolean): void {

@@ -80,6 +80,47 @@ describe("TelegramTopicRecoveryRuntime", () => {
     expect(harness.outboxPump).not.toHaveBeenCalled();
   });
 
+  it("cancels an active creation on dispose without committing ambiguous effects", async () => {
+    vi.useFakeTimers();
+    const harness = createHarness({ creationTimeoutMs: 10_000 });
+    let resolveCreation!: (destination: typeof NEW) => void;
+    let creationSignal!: AbortSignal;
+    harness.createForumTopic.mockImplementationOnce(({ signal }) => {
+      creationSignal = signal;
+      return new Promise((resolve) => {
+        resolveCreation = resolve;
+      });
+    });
+    const runtime = createTelegramTopicRecoveryRuntime(harness.options);
+
+    const recovery = runtime.recover(harness.action);
+    await vi.waitFor(() => expect(harness.createForumTopic).toHaveBeenCalledOnce());
+    expect(vi.getTimerCount()).toBe(1);
+
+    runtime.dispose();
+
+    expect.soft(creationSignal.aborted).toBe(true);
+    expect.soft(vi.getTimerCount()).toBe(0);
+    resolveCreation(NEW);
+    await recovery;
+    await Promise.resolve();
+
+    expect.soft(harness.store.completeTopicRecovery).not.toHaveBeenCalled();
+    expect.soft(harness.store.markTopicRecoveryUnknown).not.toHaveBeenCalled();
+    expect.soft(harness.store.deferTopicRecovery).not.toHaveBeenCalled();
+    expect.soft(harness.store.failTopicRecovery).not.toHaveBeenCalled();
+    expect.soft(harness.rebindThreadTopic).not.toHaveBeenCalled();
+    expect.soft(harness.sendWelcome).not.toHaveBeenCalled();
+    expect.soft(harness.outboxPump).not.toHaveBeenCalled();
+    expect(harness.store.getTopicRecovery(harness.action.jobId)?.state).toBe("in_flight");
+
+    const restarted = createTelegramTopicRecoveryRuntime(harness.options);
+    await restarted.reconcile();
+    expect(harness.store.markTopicRecoveryUnknown).toHaveBeenCalledOnce();
+    restarted.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("fails closed on a definitive permanent creation error", async () => {
     const harness = createHarness({ creationError: { error_code: 400 } });
     const runtime = createTelegramTopicRecoveryRuntime(harness.options);

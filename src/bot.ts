@@ -76,7 +76,6 @@ import {
   renderProjectHTML,
   renderProjectsHTML,
   sessionButtons,
-  probeForumTopic,
   topicUrl,
   type ProjectGroup,
 } from "./projects.js";
@@ -90,6 +89,7 @@ import {
 } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, splitTelegramMarkdown } from "./format.js";
+import { createForumTopicLivenessProbe } from "./telegram-topic-liveness.js";
 import { registerGuardianCallbacks } from "./guardian-bot-adapter.js";
 import { JiraClient } from "./jira-client.js";
 import {
@@ -3193,11 +3193,12 @@ export function createBot(
   };
 
   /** Telegram sends no update when a forum topic is deleted. */
+  const probeTopicLiveness = createForumTopicLivenessProbe({
+    sendChatAction: (chatId, action, requestOptions, signal) =>
+      bot.api.sendChatAction(chatId, action, requestOptions, signal as never),
+  });
   const topicIsAlive = (chatId: number, messageThreadId: number): Promise<boolean> =>
-    probeForumTopic(messageThreadId, {
-      reopen: (threadId) => bot.api.reopenForumTopic(chatId, threadId),
-      close: (threadId) => bot.api.closeForumTopic(chatId, threadId),
-    });
+    probeTopicLiveness({ chatId, messageThreadId });
 
   if (config.miniApp && config.jiraPanel && jiraPanelClient) {
     const panelConfig = config.jiraPanel;

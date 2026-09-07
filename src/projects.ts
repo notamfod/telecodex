@@ -109,34 +109,6 @@ export async function findLiveBoundTopic(
   return undefined;
 }
 
-export function isMissingForumTopicError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /message thread not found|TOPIC_ID_INVALID|TOPIC_DELETED/i.test(message);
-}
-
-export async function probeForumTopic(
-  messageThreadId: number,
-  options: {
-    reopen(messageThreadId: number): Promise<unknown>;
-    close(messageThreadId: number): Promise<unknown>;
-  },
-): Promise<boolean> {
-  try {
-    await options.reopen(messageThreadId);
-  } catch (error) {
-    if (isMissingForumTopicError(error)) return false;
-    if (isTopicNotModifiedError(error)) return true;
-    throw error;
-  }
-
-  try {
-    await options.close(messageThreadId);
-  } catch (error) {
-    if (!isTopicNotModifiedError(error)) throw error;
-  }
-  return true;
-}
-
 export async function partitionJobsByTopicLiveness<
   T extends { chatId: number; messageThreadId?: number },
 >(
@@ -160,11 +132,6 @@ export async function partitionJobsByTopicLiveness<
   }
 
   return { retained, dead };
-}
-
-function isTopicNotModifiedError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /TOPIC_NOT_MODIFIED|topic is already (?:open|closed)/i.test(message);
 }
 
 export interface EnsureThreadTopicOptions {

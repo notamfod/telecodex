@@ -44,12 +44,14 @@ describe("Telegram topic recovery adapter", () => {
     await adapter.sendWelcome(destination, "A <safe> topic", signal);
     adapter.rebindThreadTopic("old-context", "new-context", thread);
 
-    expect(harness.api.reopenForumTopic).toHaveBeenCalledWith(
-      destination.chatId, destination.messageThreadId, signal,
+    expect(harness.api.sendChatAction).toHaveBeenCalledWith(
+      destination.chatId,
+      "typing",
+      { message_thread_id: destination.messageThreadId },
+      expect.any(AbortSignal),
     );
-    expect(harness.api.closeForumTopic).toHaveBeenCalledWith(
-      destination.chatId, destination.messageThreadId, signal,
-    );
+    expect(harness.api).not.toHaveProperty("reopenForumTopic");
+    expect(harness.api).not.toHaveProperty("closeForumTopic");
     expect(harness.api.createForumTopic).toHaveBeenCalledWith(
       destination.chatId, "Replacement", {}, signal,
     );
@@ -68,8 +70,7 @@ describe("Telegram topic recovery adapter", () => {
 
   function createHarness() {
     const api = {
-      reopenForumTopic: vi.fn(async () => true),
-      closeForumTopic: vi.fn(async () => true),
+      sendChatAction: vi.fn(async () => true),
       createForumTopic: vi.fn(async () => ({ message_thread_id: 99 })),
       sendMessage: vi.fn(async () => ({ message_id: 1 })),
     };

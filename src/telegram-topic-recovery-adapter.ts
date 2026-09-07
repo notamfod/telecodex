@@ -2,8 +2,8 @@ import type { Api } from "grammy";
 
 import { getThread as readThread, type CodexThreadRecord } from "./codex-state.js";
 import { escapeHTML } from "./format.js";
-import { probeForumTopic } from "./projects.js";
 import type { SessionRegistry } from "./session-registry.js";
+import { createForumTopicLivenessProbe } from "./telegram-topic-liveness.js";
 import type {
   TelegramTopicRecoveryRuntimeOptions,
   TelegramTopicRecoveryRuntimeReasonCode,
@@ -11,7 +11,7 @@ import type {
 
 type RecoveryApi = Pick<
   Api,
-  "reopenForumTopic" | "closeForumTopic" | "createForumTopic" | "sendMessage"
+  "sendChatAction" | "createForumTopic" | "sendMessage"
 >;
 
 type RecoveryRegistry = Pick<SessionRegistry, "listContexts" | "rebindThreadTopic">;
@@ -39,16 +39,17 @@ export function createTelegramTopicRecoveryAdapter(
 ): TelegramTopicRecoveryAdapter | undefined {
   if (!options.enabled) return undefined;
   const getThread = options.getThread ?? readThread;
+  const probeForumTopic = createForumTopicLivenessProbe({
+    sendChatAction: (chatId, action, requestOptions, signal) =>
+      options.api.sendChatAction(chatId, action, requestOptions, signal as never),
+  });
   return {
     forumChatId: options.forumChatId ?? 0,
     hasThreadTopicBinding: (threadId, destination) => options.registry.listContexts().some(
       (context) => context.contextKey === `${destination.chatId}:${destination.messageThreadId}`
         && context.threadId === threadId,
     ),
-    probeForumTopic: ({ chatId, messageThreadId }, signal) => probeForumTopic(messageThreadId, {
-      reopen: (threadId) => options.api.reopenForumTopic(chatId, threadId, signal as never),
-      close: (threadId) => options.api.closeForumTopic(chatId, threadId, signal as never),
-    }),
+    probeForumTopic: (destination, signal) => probeForumTopic(destination, signal),
     createForumTopic: async ({ chatId, topicName, signal }) => {
       const topic = await options.api.createForumTopic(chatId, topicName, {}, signal as never);
       return { chatId, messageThreadId: topic.message_thread_id };

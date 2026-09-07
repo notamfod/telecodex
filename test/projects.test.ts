@@ -5,9 +5,7 @@ import type { ContextMetadata } from "../src/session-registry.js";
 import {
   findBoundTopic,
   findLiveBoundTopic,
-  isMissingForumTopicError,
   partitionJobsByTopicLiveness,
-  probeForumTopic,
   ensureThreadTopic,
   groupThreadsByProject,
   projectButtons,
@@ -223,51 +221,6 @@ describe("findLiveBoundTopic", () => {
 
     expect(await findLiveBoundTopic(contexts, chatId, threadId, topicIsAlive)).toBe(14);
     expect(topicIsAlive.mock.calls.map(([messageThreadId]) => messageThreadId)).toEqual([13, 14]);
-  });
-});
-
-describe("isMissingForumTopicError", () => {
-  it.each([
-    "Bad Request: TOPIC_ID_INVALID",
-    "Bad Request: TOPIC_DELETED",
-    "Bad Request: message thread not found",
-  ])("recognises %s", (message) => {
-    expect(isMissingForumTopicError(new Error(message))).toBe(true);
-  });
-});
-
-describe("probeForumTopic", () => {
-  it("restores a closed topic after probing it", async () => {
-    const close = vi.fn().mockResolvedValue(undefined);
-
-    await expect(probeForumTopic(14, {
-      reopen: vi.fn().mockResolvedValue(undefined),
-      close,
-    })).resolves.toBe(true);
-
-    expect(close).toHaveBeenCalledWith(14);
-  });
-
-  it("leaves an already open topic open", async () => {
-    const close = vi.fn();
-
-    await expect(probeForumTopic(14, {
-      reopen: vi.fn().mockRejectedValue(new Error("Bad Request: TOPIC_NOT_MODIFIED")),
-      close,
-    })).resolves.toBe(true);
-
-    expect(close).not.toHaveBeenCalled();
-  });
-
-  it("reports a deleted topic without trying to close it", async () => {
-    const close = vi.fn();
-
-    await expect(probeForumTopic(14, {
-      reopen: vi.fn().mockRejectedValue(new Error("Bad Request: TOPIC_DELETED")),
-      close,
-    })).resolves.toBe(false);
-
-    expect(close).not.toHaveBeenCalled();
   });
 });
 

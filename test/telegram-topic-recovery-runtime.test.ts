@@ -142,6 +142,20 @@ describe("TelegramTopicRecoveryRuntime", () => {
     }));
     expect(harness.outboxPump).toHaveBeenCalledOnce();
   });
+
+  it("binds the preflight thread descriptor even if the live index changes after creation", async () => {
+    const harness = createHarness({ threadDisappearsAfterPlanning: true });
+    const runtime = createTelegramTopicRecoveryRuntime(harness.options);
+
+    await runtime.recover(harness.action);
+
+    expect(harness.rebindThreadTopic).toHaveBeenCalledWith(
+      `${OLD.chatId}:${OLD.messageThreadId}`,
+      `${NEW.chatId}:${NEW.messageThreadId}`,
+      harness.thread,
+    );
+    expect(harness.outboxPump).toHaveBeenCalledOnce();
+  });
 });
 
 function createHarness(options: {
@@ -152,6 +166,7 @@ function createHarness(options: {
   initialRecoveryState?: TelegramTopicRecoveryState;
   retryAt?: number;
   welcomeError?: Error;
+  threadDisappearsAfterPlanning?: boolean;
 } = {}) {
   const thread: CodexThreadRecord = {
     id: "thread-1",
@@ -278,12 +293,15 @@ function createHarness(options: {
   });
   const outboxPump = vi.fn(async () => undefined);
   const reportReason = vi.fn();
+  const getThread = options.threadDisappearsAfterPlanning
+    ? vi.fn().mockReturnValueOnce(structuredClone(thread)).mockReturnValue(null)
+    : vi.fn(() => structuredClone(thread));
   const scheduled: Array<{ at: number; wake: () => Promise<void> }> = [];
   const runtimeOptions = {
     store,
     probeForumTopic,
     createForumTopic,
-    getThread: vi.fn(() => structuredClone(thread)),
+    getThread,
     rebindThreadTopic,
     sendWelcome,
     outboxPump,

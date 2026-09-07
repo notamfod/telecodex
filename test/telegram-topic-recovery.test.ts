@@ -116,7 +116,7 @@ describe("Telegram topic recovery", () => {
 
   test("uses the durable target context when the historical source points to a control topic", () => {
     const input = fixture();
-    input.source = source({ chatId: -2001, messageThreadId: 3, targetContext: OLD });
+    input.source = source({ messageThreadId: 3, targetContext: OLD });
 
     expect(planTelegramTopicRecovery(input)?.oldDestination).toEqual(OLD);
   });
@@ -127,6 +127,9 @@ describe("Telegram topic recovery", () => {
     ["mismatched thread", (value: ReturnType<typeof fixture>) => { value.thread = thread({ id: "other" }); }],
     ["absent response plan", (value: ReturnType<typeof fixture>) => { value.job = job({ responsePlan: undefined }); }],
     ["target provisioning", (value: ReturnType<typeof fixture>) => { value.source = source({ targetProvision: { kind: "forum_topic", topicName: "new", state: "planned" } }); }],
+    ["source bot mismatch", (value: ReturnType<typeof fixture>) => { value.source = source({ botId: "other" }); }],
+    ["source identity mismatch", (value: ReturnType<typeof fixture>) => { value.source = source({ updateId: 2 }); }],
+    ["cross-chat target context", (value: ReturnType<typeof fixture>) => { value.source = source({ chatId: -2001, targetContext: OLD }); }],
     ["non-pending response", (value: ReturnType<typeof fixture>) => { value.deliveries[1] = { ...value.deliveries[1], state: "sending" }; }],
     ["delivered response", (value: ReturnType<typeof fixture>) => { value.deliveries[1] = { ...value.deliveries[1], state: "delivered", telegramMessageId: 4 }; }],
     ["uncertain response", (value: ReturnType<typeof fixture>) => { value.deliveries[1] = { ...value.deliveries[1], state: "uncertain" }; }],
@@ -134,6 +137,8 @@ describe("Telegram topic recovery", () => {
     ["extra response", (value: ReturnType<typeof fixture>) => { value.deliveries.push(row("notice:0003", 3, "notice", "pending", { operation: "send_text", ...OLD, text: "extra" })); }],
     ["duplicate response", (value: ReturnType<typeof fixture>) => { value.deliveries.push({ ...value.deliveries[1] }); }],
     ["non-failed anchor", (value: ReturnType<typeof fixture>) => { value.deliveries[0] = { ...value.deliveries[0], state: "pending" }; }],
+    ["bad anchor kind", (value: ReturnType<typeof fixture>) => { value.deliveries[0] = { ...value.deliveries[0], kind: "final" }; }],
+    ["anchor job mismatch", (value: ReturnType<typeof fixture>) => { value.deliveries[0] = { ...value.deliveries[0], jobId: "other" }; }],
     ["edit anchor", (value: ReturnType<typeof fixture>) => { const payload = { operation: "edit_text" as const, chatId: OLD.chatId, messageId: 4, text: "x" }; value.deliveries[0] = row("status-anchor", 0, "status-anchor", "failed", payload); value.anchorPlan = { payload, contentHash: hashTelegramDeliveryPayload(payload) }; }],
     ["known anchor message", (value: ReturnType<typeof fixture>) => { value.deliveries[0] = { ...value.deliveries[0], telegramMessageId: 4 }; }],
     ["missing anchor plan", (value: ReturnType<typeof fixture>) => { value.anchorPlan = null as unknown as ReturnType<typeof fixture>["anchorPlan"]; }],
@@ -144,6 +149,9 @@ describe("Telegram topic recovery", () => {
     ["malformed hash", (value: ReturnType<typeof fixture>) => { value.deliveries[1] = { ...value.deliveries[1], contentHash: "0".repeat(64) }; }],
     ["malformed payload", (value: ReturnType<typeof fixture>) => { value.deliveries[1] = { ...value.deliveries[1], payload: {}, contentHash: "0".repeat(64) }; }],
     ["noncanonical pending row", (value: ReturnType<typeof fixture>) => { value.deliveries[3] = { ...value.deliveries[3], attemptCount: 1 }; }],
+    ["negative anchor updated time", (value: ReturnType<typeof fixture>) => { value.deliveries[0] = { ...value.deliveries[0], updatedAt: -1 }; }],
+    ["negative follower updated time", (value: ReturnType<typeof fixture>) => { value.deliveries[1] = { ...value.deliveries[1], updatedAt: -1 }; }],
+    ["reordered job projection", (value: ReturnType<typeof fixture>) => { value.job = job({ deliveries: [...value.job.deliveries].reverse() }); }],
   ])("rejects %s", (_name, mutate) => {
     const input = fixture();
     mutate(input);
@@ -151,24 +159,56 @@ describe("Telegram topic recovery", () => {
   });
 
   test.each([
-    [{ operation: "send_text", ...OLD, text: "text" }],
-    [{ operation: "send_media", ...OLD, mediaKind: "image", path: "outputs/chart.png", caption: "chart" }],
-    [{ operation: "send_rich", ...OLD, markdown: "# rich", media: [], fallbackParts: [{ partKey: "final:0000:fallback:0000", kind: "final", payload: { operation: "send_text", ...OLD, text: "fallback" } }] }],
-  ] as const)("rebinds %s payloads without mutation", (payload) => {
+    [
+      { operation: "send_text", ...OLD, text: "text", replyMarkup: { inlineKeyboard: [[{ text: "Retry", callbackData: "retry" }]] } },
+      { operation: "send_text", ...NEW, text: "text", replyMarkup: { inlineKeyboard: [[{ text: "Retry", callbackData: "retry" }]] } },
+    ],
+    [
+      { operation: "send_media", ...OLD, mediaKind: "image", path: "outputs/chart.png", caption: "chart" },
+      { operation: "send_media", ...NEW, mediaKind: "image", path: "outputs/chart.png", caption: "chart" },
+    ],
+    [
+      { operation: "send_rich", ...OLD, markdown: "# rich", media: [{ id: "generated_0001", path: "outputs/chart.png" }], fallbackParts: [{ partKey: "final:0000:fallback:0000", kind: "final", payload: { operation: "send_text", ...OLD, text: "fallback" } }] },
+      { operation: "send_rich", ...NEW, markdown: "# rich", media: [{ id: "generated_0001", path: "outputs/chart.png" }], fallbackParts: [{ partKey: "final:0000:fallback:0000", kind: "final", payload: { operation: "send_text", ...NEW, text: "fallback" } }] },
+    ],
+  ] as const)("rebinds payloads exactly without mutation", (payload, expected) => {
     const before = structuredClone(payload);
     const rebound = rebindTelegramTopicPayload(payload, OLD, NEW);
-    expect(rebound.payload).toMatchObject(NEW);
+    expect(rebound.payload).toEqual(expected);
     expect(rebound.contentHash).toBe(hashTelegramDeliveryPayload(rebound.payload));
     expect(payload).toEqual(before);
     expect(isDeepStrictEqual(payload, before)).toBe(true);
   });
 
-  test("rewrites every rich fallback and rejects invalid direct arguments", () => {
-    const payload = fixture().deliveries[1].payload as TelegramDeliveryPayload;
+  test("rewrites every rich fallback and rejects edit payloads", () => {
+    const payload: TelegramDeliveryPayload = {
+      operation: "send_rich", ...OLD, markdown: "# Result", media: [], fallbackParts: [
+        { partKey: "final:0000:fallback:0000", kind: "final", payload: { operation: "send_text", ...OLD, text: "first" } },
+        { partKey: "final:0000:fallback:0001", kind: "final", payload: { operation: "send_text", ...OLD, text: "second" } },
+      ],
+    };
     const rebound = rebindTelegramTopicPayload(payload, OLD, NEW);
-    expect(rebound.payload).toMatchObject({ ...NEW, fallbackParts: [{ payload: NEW }] });
+    expect(rebound.payload).toEqual({
+      operation: "send_rich", ...NEW, markdown: "# Result", media: [], fallbackParts: [
+        { partKey: "final:0000:fallback:0000", kind: "final", payload: { operation: "send_text", ...NEW, text: "first" } },
+        { partKey: "final:0000:fallback:0001", kind: "final", payload: { operation: "send_text", ...NEW, text: "second" } },
+      ],
+    });
     expect(() => rebindTelegramTopicPayload({ operation: "edit_text", chatId: -1001, messageId: 1, text: "edit" }, OLD, NEW))
       .toThrow("Invalid Telegram topic recovery payload");
+    expect(() => rebindTelegramTopicPayload({
+      operation: "edit_rich", chatId: -1001, messageId: 1, markdown: "# edit", media: [],
+      fallbackParts: [{ partKey: "final:0000:fallback:0000", kind: "final", payload: { operation: "edit_text", chatId: -1001, messageId: 1, text: "edit" } }],
+    }, OLD, NEW)).toThrow("Invalid Telegram topic recovery payload");
     expect(() => rebindTelegramTopicPayload(payload, NEW, OLD)).toThrow("Invalid Telegram topic recovery payload");
+  });
+
+  test("rejects plans beyond the runtime response-part limit", () => {
+    const input = fixture();
+    const responsePlan = Array.from({ length: 513 }, (_, index) => ({ partId: `final:${String(index).padStart(4, "0")}`, kind: "final" as const }));
+    input.job = job({ responsePlan, deliveries: responsePlan.map((part) => ({ partId: part.partId, state: "pending", attempts: 0, messageId: null, deliveredAt: null })) });
+    input.deliveries = [input.deliveries[0], ...responsePlan.map((part, index) => row(part.partId, index, "final", "pending", { operation: "send_text", ...OLD, text: part.partId }))];
+
+    expect(planTelegramTopicRecovery(input)).toBeNull();
   });
 });

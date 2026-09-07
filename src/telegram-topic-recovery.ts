@@ -2,7 +2,9 @@ import { isDeepStrictEqual } from "node:util";
 
 import type { CodexThreadRecord } from "./codex-state.js";
 import type { TelegramWorkSource } from "./telegram-job-ingress.js";
+import { validateDelivery } from "./telegram-delivery-ledger.js";
 import type { DeliveryPart, TelegramJob } from "./telegram-job-store.js";
+import { isTelegramDeliveryProjectionValid } from "./telegram-job-runtime.js";
 import {
   hashTelegramDeliveryPayload,
   normalizeTelegramDeliveryPayload,
@@ -45,8 +47,10 @@ export function planTelegramTopicRecovery(
 ): TelegramTopicRecoveryCandidate | null {
   try {
     const { job, source, deliveries, anchorPlan, thread } = input;
-    if (job.phase !== "delivering" || !validThread(job.threadId, thread) || job.responsePlan === undefined
-      || Object.hasOwn(source, "targetProvision")) return null;
+    if (job.phase !== "delivering" || !sameSource(source, job) || !sameChatTargetContext(source)
+      || !validThread(job.threadId, thread) || job.responsePlan === undefined || Object.hasOwn(source, "targetProvision")) {
+      return null;
+    }
     const oldDestination = destination(source.targetContext ?? source);
     if (!oldDestination || !validResponsePlan(job) || !validJobProjection(job)) return null;
     if (!anchorPlan || !canonicalPayload(anchorPlan.payload, anchorPlan.contentHash)) return null;
@@ -106,7 +110,7 @@ function validAnchor(
   destination: TelegramTopicDestination,
 ): row is DeliveryPart {
   return row !== undefined
-    && row.jobId.length > 0
+    && validDeliveryRow(row)
     && row.kind === "status-anchor"
     && row.ordinal === 0
     && row.state === "failed"
@@ -128,6 +132,7 @@ function validPendingPart(
   ordinal: number,
 ): boolean {
   return row.jobId === jobId
+    && validDeliveryRow(row)
     && row.partKey === partKey
     && row.kind === kind
     && row.ordinal === ordinal
@@ -140,15 +145,10 @@ function validPendingPart(
 }
 
 function validJobProjection(job: TelegramJob): boolean {
-  if (!job.responsePlan || job.deliveries.length !== job.responsePlan.length) return false;
-  return job.responsePlan.every((part) => {
-    const matches = job.deliveries.filter((delivery) => delivery.partId === part.partId);
-    return matches.length === 1
-      && matches[0].state === "pending"
-      && matches[0].attempts === 0
-      && matches[0].messageId === null
-      && matches[0].deliveredAt === null;
-  });
+  return job.responsePlan !== undefined
+    && isTelegramDeliveryProjectionValid(job.responsePlan, job.deliveries)
+    && job.deliveries.every((delivery) => delivery.state === "pending"
+      && delivery.attempts === 0 && delivery.messageId === null && delivery.deliveredAt === null);
 }
 
 function validResponsePlan(job: TelegramJob): boolean {
@@ -166,6 +166,25 @@ function validResponsePlan(job: TelegramJob): boolean {
 
 function validThread(threadId: unknown, thread: CodexThreadRecord | null): thread is CodexThreadRecord {
   return thread !== null && typeof threadId === "string" && threadId.length > 0 && thread.id === threadId;
+}
+
+function sameSource(source: TelegramWorkSource, job: TelegramJob): boolean {
+  return typeof source.botId === "string" && source.botId.length > 0
+    && Number.isSafeInteger(source.updateId) && source.updateId >= 0
+    && source.botId === job.source.botId && source.updateId === job.source.updateId;
+}
+
+function sameChatTargetContext(source: TelegramWorkSource): boolean {
+  return source.targetContext === undefined || source.targetContext.chatId === source.chatId;
+}
+
+function validDeliveryRow(row: DeliveryPart): boolean {
+  try {
+    validateDelivery(row);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function destination(value: unknown): TelegramTopicDestination | null {

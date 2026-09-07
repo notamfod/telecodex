@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { findLaunchProfile } from "./codex-launch.js";
@@ -167,20 +168,34 @@ export class SessionRegistry {
   }
 
   bindThread(contextKey: TelegramContextKey, thread: CodexThreadRecord): void {
-    this.metadata.set(contextKey, {
-      contextKey,
-      threadId: thread.id,
-      workspace: thread.cwd,
-      model: thread.model ?? undefined,
-      modelProvider: thread.modelProvider ?? "openai",
-      modelChoiceId: this.config.modelChoices.find(
-        (choice) =>
-          choice.model === thread.model && choice.provider === (thread.modelProvider ?? "openai"),
-      )?.id,
-      launchProfileId: this.config.defaultLaunchProfileId,
-      updatedAt: thread.updatedAt.getTime(),
-    });
+    this.metadata.set(contextKey, this.threadMetadata(contextKey, thread));
     this.persistMetadata();
+  }
+
+  rebindThreadTopic(
+    oldContextKey: TelegramContextKey,
+    newContextKey: TelegramContextKey,
+    thread: CodexThreadRecord,
+  ): void {
+    if (oldContextKey === newContextKey) {
+      throw new Error("Telegram topic rebind requires a new context");
+    }
+    const previous = new Map(this.metadata);
+    this.metadata.delete(oldContextKey);
+    this.metadata.set(newContextKey, this.threadMetadata(newContextKey, thread));
+    try {
+      this.persistMetadataReplaceSafe();
+    } catch {
+      this.metadata.clear();
+      for (const [contextKey, metadata] of previous) this.metadata.set(contextKey, metadata);
+      throw new Error("Failed to persist rebound context metadata");
+    }
+
+    const oldSession = this.sessions.get(oldContextKey);
+    oldSession?.dispose();
+    this.sessions.delete(oldContextKey);
+    this.sessionCreations.delete(oldContextKey);
+    this.onRemoveCallback?.(oldContextKey);
   }
 
   onRemove(callback: (contextKey: TelegramContextKey) => void): void {
@@ -221,6 +236,33 @@ export class SessionRegistry {
         error instanceof Error ? error.message : String(error),
       );
     }
+  }
+
+  private persistMetadataReplaceSafe(): void {
+    const dir = path.dirname(this.persistPath);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const temporaryPath = `${this.persistPath}.tmp-${process.pid}-${randomUUID()}`;
+    writeFileSync(temporaryPath, JSON.stringify([...this.metadata.values()], null, 2), "utf8");
+    renameSync(temporaryPath, this.persistPath);
+  }
+
+  private threadMetadata(
+    contextKey: TelegramContextKey,
+    thread: CodexThreadRecord,
+  ): ContextMetadata {
+    return {
+      contextKey,
+      threadId: thread.id,
+      workspace: thread.cwd,
+      model: thread.model ?? undefined,
+      modelProvider: thread.modelProvider ?? "openai",
+      modelChoiceId: this.config.modelChoices.find(
+        (choice) =>
+          choice.model === thread.model && choice.provider === (thread.modelProvider ?? "openai"),
+      )?.id,
+      launchProfileId: this.config.defaultLaunchProfileId,
+      updatedAt: thread.updatedAt.getTime(),
+    };
   }
 
   private loadPersistedMetadata(): void {

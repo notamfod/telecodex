@@ -9,13 +9,27 @@ import type { CodexThreadRecord } from "../src/codex-state.js";
 const mockFsState = vi.hoisted(() => {
   const files = new Map<string, string>();
   const directories = new Set<string>();
+  let renameFailure: Error | null = null;
 
   return {
     files,
     directories,
+    failNextRename: (error: Error) => { renameFailure = error; },
+    rename: (source: string, destination: string) => {
+      if (renameFailure) {
+        const error = renameFailure;
+        renameFailure = null;
+        throw error;
+      }
+      const content = files.get(source);
+      if (content === undefined) throw new Error(`ENOENT: ${source}`);
+      files.set(destination, content);
+      files.delete(source);
+    },
     reset: () => {
       files.clear();
       directories.clear();
+      renameFailure = null;
     },
   };
 });
@@ -79,6 +93,9 @@ vi.mock("node:fs", () => ({
       throw new Error(`ENOENT: ${targetPath}`);
     }
     return content;
+  }),
+  renameSync: vi.fn((source: string, destination: string) => {
+    mockFsState.rename(source, destination);
   }),
   writeFileSync: vi.fn((targetPath: string, content: string) => {
     mockFsState.files.set(targetPath, content);
@@ -315,6 +332,70 @@ describe("SessionRegistry", () => {
 
     const restored = new SessionRegistry(config);
     expect(restored.isThreadBoundInChat("thread-visible", -100123)).toBe(true);
+  });
+
+  it("atomically rebinds a thread and removes the stale active context", async () => {
+    const config = createConfig();
+    const registry = new SessionRegistry(config);
+    const thread: CodexThreadRecord = {
+      id: "thread-visible",
+      title: "Visible chat",
+      cwd: "/workspace/project",
+      model: "gpt-5.6-sol",
+      modelProvider: "openai",
+      createdAt: new Date(10_000),
+      updatedAt: new Date(20_000),
+      firstUserMessage: "Visible chat",
+    };
+    registry.bindThread("-100123:41", thread);
+    const oldSession = await registry.getOrCreate("-100123:41");
+    const removed: string[] = [];
+    registry.onRemove((contextKey) => removed.push(contextKey));
+
+    registry.rebindThreadTopic("-100123:41", "-100123:99", thread);
+
+    expect(registry.listContexts()).toEqual([
+      expect.objectContaining({ contextKey: "-100123:99", threadId: thread.id }),
+    ]);
+    expect(registry.has("-100123:41")).toBe(false);
+    expect(oldSession.dispose).toHaveBeenCalledOnce();
+    expect(removed).toEqual(["-100123:41"]);
+    const persistPath = path.join(config.workspace, ".telecodex", "contexts.json");
+    expect(JSON.parse(mockFsState.files.get(persistPath)!)).toEqual([
+      expect.objectContaining({ contextKey: "-100123:99", threadId: thread.id }),
+    ]);
+    expect([...mockFsState.files.keys()].filter((file) => file.startsWith(`${persistPath}.tmp-`)))
+      .toEqual([]);
+  });
+
+  it("restores the old binding and readable file when atomic replacement fails", async () => {
+    const config = createConfig();
+    const registry = new SessionRegistry(config);
+    const thread: CodexThreadRecord = {
+      id: "thread-visible",
+      title: "Visible chat",
+      cwd: "/workspace/project",
+      model: null,
+      modelProvider: null,
+      createdAt: new Date(10_000),
+      updatedAt: new Date(20_000),
+      firstUserMessage: "Visible chat",
+    };
+    registry.bindThread("-100123:41", thread);
+    const oldSession = await registry.getOrCreate("-100123:41");
+    const persistPath = path.join(config.workspace, ".telecodex", "contexts.json");
+    const prior = mockFsState.files.get(persistPath);
+    mockFsState.failNextRename(new Error("replacement failed"));
+
+    expect(() => registry.rebindThreadTopic("-100123:41", "-100123:99", thread))
+      .toThrow("Failed to persist rebound context metadata");
+
+    expect(mockFsState.files.get(persistPath)).toBe(prior);
+    expect(registry.listContexts()).toEqual([
+      expect.objectContaining({ contextKey: "-100123:41", threadId: thread.id }),
+    ]);
+    expect(registry.has("-100123:41")).toBe(true);
+    expect(oldSession.dispose).not.toHaveBeenCalled();
   });
 
   it("two topic contexts in the same chat maintain independent sessions", async () => {

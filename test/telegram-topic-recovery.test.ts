@@ -7,7 +7,6 @@ import {
   hashTelegramDeliveryPayload,
   type TelegramDeliveryPayload,
 } from "../src/telegram-response-plan.js";
-import { buildTopicName } from "../src/topic-sync.js";
 import {
   planTelegramTopicRecovery,
   rebindTelegramTopicPayload,
@@ -97,20 +96,37 @@ describe("Telegram topic recovery", () => {
   test("plans a canonical failed-topic recovery with all response parts preserved for later rebinding", () => {
     const input = fixture();
     const before = structuredClone(input);
+    const expectedAnchor = { operation: "send_text" as const, chatId: -1001, messageThreadId: 7, text: "Response follows." };
+    const expectedFinal: TelegramDeliveryPayload = {
+      operation: "send_rich", chatId: -1001, messageThreadId: 7, markdown: "# Result", media: [], fallbackParts: [{
+        partKey: "final:0000:fallback:0000", kind: "final",
+        payload: { operation: "send_text", chatId: -1001, messageThreadId: 7, text: "Result" },
+      }],
+    };
+    const expectedAttachment = {
+      operation: "send_media" as const, chatId: -1001, messageThreadId: 7, mediaKind: "file" as const,
+      path: "outputs/result.pdf", name: "result.pdf",
+    };
+    const expectedSummary = { operation: "send_text" as const, chatId: -1001, messageThreadId: 7, text: "Summary" };
     const candidate = planTelegramTopicRecovery(input);
 
+    expect(hashTelegramDeliveryPayload(expectedAnchor)).toBe("52b78b4472ee8501450496c8e8d62a25df04a1b914d0526315bbfd7e9fb7e601");
+    expect(hashTelegramDeliveryPayload(expectedFinal)).toBe("33f27a6e265acb08edff13defb04510e8b55375d76afaf28ea05ffb27aff0b5f");
+    expect(hashTelegramDeliveryPayload(expectedAttachment)).toBe("0d0efac0224ca45e0bda56bbb248efabfc9b06cf2fafa277ef4efe601ce59d97");
+    expect(hashTelegramDeliveryPayload(expectedSummary)).toBe("76c254c4f747d35b61b45c7b21ce03728fd28d645465543bdedfff17428def67");
     expect(candidate).toEqual({
-      jobId: "job-1", expectedVersion: 9, threadId: "thread-1", topicName: buildTopicName(input.thread),
-      oldDestination: OLD,
+      jobId: "job-1", expectedVersion: 9, threadId: "thread-1", topicName: "telecodex · Recover topic",
+      oldDestination: { chatId: -1001, messageThreadId: 7 },
       parts: [
-        expect.objectContaining({ partKey: "final:0000", payload: expect.objectContaining(OLD) }),
-        expect.objectContaining({ partKey: "attachment:0001", payload: expect.objectContaining(OLD) }),
-        expect.objectContaining({ partKey: "summary:0002", payload: expect.objectContaining(OLD) }),
+        { partKey: "final:0000", payload: expectedFinal, contentHash: "33f27a6e265acb08edff13defb04510e8b55375d76afaf28ea05ffb27aff0b5f" },
+        { partKey: "attachment:0001", payload: expectedAttachment, contentHash: "0d0efac0224ca45e0bda56bbb248efabfc9b06cf2fafa277ef4efe601ce59d97" },
+        { partKey: "summary:0002", payload: expectedSummary, contentHash: "76c254c4f747d35b61b45c7b21ce03728fd28d645465543bdedfff17428def67" },
       ],
-      anchorPlan: expect.objectContaining({ partKey: "status-anchor", payload: expect.objectContaining(OLD) }),
+      anchorPlan: {
+        partKey: "status-anchor", payload: expectedAnchor,
+        contentHash: "52b78b4472ee8501450496c8e8d62a25df04a1b914d0526315bbfd7e9fb7e601",
+      },
     });
-    expect(candidate?.parts[0].payload).toMatchObject({ fallbackParts: [{ payload: OLD }] });
-    expect(candidate?.parts.map((part) => part.contentHash)).toEqual(candidate?.parts.map((part) => hashTelegramDeliveryPayload(part.payload)));
     expect(input).toEqual(before);
   });
 

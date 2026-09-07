@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 const TABLES_V1 = {
   inbox_updates: `CREATE TABLE inbox_updates (
@@ -70,6 +70,19 @@ const TABLES_V6 = {
   )`,
 } as const;
 
+const TABLES_V7 = {
+  ...TABLES_V6,
+  topic_recoveries: `CREATE TABLE topic_recoveries (
+    job_id TEXT PRIMARY KEY, action_token TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL, old_chat_id INTEGER NOT NULL,
+    old_message_thread_id INTEGER NOT NULL, new_message_thread_id INTEGER,
+    reserved_job_version INTEGER NOT NULL, current_job_version INTEGER NOT NULL,
+    next_attempt_at_ms INTEGER, reason_code TEXT,
+    started_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES jobs(id)
+  )`,
+} as const;
+
 export function initializeTelegramJobSchema(database: Database.Database): void {
   database.transaction(() => {
     const version = database.pragma("user_version", { simple: true });
@@ -77,7 +90,7 @@ export function initializeTelegramJobSchema(database: Database.Database): void {
     if (version > SCHEMA_VERSION) throw new Error("Unsupported telegram job schema version");
     if (version === 0) {
       if (tableNames(database).length > 0) malformed();
-      for (const schema of Object.values(TABLES_V6)) database.exec(schema);
+      for (const schema of Object.values(TABLES_V7)) database.exec(schema);
       database.pragma(`user_version = ${SCHEMA_VERSION}`);
     } else if (version === 1) {
       validateSchema(database, TABLES_V1);
@@ -86,6 +99,7 @@ export function initializeTelegramJobSchema(database: Database.Database): void {
       database.exec(TABLES_V4.job_retry_reservations);
       database.exec(TABLES_V5.retention_file_cleanup);
       migrateStatusAnchorPlans(database);
+      database.exec(TABLES_V7.topic_recoveries);
       database.pragma(`user_version = ${SCHEMA_VERSION}`);
     } else if (version === 2) {
       validateSchema(database, TABLES_V2);
@@ -93,24 +107,32 @@ export function initializeTelegramJobSchema(database: Database.Database): void {
       database.exec(TABLES_V4.job_retry_reservations);
       database.exec(TABLES_V5.retention_file_cleanup);
       migrateStatusAnchorPlans(database);
+      database.exec(TABLES_V7.topic_recoveries);
       database.pragma(`user_version = ${SCHEMA_VERSION}`);
     } else if (version === 3) {
       validateSchema(database, TABLES_V3);
       database.exec(TABLES_V4.job_retry_reservations);
       database.exec(TABLES_V5.retention_file_cleanup);
       migrateStatusAnchorPlans(database);
+      database.exec(TABLES_V7.topic_recoveries);
       database.pragma(`user_version = ${SCHEMA_VERSION}`);
     } else if (version === 4) {
       validateSchema(database, TABLES_V4);
       database.exec(TABLES_V5.retention_file_cleanup);
       migrateStatusAnchorPlans(database);
+      database.exec(TABLES_V7.topic_recoveries);
       database.pragma(`user_version = ${SCHEMA_VERSION}`);
     } else if (version === 5) {
       validateSchema(database, TABLES_V5);
       migrateStatusAnchorPlans(database);
+      database.exec(TABLES_V7.topic_recoveries);
+      database.pragma(`user_version = ${SCHEMA_VERSION}`);
+    } else if (version === 6) {
+      validateSchema(database, TABLES_V6);
+      database.exec(TABLES_V7.topic_recoveries);
       database.pragma(`user_version = ${SCHEMA_VERSION}`);
     }
-    validateSchema(database, TABLES_V6);
+    validateSchema(database, TABLES_V7);
     database.exec(`CREATE INDEX IF NOT EXISTS inbox_updates_queue_order
       ON inbox_updates (accepted_at_ms, job_id)`);
     database.exec(`CREATE INDEX IF NOT EXISTS job_events_job_sequence
@@ -124,7 +146,7 @@ export function validateTelegramJobSchema(database: Database.Database): void {
   const version = database.pragma("user_version", { simple: true });
   if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 0) malformed();
   if (version !== SCHEMA_VERSION) throw new Error("Unsupported telegram job schema version");
-  validateSchema(database, TABLES_V6);
+  validateSchema(database, TABLES_V7);
 }
 
 function migrateStatusAnchorPlans(database: Database.Database): void {

@@ -33,6 +33,12 @@ import { STATUS_CANDIDATE_WHERE } from "./telegram-status-anchor-ledger.js";
 import type {
   TelegramJob, TelegramJobEvent, TelegramSourceKey, UpdateAcceptedEvent,
 } from "./telegram-job-types.js";
+import { TelegramTopicRecoveryLedger } from "./telegram-topic-recovery-ledger.js";
+import type {
+  CompleteTopicRecoveryInput, DeferTopicRecoveryInput, ReserveTopicRecoveryInput,
+  TelegramTopicRecoveryCompletion, TelegramTopicRecoveryRecord, TelegramTopicRecoveryResult,
+  TelegramTopicRecoveryState, TopicRecoveryOutcomeInput,
+} from "./telegram-topic-recovery-ledger.js";
 
 export type {
   DeliveryCompletionCandidate, DeliveryCompletionScanCursor, DeliveryCompletionScanInput,
@@ -44,6 +50,11 @@ export type {
   TelegramDeliverySummary,
 } from "./telegram-delivery-ledger.js";
 export type { ReplanRichDeliveryInput, ReplanRichDeliveryResult } from "./telegram-delivery-replan.js";
+export type {
+  CompleteTopicRecoveryInput, DeferTopicRecoveryInput, ReserveTopicRecoveryInput,
+  TelegramTopicRecoveryCompletion, TelegramTopicRecoveryRecord, TelegramTopicRecoveryResult,
+  TelegramTopicRecoveryState, TopicRecoveryOutcomeInput,
+} from "./telegram-topic-recovery-ledger.js";
 
 const BUSY_TIMEOUT_MS = 5_000;
 const JOB_ID_MAX_LENGTH = 128;
@@ -131,6 +142,7 @@ export class SqliteTelegramJobStore {
   private readonly database: Database.Database;
   private readonly statements = new Map<string, Database.Statement>();
   private readonly deliveryLedger: TelegramDeliveryLedger;
+  private readonly topicRecoveryLedger: TelegramTopicRecoveryLedger;
   private closed = false;
 
   constructor(private readonly databasePath: string, options: SqliteTelegramJobStoreOptions = {}) {
@@ -146,6 +158,14 @@ export class SqliteTelegramJobStore {
       statement: (sql) => this.statement(sql),
       getJob: (jobId) => this.get(jobId),
       readSourcePayload: (jobId) => this.readSourcePayload(jobId),
+      applyTransition: (input) => this.applyTransition(input),
+    });
+    this.topicRecoveryLedger = new TelegramTopicRecoveryLedger({
+      database: this.database,
+      statement: (sql) => this.statement(sql),
+      getJob: (jobId) => this.get(jobId),
+      readSourcePayload: (jobId) => this.readSourcePayload(jobId),
+      listDeliveries: (jobId) => this.listDeliveries(jobId),
       applyTransition: (input) => this.applyTransition(input),
     });
     try {
@@ -657,6 +677,37 @@ export class SqliteTelegramJobStore {
     this.assertOpen(); return this.deliveryLedger.summary(jobId);
   }
 
+  reserveTopicRecovery(input: ReserveTopicRecoveryInput): TelegramTopicRecoveryResult {
+    this.assertOpen(); return this.topicRecoveryLedger.reserve(input);
+  }
+
+  deferTopicRecovery(input: DeferTopicRecoveryInput): TelegramTopicRecoveryRecord {
+    this.assertOpen(); return this.topicRecoveryLedger.defer(input);
+  }
+
+  markTopicRecoveryUnknown(input: TopicRecoveryOutcomeInput): TelegramTopicRecoveryRecord {
+    this.assertOpen(); return this.topicRecoveryLedger.markUnknown(input);
+  }
+
+  failTopicRecovery(input: TopicRecoveryOutcomeInput): TelegramTopicRecoveryRecord {
+    this.assertOpen(); return this.topicRecoveryLedger.fail(input);
+  }
+
+  completeTopicRecovery(input: CompleteTopicRecoveryInput): TelegramTopicRecoveryCompletion {
+    this.assertOpen(); return this.topicRecoveryLedger.complete(input);
+  }
+
+  getTopicRecovery(jobId: string): TelegramTopicRecoveryRecord | null {
+    this.assertOpen(); return this.topicRecoveryLedger.get(jobId);
+  }
+
+  listTopicRecoveries(
+    states: readonly TelegramTopicRecoveryState[],
+    limit?: number,
+  ): readonly TelegramTopicRecoveryRecord[] {
+    this.assertOpen(); return this.topicRecoveryLedger.list(states, limit);
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -755,6 +806,7 @@ export class SqliteTelegramJobStore {
     this.statement("DELETE FROM job_quarantine WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM status_anchor_plans WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM status_anchor_plan_bootstrap_eligibility WHERE job_id = ?").run(jobId);
+    this.statement("DELETE FROM topic_recoveries WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM deliveries WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM job_events WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM job_event_archive WHERE job_id = ?").run(jobId);

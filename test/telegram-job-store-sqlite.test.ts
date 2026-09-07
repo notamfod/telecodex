@@ -111,7 +111,7 @@ describe("SqliteTelegramJobStore", () => {
       expect(db.prepare("SELECT count(*) AS count FROM inbox_updates").get()).toEqual({ count: 1 });
       expect(db.prepare("SELECT count(*) AS count FROM jobs").get()).toEqual({ count: 1 });
       expect(db.prepare("SELECT count(*) AS count FROM job_events").get()).toEqual({ count: 1 });
-      expect(db.pragma("user_version", { simple: true })).toBe(6);
+      expect(db.pragma("user_version", { simple: true })).toBe(7);
       expect(db.prepare("SELECT count(*) AS count FROM status_anchor_plans").get()).toEqual({ count: 0 });
       expect(db.prepare("SELECT count(*) AS count FROM status_anchor_plan_bootstrap_eligibility").get())
         .toEqual({ count: 0 });
@@ -141,6 +141,41 @@ describe("SqliteTelegramJobStore", () => {
       ]);
       expect(db.prepare("PRAGMA table_info(status_anchor_plan_bootstrap_eligibility)").all()).toEqual([
         { cid: 0, name: "job_id", type: "TEXT", notnull: 0, dflt_value: null, pk: 1 },
+      ]);
+    } finally { db.close(); }
+  });
+
+  it("migrates v6 to the exact v7 topic recovery schema", () => {
+    open().close();
+    const legacy = new Database(databasePath);
+    legacy.exec("DROP TABLE topic_recoveries");
+    legacy.pragma("user_version = 6");
+    legacy.close();
+
+    open();
+    const db = new Database(databasePath, { readonly: true });
+    try {
+      expect(db.pragma("user_version", { simple: true })).toBe(7);
+      expect(db.prepare("PRAGMA table_info(topic_recoveries)").all()).toEqual([
+        { cid: 0, name: "job_id", type: "TEXT", notnull: 0, dflt_value: null, pk: 1 },
+        { cid: 1, name: "action_token", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 2, name: "state", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 3, name: "old_chat_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 4, name: "old_message_thread_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 5, name: "new_message_thread_id", type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 },
+        { cid: 6, name: "reserved_job_version", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 7, name: "current_job_version", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 8, name: "next_attempt_at_ms", type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 },
+        { cid: 9, name: "reason_code", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+        { cid: 10, name: "started_at_ms", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 11, name: "updated_at_ms", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      ]);
+      expect(db.prepare("PRAGMA index_list(topic_recoveries)").all()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ unique: 1, origin: "u" }),
+        expect.objectContaining({ unique: 1, origin: "pk" }),
+      ]));
+      expect(db.prepare("PRAGMA foreign_key_list(topic_recoveries)").all()).toEqual([
+        expect.objectContaining({ table: "jobs", from: "job_id", to: "id" }),
       ]);
     } finally { db.close(); }
   });
@@ -385,8 +420,10 @@ describe("SqliteTelegramJobStore", () => {
 
   it("rejects a clean worker exit while a result is pending", async () => {
     const gate = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
-    const workerModule = new URL("./telegram-job-ledger-worker.ts", import.meta.url).href;
-    const bootstrap = `(async () => { const { register } = await import("tsx/esm/api"); register(); await import(${JSON.stringify(workerModule)}); })();`;
+    const bootstrap = `const { parentPort, workerData } = require("node:worker_threads");
+      parentPort.postMessage({ type: "ready" });
+      Atomics.wait(new Int32Array(workerData.gate), 0, 0);
+      process.exit(0);`;
     const worker = new Worker(bootstrap, {
       eval: true, workerData: { databasePath, jobId: "worker-exit", eventId: "worker-exit-event", gate, exit: true },
     });

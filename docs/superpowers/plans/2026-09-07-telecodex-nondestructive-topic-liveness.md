@@ -653,11 +653,21 @@ set -euo pipefail
 TMPDIR=/var/tmp npm test
 TMPDIR=/var/tmp npm run check:web
 TMPDIR=/var/tmp npx tsc --noEmit
-TMPDIR=/var/tmp npm run build
+TELECODEX_VERIFY_ROOT=.telecodex/release-state/topic-liveness-hotfix
+install -d -m 0700 "$TELECODEX_VERIFY_ROOT"
+TELECODEX_VERIFY_STAGE=$(mktemp -d "$TELECODEX_VERIFY_ROOT/verify.XXXXXX")
+TELECODEX_VERIFY_STAGE_ABS=$(realpath "$TELECODEX_VERIFY_STAGE")
+TMPDIR=/var/tmp npx --no-install tsc --outDir "$TELECODEX_VERIFY_STAGE_ABS/dist"
+TMPDIR=/var/tmp npx --no-install vite build --config web/vite.config.ts \
+  --outDir "$TELECODEX_VERIFY_STAGE_ABS/dist-web"
+chmod -R go-rwx "$TELECODEX_VERIFY_STAGE"
 git diff --check
 ```
 
-Expected: all Vitest files and tests pass, Svelte reports 0 errors and 0 warnings, TypeScript and both builds exit 0, and diff check prints nothing.
+Expected: all Vitest files and tests pass, Svelte reports 0 errors and 0 warnings,
+TypeScript and both private staged builds exit 0, and diff check prints nothing. Do
+not run `npm run build` because its default outputs are the live `dist` and
+`dist-web` trees.
 
 - [ ] **Step 2: Enforce focused structural assertions**
 

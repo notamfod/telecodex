@@ -66,6 +66,7 @@ export type {
   TelegramTopicResumeResult, TelegramTopicResumeState,
   TransitionTopicResumeInput,
 } from "./telegram-topic-resume-ledger.js";
+export type { TelegramTopicResumeMode } from "./telegram-topic-resume.js";
 
 const BUSY_TIMEOUT_MS = 5_000;
 const JOB_ID_MAX_LENGTH = 128;
@@ -204,7 +205,9 @@ export class SqliteTelegramJobStore {
     } catch (error) {
       this.closed = true;
       try { this.database.close(); } catch { /* Preserve a safe error. */ }
-      if (error instanceof Error && (error.message === "Malformed telegram job schema" || error.message === "Unsupported telegram job schema version")) throw error;
+      if (error instanceof Error && (error.message === "Malformed telegram job schema"
+        || error.message === "Unsupported telegram job schema version"
+        || error.message === "Cannot migrate active Telegram topic resumes")) throw error;
       throw new Error("Unable to open Telegram SQLite job ledger");
     }
   }

@@ -94,7 +94,7 @@ describe("SQLite reconciliation scan", () => {
     expect(done).toMatchObject({ jobs: [], quarantined: [], nextCursor: null });
     const inspect = new Database(databasePath, { readonly: true });
     try {
-      expect(inspect.pragma("user_version", { simple: true })).toBe(8);
+      expect(inspect.pragma("user_version", { simple: true })).toBe(9);
       expect(inspect.prepare("SELECT count(*) AS count FROM job_quarantine").get()).toEqual({ count: 0 });
       expect(inspect.prepare("SELECT count(*) AS count FROM job_event_archive").get()).toEqual({ count: 0 });
       expect(inspect.prepare("SELECT count(*) AS count FROM status_anchor_plans").get()).toEqual({ count: 0 });
@@ -105,7 +105,7 @@ describe("SQLite reconciliation scan", () => {
     } finally { inspect.close(); }
   });
 
-  it.each([1, 2, 3, 4, 5])("migrates a valid v%s ledger to empty v8 recovery tables", (version) => {
+  it.each([1, 2, 3, 4, 5])("migrates a valid v%s ledger to empty v9 recovery tables", (version) => {
     const migrationPath = path.join(directory, `migration-v${version}.sqlite`);
     const seeded = new SqliteTelegramJobStore(migrationPath);
     accept(seeded, `preserved-v${version}`, version, NOW + version);
@@ -129,7 +129,7 @@ describe("SQLite reconciliation scan", () => {
       expect(migrated.get(`preserved-v${version}`)?.id).toBe(`preserved-v${version}`);
       const inspect = new Database(migrationPath, { readonly: true });
       try {
-        expect(inspect.pragma("user_version", { simple: true })).toBe(8);
+        expect(inspect.pragma("user_version", { simple: true })).toBe(9);
         expect(inspect.prepare("SELECT count(*) AS count FROM status_anchor_plans").get()).toEqual({ count: 0 });
         expect(inspect.prepare("SELECT count(*) AS count FROM topic_recoveries").get()).toEqual({ count: 0 });
         expect(inspect.prepare("SELECT count(*) AS count FROM topic_resume_attempts").get()).toEqual({ count: 0 });

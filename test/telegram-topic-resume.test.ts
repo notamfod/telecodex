@@ -4,7 +4,11 @@ import type { CodexThreadRecord } from "../src/codex-state.js";
 import type { TelegramWorkSource } from "../src/telegram-job-ingress.js";
 import type { DeliveryPart, TelegramJob } from "../src/telegram-job-store.js";
 import { hashTelegramDeliveryPayload } from "../src/telegram-response-plan.js";
-import { planTelegramTopicResume } from "../src/telegram-topic-resume.js";
+import {
+  hashTelegramTopicResumeTopology,
+  isTelegramTopicResumeContinuationValid,
+  planTelegramTopicResume,
+} from "../src/telegram-topic-resume.js";
 import type { TelegramTopicRecoveryRecord } from "../src/telegram-topic-recovery-ledger.js";
 
 const DESTINATION = { chatId: -100123, messageThreadId: 41 } as const;
@@ -161,6 +165,141 @@ describe("Telegram existing topic resume eligibility", () => {
     expect(input).toEqual(before);
   });
 
+  it("validates a standard continuation against the actual post-reservation job", () => {
+    const input = fixture();
+    const reservedJobVersion = input.job.version;
+    const deliveryTopologyHash = hashTelegramTopicResumeTopology(input.job, input.deliveries);
+    input.hasExistingAttempt = true;
+    input.job = {
+      ...input.job,
+      version: reservedJobVersion + 1,
+      updatedAt: input.job.updatedAt + 1,
+    };
+
+    expect(isTelegramTopicResumeContinuationValid({
+      ...input,
+      mode: "standard",
+      reservedJobVersion,
+      currentJobVersion: input.job.version,
+      anchorAttemptBaseline: 1,
+      recoveryJobVersionBaseline: reservedJobVersion,
+      deliveryTopologyHash,
+    })).toBe(true);
+  });
+
+  it.each([
+    ["missing persisted attempt", { hasExistingAttempt: false }],
+    ["warning mode", { mode: "warning_replay" }],
+    ["wrong anchor baseline", { anchorAttemptBaseline: 2 }],
+    ["wrong recovery baseline", { recoveryJobVersionBaseline: 540 }],
+    ["future recovery baseline", { recoveryJobVersionBaseline: 543 }],
+    ["stale current version", { currentJobVersion: 541 }],
+    ["invalid topology hash", { deliveryTopologyHash: "A".repeat(64) }],
+  ] as const)("rejects a standard continuation with %s", (_name, override) => {
+    const input = fixture();
+    const reservedJobVersion = input.job.version;
+    const deliveryTopologyHash = hashTelegramTopicResumeTopology(input.job, input.deliveries);
+    input.hasExistingAttempt = true;
+    input.job = { ...input.job, version: reservedJobVersion + 1, updatedAt: input.job.updatedAt + 1 };
+
+    expect(isTelegramTopicResumeContinuationValid({
+      ...input,
+      mode: "standard",
+      reservedJobVersion,
+      currentJobVersion: input.job.version,
+      anchorAttemptBaseline: 1,
+      recoveryJobVersionBaseline: reservedJobVersion,
+      deliveryTopologyHash,
+      ...override,
+    })).toBe(false);
+  });
+
+  it.each([null, "telegram_not_sent"] as const)(
+    "rejects a standard continuation whose anchor error is %s",
+    (lastErrorCode) => {
+      const input = fixture();
+      const reservedJobVersion = input.job.version;
+      const deliveryTopologyHash = hashTelegramTopicResumeTopology(input.job, input.deliveries);
+      input.hasExistingAttempt = true;
+      input.job = { ...input.job, version: reservedJobVersion + 1, updatedAt: input.job.updatedAt + 1 };
+      input.deliveries[0] = { ...input.deliveries[0]!, lastErrorCode };
+
+      expect(isTelegramTopicResumeContinuationValid({
+        ...input,
+        mode: "standard",
+        reservedJobVersion,
+        currentJobVersion: input.job.version,
+        anchorAttemptBaseline: 1,
+        recoveryJobVersionBaseline: reservedJobVersion,
+        deliveryTopologyHash,
+      })).toBe(false);
+    },
+  );
+
+  it("hashes topology without delivery state while detecting canonical payload changes", () => {
+    const input = fixture();
+    const baseline = hashTelegramTopicResumeTopology(input.job, input.deliveries);
+    const transitioned = input.deliveries.map((part, index) => ({
+      ...part,
+      state: "delivered" as const,
+      attemptCount: index + 2,
+      telegramMessageId: index + 10,
+      nextAttemptAt: 999,
+      lastErrorCode: "ignored-state",
+      updatedAt: part.updatedAt + 10,
+    }));
+    expect(hashTelegramTopicResumeTopology(input.job, transitioned)).toBe(baseline);
+    expect(hashTelegramTopicResumeTopology(input.job, [...input.deliveries].reverse())).toBe(baseline);
+
+    const changed = structuredClone(input.deliveries);
+    const payload = {
+      operation: "send_text" as const,
+      ...DESTINATION,
+      text: "Different notice",
+    };
+    changed[2] = { ...changed[2]!, payload, contentHash: hashTelegramDeliveryPayload(payload) };
+    expect(hashTelegramTopicResumeTopology(input.job, changed)).not.toBe(baseline);
+  });
+
+  const invalidTopologies: Array<[string, (input: Fixture) => void]> = [
+    ["missing row", (input) => { input.deliveries.pop(); }],
+    ["extra row", (input) => {
+      const payload = { operation: "send_text" as const, ...DESTINATION, text: "extra" };
+      input.deliveries.push(row("extra:0002", 2, "notice", "pending", payload));
+    }],
+    ["wrong key", (input) => { input.deliveries[1] = { ...input.deliveries[1]!, partKey: "other" }; }],
+    ["wrong ordinal", (input) => { input.deliveries[1] = { ...input.deliveries[1]!, ordinal: 1 }; }],
+    ["wrong kind", (input) => { input.deliveries[1] = { ...input.deliveries[1]!, kind: "notice" }; }],
+    ["mismatched plan order", (input) => {
+      input.job = { ...input.job, responsePlan: [...input.job.responsePlan!].reverse() };
+    }],
+    ["wrong content hash", (input) => {
+      input.deliveries[1] = { ...input.deliveries[1]!, contentHash: "0".repeat(64) };
+    }],
+  ];
+
+  it.each(invalidTopologies)("rejects topology with %s", (_name, mutate) => {
+    const input = fixture();
+    mutate(input);
+    expect(() => hashTelegramTopicResumeTopology(input.job, input.deliveries))
+      .toThrow("Invalid Telegram topic resume topology");
+  });
+
+  it("changes the topology hash for a consistently reordered response plan", () => {
+    const input = fixture();
+    const baseline = hashTelegramTopicResumeTopology(input.job, input.deliveries);
+    const reordered = fixture();
+    reordered.job = {
+      ...reordered.job,
+      responsePlan: [...reordered.job.responsePlan!].reverse(),
+      deliveries: [...reordered.job.deliveries].reverse(),
+    };
+    reordered.deliveries[1] = { ...reordered.deliveries[1]!, ordinal: 1 };
+    reordered.deliveries[2] = { ...reordered.deliveries[2]!, ordinal: 0 };
+
+    expect(hashTelegramTopicResumeTopology(reordered.job, reordered.deliveries)).not.toBe(baseline);
+  });
+
   it.each([
     ["non-failed recovery", (value: Fixture) => { value.recovery = { ...value.recovery!, state: "unknown", reasonCode: "TOPIC_RECOVERY_UNKNOWN" }; }],
     ["recovery with a new topic", (value: Fixture) => { value.recovery = { ...value.recovery!, newMessageThreadId: 42 }; }],
@@ -176,6 +315,8 @@ describe("Telegram existing topic resume eligibility", () => {
     ["mismatched anchor plan", (value: Fixture) => { value.anchorPlan = { ...value.anchorPlan!, contentHash: "0".repeat(64) }; }],
     ["non-failed anchor", (value: Fixture) => { value.deliveries[0] = { ...value.deliveries[0]!, state: "pending" }; }],
     ["known anchor message", (value: Fixture) => { value.deliveries[0] = { ...value.deliveries[0]!, telegramMessageId: 5 }; }],
+    ["missing anchor error", (value: Fixture) => { value.deliveries[0] = { ...value.deliveries[0]!, lastErrorCode: null }; }],
+    ["wrong anchor error", (value: Fixture) => { value.deliveries[0] = { ...value.deliveries[0]!, lastErrorCode: "telegram_not_sent" }; }],
     ["delivered follower", (value: Fixture) => { value.deliveries[1] = { ...value.deliveries[1]!, state: "delivered", telegramMessageId: 6 }; }],
     ["sending follower", (value: Fixture) => { value.deliveries[1] = { ...value.deliveries[1]!, state: "sending" }; }],
     ["uncertain follower", (value: Fixture) => { value.deliveries[1] = { ...value.deliveries[1]!, state: "uncertain" }; }],

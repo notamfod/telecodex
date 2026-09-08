@@ -293,6 +293,27 @@ describe("TelegramTopicResumeRuntime", () => {
     expect(harness.resume()?.state).toBe("delivery_handoff");
   });
 
+  it.each([
+    ["attempt baseline", { attemptCount: 2 }],
+    ["missing error", { lastErrorCode: null }],
+    ["wrong error", { lastErrorCode: "telegram_not_sent" }],
+    ["message id", { telegramMessageId: 71 }],
+    ["retry deadline", { nextAttemptAt: NOW + 30 }],
+  ] as const)("does not call an outbox after handoff %s drift", async (_name, mutation) => {
+    const harness = createHarness({
+      liveness: "live",
+      outboxOutcome: "pending",
+      handoffAnchorMutation: mutation,
+    });
+    const runtime = createTelegramTopicResumeRuntime(harness.options);
+
+    await runtime.resume(harness.action);
+
+    expect(harness.outboxRetryFailed).not.toHaveBeenCalled();
+    expect(harness.outboxPump).not.toHaveBeenCalled();
+    expect(harness.resume()?.state).toBe("delivery_handoff");
+  });
+
   it("pumps and settles durable evidence when a handoff job version has advanced", async () => {
     const harness = createHarness({
       initialState: "delivery_handoff",

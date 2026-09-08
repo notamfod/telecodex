@@ -10,6 +10,10 @@ import type {
   TelegramTopicResumeRecord,
   TelegramTopicResumeState,
 } from "../src/telegram-topic-resume-ledger.js";
+import {
+  hashTelegramTopicResumeTopology,
+  isTelegramTopicResumeContinuationValid,
+} from "../src/telegram-topic-resume.js";
 import type { TelegramStatusAction } from "../src/telegram-status-projection.js";
 
 export const NOW = 10_000;
@@ -27,6 +31,7 @@ export function createHarness(settings: {
   bindingResults?: readonly boolean[];
   classifyNeverSettles?: boolean;
   reopenNeverSettles?: boolean;
+  handoffAnchorMutation?: Partial<DeliveryPart>;
 } = {}) {
   let clock = NOW;
   const calls: string[] = [];
@@ -118,6 +123,10 @@ export function createHarness(settings: {
     jobId: job.id,
     actionToken: "a".repeat(64),
     state: settings.initialState,
+    mode: "standard",
+    anchorAttemptBaseline: 1,
+    recoveryJobVersionBaseline: job.version,
+    deliveryTopologyHash: hashTelegramTopicResumeTopology(job, deliveries),
     destination: DESTINATION,
     reservedJobVersion: 9,
     currentJobVersion: initialResumeVersion,
@@ -161,6 +170,10 @@ export function createHarness(settings: {
         jobId: job.id,
         actionToken: input.actionToken,
         state: "probe_in_flight",
+        mode: "standard",
+        anchorAttemptBaseline: 1,
+        recoveryJobVersionBaseline: reservedJobVersion,
+        deliveryTopologyHash: hashTelegramTopicResumeTopology(job, deliveries),
         destination: DESTINATION,
         reservedJobVersion,
         currentJobVersion: job.version,
@@ -186,11 +199,26 @@ export function createHarness(settings: {
     }) => {
       if (!resume || resume.currentJobVersion !== input.expectedVersion
         || resume.state !== input.expectedState) throw new Error("Telegram topic resume conflict");
-      if ((input.state === "reopen_in_flight" || input.state === "delivery_handoff")
-        && (!input.externalEligibilitySnapshot?.thread
-          || input.externalEligibilitySnapshot.forumChatId !== DESTINATION.chatId
-          || !input.externalEligibilitySnapshot.hasThreadTopicBinding)) {
-        throw new Error("Telegram topic resume conflict");
+      if (input.state === "reopen_in_flight" || input.state === "delivery_handoff") {
+        const external = input.externalEligibilitySnapshot;
+        if (!external || !isTelegramTopicResumeContinuationValid({
+          job,
+          source,
+          deliveries,
+          anchorPlan,
+          thread: external.thread,
+          recovery,
+          hasExistingAttempt: true,
+          forumChatId: external.forumChatId,
+          hasThreadTopicBinding: external.hasThreadTopicBinding,
+          quarantined: false,
+          mode: resume.mode,
+          reservedJobVersion: resume.reservedJobVersion,
+          currentJobVersion: resume.currentJobVersion,
+          anchorAttemptBaseline: resume.anchorAttemptBaseline,
+          recoveryJobVersionBaseline: resume.recoveryJobVersionBaseline,
+          deliveryTopologyHash: resume.deliveryTopologyHash,
+        })) throw new Error("Telegram topic resume conflict");
       }
       calls.push(`transition:${input.state}`);
       advance(input.updatedAt);
@@ -202,6 +230,11 @@ export function createHarness(settings: {
         reasonCode: input.reasonCode ?? null,
         updatedAt: input.updatedAt,
       };
+      if (input.state === "delivery_handoff" && settings.handoffAnchorMutation) {
+        deliveries = deliveries.map((part) => part.partKey === "status-anchor"
+          ? { ...part, ...settings.handoffAnchorMutation }
+          : part);
+      }
       return { job: structuredClone(job), resume: structuredClone(resume) };
     }),
     settleTopicResumeDelivery: vi.fn((input: { expectedVersion: number; updatedAt: number }) => {

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import path from "node:path";
 
@@ -25,6 +26,8 @@ export interface TelegramTopicResumeCandidate {
   readonly anchorAttemptCount: number;
 }
 
+export type TelegramTopicResumeMode = "standard" | "warning_replay";
+
 export interface TelegramTopicResumeEligibilityInput {
   readonly job: TelegramJob;
   readonly source: TelegramWorkSource;
@@ -38,17 +41,105 @@ export interface TelegramTopicResumeEligibilityInput {
   readonly quarantined: boolean;
 }
 
+export interface TelegramTopicResumeContinuationInput extends TelegramTopicResumeEligibilityInput {
+  readonly mode: TelegramTopicResumeMode;
+  readonly reservedJobVersion: number;
+  readonly currentJobVersion: number;
+  readonly anchorAttemptBaseline: number;
+  readonly recoveryJobVersionBaseline: number;
+  readonly deliveryTopologyHash: string;
+}
+
 export function planTelegramTopicResume(
   input: TelegramTopicResumeEligibilityInput,
 ): TelegramTopicResumeCandidate | null {
+  return planTelegramTopicResumeWithContract(input, {
+    allowExistingAttempt: false,
+    expectedAnchorAttemptCount: 1,
+    expectedRecoveryJobVersion: input.job.version,
+  });
+}
+
+export function isTelegramTopicResumeContinuationValid(
+  input: TelegramTopicResumeContinuationInput,
+): boolean {
+  try {
+    if (input.mode !== "standard" || !input.hasExistingAttempt
+      || input.anchorAttemptBaseline !== 1
+      || input.recoveryJobVersionBaseline !== input.reservedJobVersion
+      || input.currentJobVersion !== input.job.version
+      || !Number.isSafeInteger(input.reservedJobVersion) || input.reservedJobVersion < 1
+      || input.reservedJobVersion >= input.currentJobVersion
+      || !/^[0-9a-f]{64}$/.test(input.deliveryTopologyHash)) return false;
+    const candidate = planTelegramTopicResumeWithContract(input, {
+      allowExistingAttempt: true,
+      expectedAnchorAttemptCount: input.anchorAttemptBaseline,
+      expectedRecoveryJobVersion: input.recoveryJobVersionBaseline,
+    });
+    return candidate !== null
+      && candidate.expectedVersion === input.currentJobVersion
+      && hashTelegramTopicResumeTopology(input.job, input.deliveries) === input.deliveryTopologyHash;
+  } catch {
+    return false;
+  }
+}
+
+export function hashTelegramTopicResumeTopology(
+  job: TelegramJob,
+  deliveries: readonly DeliveryPart[],
+): string {
+  if (!validJob(job) || !job.responsePlan) throw new Error("Invalid Telegram topic resume topology");
+  const anchors = deliveries.filter((row) => row.partKey === "status-anchor");
+  if (anchors.length !== 1 || anchors[0]!.kind !== "status-anchor" || anchors[0]!.ordinal !== 0
+    || deliveries.length !== job.responsePlan.length + 1) {
+    throw new Error("Invalid Telegram topic resume topology");
+  }
+  const followers = job.responsePlan.map((planned, ordinal) => {
+    const matches = deliveries.filter((row) => row.partKey === planned.partId);
+    if (matches.length !== 1 || matches[0]!.ordinal !== ordinal || matches[0]!.kind !== planned.kind) {
+      throw new Error("Invalid Telegram topic resume topology");
+    }
+    return matches[0]!;
+  });
+  const rows = [anchors[0]!, ...followers];
+  const keys = new Set<string>();
+  const canonicalRows = rows.map((row) => {
+    if (row.jobId !== job.id || keys.has(row.partKey) || !validDeliveryRow(row)
+      || !canonicalPayload(row.payload, row.contentHash)) {
+      throw new Error("Invalid Telegram topic resume topology");
+    }
+    keys.add(row.partKey);
+    return {
+      partKey: row.partKey,
+      ordinal: row.ordinal,
+      kind: row.kind,
+      payload: normalizeTelegramDeliveryPayload(row.payload),
+      contentHash: row.contentHash,
+    };
+  });
+  return createHash("sha256").update(JSON.stringify({
+    responsePlan: job.responsePlan.map(({ partId, kind }) => ({ partId, kind })),
+    deliveries: canonicalRows,
+  })).digest("hex");
+}
+
+function planTelegramTopicResumeWithContract(
+  input: TelegramTopicResumeEligibilityInput,
+  contract: {
+    readonly allowExistingAttempt: boolean;
+    readonly expectedAnchorAttemptCount: number;
+    readonly expectedRecoveryJobVersion: number;
+  },
+): TelegramTopicResumeCandidate | null {
   try {
     const { job, deliveries, anchorPlan, recovery } = input;
-    if (input.hasExistingAttempt || input.quarantined || !input.hasThreadTopicBinding
+    if ((!contract.allowExistingAttempt && input.hasExistingAttempt)
+      || input.quarantined || !input.hasThreadTopicBinding
       || job.phase !== "delivering" || !validJob(job) || !validSource(input.source, job)
       || !validThread(job.threadId, input.thread)) return null;
     const destination = sourceDestination(input.source);
     if (!destination || destination.chatId !== input.forumChatId
-      || !validRecovery(recovery, job, destination) || !anchorPlan
+      || !validRecovery(recovery, job, destination, contract.expectedRecoveryJobVersion) || !anchorPlan
       || !canonicalPayload(anchorPlan.payload, anchorPlan.contentHash)) return null;
 
     const anchors = deliveries.filter((part) => part.partKey === "status-anchor");
@@ -57,7 +148,8 @@ export function planTelegramTopicResume(
     if (job.responsePlan!.length !== 2 || followers.length !== 2 || anchors.length !== 1
       || followers.length !== job.responsePlan!.length
       || deliveries.length !== job.responsePlan!.length + 1
-      || !validAnchor(anchor, job.id, destination, anchorPlan)) return null;
+      || !validAnchor(anchor, job.id, destination, anchorPlan,
+        contract.expectedAnchorAttemptCount)) return null;
 
     for (let ordinal = 0; ordinal < job.responsePlan!.length; ordinal += 1) {
       const planned = job.responsePlan![ordinal]!;
@@ -135,6 +227,7 @@ function validRecovery(
   recovery: TelegramTopicRecoveryRecord | null,
   job: TelegramJob,
   destination: TelegramTopicDestination,
+  expectedCurrentJobVersion: number,
 ): recovery is TelegramTopicRecoveryRecord {
   return recovery !== null
     && recovery.jobId === job.id
@@ -142,7 +235,7 @@ function validRecovery(
     && recovery.reasonCode === "TOPIC_RECOVERY_FAILED"
     && recovery.newMessageThreadId === null
     && recovery.nextAttemptAt === null
-    && recovery.currentJobVersion === job.version
+    && recovery.currentJobVersion === expectedCurrentJobVersion
     && recovery.reservedJobVersion > 0
     && recovery.reservedJobVersion < recovery.currentJobVersion
     && recovery.updatedAt >= recovery.startedAt
@@ -154,12 +247,13 @@ function validAnchor(
   jobId: string,
   destination: TelegramTopicDestination,
   plan: NonNullable<TelegramTopicResumeEligibilityInput["anchorPlan"]>,
+  expectedAttemptCount: number,
 ): row is DeliveryPart {
   return row !== undefined && validDeliveryRow(row)
     && row.jobId === jobId && row.kind === "status-anchor" && row.ordinal === 0
     && row.state === "failed" && row.telegramMessageId === null
-    && row.attemptCount === 1
-    && row.nextAttemptAt === null
+    && row.attemptCount === expectedAttemptCount
+    && row.nextAttemptAt === null && row.lastErrorCode === "telegram_permanent"
     && canonicalPayload(row.payload, row.contentHash)
     && isDeepStrictEqual(row.payload, plan.payload) && row.contentHash === plan.contentHash
     && payloadMatchesDestination(row.payload, destination);

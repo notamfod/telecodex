@@ -134,12 +134,18 @@ export function createTelegramTopicResumeRuntime(
     if (!current || current.actionToken !== resume.actionToken
       || current.state !== "delivery_handoff") return;
     const job = requireJob(options.store, current.jobId);
-    const anchor = options.store.listDeliveries(current.jobId)
-      .find((part) => part.partKey === "status-anchor");
+    const anchors = options.store.listDeliveries(current.jobId)
+      .filter((part) => part.partKey === "status-anchor");
+    const anchor = anchors[0];
+    const anchorCanStart = job.version === current.currentJobVersion
+      && anchors.length === 1 && anchor?.state === "failed"
+      && anchor.attemptCount === current.anchorAttemptBaseline
+      && anchor.lastErrorCode === "telegram_permanent"
+      && anchor.telegramMessageId === null && anchor.nextAttemptAt === null;
     try {
-      if (job.version === current.currentJobVersion && anchor?.state === "failed") {
+      if (anchorCanStart) {
         await options.outboxRetryFailed(current.jobId, "status-anchor", current.currentJobVersion);
-      } else {
+      } else if (job.version > current.currentJobVersion) {
         await options.outboxPump();
       }
     } finally {

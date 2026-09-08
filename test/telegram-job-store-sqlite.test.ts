@@ -45,6 +45,32 @@ function mode(filePath: string): number {
   return statSync(filePath).mode & 0o777;
 }
 
+function replaceTopicResumeWithV8(database: Database.Database): void {
+  database.exec("DROP TABLE topic_resume_attempts");
+  database.exec(`CREATE TABLE topic_resume_attempts (
+    job_id TEXT PRIMARY KEY, action_token TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL, chat_id INTEGER NOT NULL, message_thread_id INTEGER NOT NULL,
+    reserved_job_version INTEGER NOT NULL, current_job_version INTEGER NOT NULL,
+    next_attempt_at_ms INTEGER, reason_code TEXT,
+    started_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES jobs(id)
+  )`);
+}
+
+function logicalDatabaseSnapshot(database: Database.Database): unknown {
+  const schema = database.prepare(`SELECT type, name, tbl_name, sql FROM sqlite_master
+    WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`).all() as Array<{ type: string; name: string }>;
+  const tableNames = schema.filter((entry) => entry.type === "table").map((entry) => entry.name);
+  return {
+    userVersion: database.pragma("user_version", { simple: true }),
+    schema,
+    rows: Object.fromEntries(tableNames.map((name) => [
+      name,
+      database.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all(),
+    ])),
+  };
+}
+
 function waitForMessage<T extends { type: string }>(worker: Worker, type: T["type"]): Promise<T> {
   return new Promise((resolve, reject) => {
     const fail = (error: Error) => { cleanup(); reject(error); };
@@ -111,7 +137,7 @@ describe("SqliteTelegramJobStore", () => {
       expect(db.prepare("SELECT count(*) AS count FROM inbox_updates").get()).toEqual({ count: 1 });
       expect(db.prepare("SELECT count(*) AS count FROM jobs").get()).toEqual({ count: 1 });
       expect(db.prepare("SELECT count(*) AS count FROM job_events").get()).toEqual({ count: 1 });
-      expect(db.pragma("user_version", { simple: true })).toBe(8);
+      expect(db.pragma("user_version", { simple: true })).toBe(9);
       expect(db.prepare("SELECT count(*) AS count FROM status_anchor_plans").get()).toEqual({ count: 0 });
       expect(db.prepare("SELECT count(*) AS count FROM status_anchor_plan_bootstrap_eligibility").get())
         .toEqual({ count: 0 });
@@ -145,7 +171,7 @@ describe("SqliteTelegramJobStore", () => {
     } finally { db.close(); }
   });
 
-  it("preserves the exact v7 topic recovery schema while migrating v6 to v8", () => {
+  it("preserves the exact v7 topic recovery schema while migrating v6 to v9", () => {
     open().close();
     const legacy = new Database(databasePath);
     legacy.exec("DROP TABLE topic_resume_attempts");
@@ -156,7 +182,7 @@ describe("SqliteTelegramJobStore", () => {
     open();
     const db = new Database(databasePath, { readonly: true });
     try {
-      expect(db.pragma("user_version", { simple: true })).toBe(8);
+      expect(db.pragma("user_version", { simple: true })).toBe(9);
       expect(db.prepare("PRAGMA table_info(topic_recoveries)").all()).toEqual([
         { cid: 0, name: "job_id", type: "TEXT", notnull: 0, dflt_value: null, pk: 1 },
         { cid: 1, name: "action_token", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
@@ -181,7 +207,7 @@ describe("SqliteTelegramJobStore", () => {
     } finally { db.close(); }
   });
 
-  it("migrates v7 to the exact v8 topic resume schema", () => {
+  it("migrates v7 to the exact v9 topic resume schema", () => {
     open().close();
     const legacy = new Database(databasePath);
     legacy.exec("DROP TABLE topic_resume_attempts");
@@ -191,19 +217,23 @@ describe("SqliteTelegramJobStore", () => {
     open();
     const db = new Database(databasePath, { readonly: true });
     try {
-      expect(db.pragma("user_version", { simple: true })).toBe(8);
+      expect(db.pragma("user_version", { simple: true })).toBe(9);
       expect(db.prepare("PRAGMA table_info(topic_resume_attempts)").all()).toEqual([
         { cid: 0, name: "job_id", type: "TEXT", notnull: 0, dflt_value: null, pk: 1 },
         { cid: 1, name: "action_token", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
         { cid: 2, name: "state", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
-        { cid: 3, name: "chat_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
-        { cid: 4, name: "message_thread_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
-        { cid: 5, name: "reserved_job_version", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
-        { cid: 6, name: "current_job_version", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
-        { cid: 7, name: "next_attempt_at_ms", type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 },
-        { cid: 8, name: "reason_code", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
-        { cid: 9, name: "started_at_ms", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
-        { cid: 10, name: "updated_at_ms", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 3, name: "resume_mode", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 4, name: "anchor_attempt_baseline", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 5, name: "recovery_job_version_baseline", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 6, name: "delivery_topology_hash", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 7, name: "chat_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 8, name: "message_thread_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 9, name: "reserved_job_version", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 10, name: "current_job_version", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 11, name: "next_attempt_at_ms", type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 },
+        { cid: 12, name: "reason_code", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+        { cid: 13, name: "started_at_ms", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 14, name: "updated_at_ms", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
       ]);
       expect(db.prepare("PRAGMA index_list(topic_resume_attempts)").all()).toEqual(expect.arrayContaining([
         expect.objectContaining({ unique: 1, origin: "u" }),
@@ -213,6 +243,57 @@ describe("SqliteTelegramJobStore", () => {
         expect.objectContaining({ table: "jobs", from: "job_id", to: "id" }),
       ]);
     } finally { db.close(); }
+  });
+
+  it("migrates an empty v8 topic resume table to v9 without changing its indexes", () => {
+    open().close();
+    const legacy = new Database(databasePath);
+    try {
+      replaceTopicResumeWithV8(legacy);
+      legacy.pragma("user_version = 8");
+    } finally { legacy.close(); }
+
+    open();
+    const inspect = new Database(databasePath, { readonly: true });
+    try {
+      expect(inspect.pragma("user_version", { simple: true })).toBe(9);
+      expect(inspect.prepare("PRAGMA table_info(topic_resume_attempts)").all().map((column) =>
+        (column as { name: string }).name)).toEqual([
+        "job_id", "action_token", "state", "resume_mode", "anchor_attempt_baseline",
+        "recovery_job_version_baseline", "delivery_topology_hash", "chat_id",
+        "message_thread_id", "reserved_job_version", "current_job_version",
+        "next_attempt_at_ms", "reason_code", "started_at_ms", "updated_at_ms",
+      ]);
+      expect(inspect.prepare("PRAGMA index_list(topic_resume_attempts)").all()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ unique: 1, origin: "u" }),
+        expect.objectContaining({ unique: 1, origin: "pk" }),
+      ]));
+    } finally { inspect.close(); }
+  });
+
+  it("rolls back v8 to v9 migration when a resume row cannot acquire baselines", () => {
+    const store = open();
+    store.acceptUpdate({ job: job("active-resume"), sourcePayload: {}, eventId: "active-resume-event" });
+    store.close();
+    const legacy = new Database(databasePath);
+    let beforeMigration: unknown;
+    try {
+      replaceTopicResumeWithV8(legacy);
+      legacy.prepare(`INSERT INTO topic_resume_attempts
+        (job_id, action_token, state, chat_id, message_thread_id, reserved_job_version,
+          current_job_version, next_attempt_at_ms, reason_code, started_at_ms, updated_at_ms)
+        VALUES (?, ?, 'probe_in_flight', ?, ?, ?, ?, NULL, NULL, ?, ?)`).run(
+        "active-resume", "a".repeat(64), -1001, 7, 1, 2, 10, 10,
+      );
+      legacy.pragma("user_version = 8");
+      beforeMigration = logicalDatabaseSnapshot(legacy);
+    } finally { legacy.close(); }
+
+    expect(() => open()).toThrow("Cannot migrate active Telegram topic resumes");
+    const inspect = new Database(databasePath, { readonly: true });
+    try {
+      expect(logicalDatabaseSnapshot(inspect)).toEqual(beforeMigration);
+    } finally { inspect.close(); }
   });
 
   it("indexes canonical and archived event streams by job and sequence", () => {

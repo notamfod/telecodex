@@ -12,7 +12,11 @@ import type { TelegramWorkSource } from "../src/telegram-job-ingress.js";
 import { SqliteTelegramJobStore, type TelegramJob } from "../src/telegram-job-store.js";
 import { hashTelegramDeliveryPayload } from "../src/telegram-response-plan.js";
 import { planTelegramTopicRecovery } from "../src/telegram-topic-recovery.js";
-import { planTelegramTopicResume, type TelegramTopicResumeCandidate } from "../src/telegram-topic-resume.js";
+import {
+  hashTelegramTopicResumeTopology,
+  planTelegramTopicResume,
+  type TelegramTopicResumeCandidate,
+} from "../src/telegram-topic-resume.js";
 import type {
   TelegramTopicResumeExternalEligibilitySnapshot,
   TelegramTopicResumeState,
@@ -57,6 +61,13 @@ describe("Telegram existing topic resume ledger", () => {
       jobId: fixture.job.id,
       actionToken: token(1),
       state: "probe_in_flight",
+      mode: "standard",
+      anchorAttemptBaseline: 1,
+      recoveryJobVersionBaseline: fixture.job.version,
+      deliveryTopologyHash: hashTelegramTopicResumeTopology(
+        fixture.job,
+        fixture.store.listDeliveries(fixture.job.id),
+      ),
       destination: DESTINATION,
       reservedJobVersion: fixture.job.version,
       currentJobVersion: fixture.job.version + 1,
@@ -97,6 +108,26 @@ describe("Telegram existing topic resume ledger", () => {
       candidate: { ...input.candidate, anchorAttemptCount: 2 },
     })).toThrow();
     expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
+  });
+
+  it("persists the current recovery version and topology in the reservation transaction", () => {
+    const fixture = resumable(open());
+    const recovery = fixture.store.getTopicRecovery(fixture.job.id)!;
+    const expectedTopology = hashTelegramTopicResumeTopology(
+      fixture.job,
+      fixture.store.listDeliveries(fixture.job.id),
+    );
+
+    const result = reserve(fixture, 1);
+
+    expect(result.resume).toMatchObject({
+      mode: "standard",
+      anchorAttemptBaseline: 1,
+      recoveryJobVersionBaseline: recovery.currentJobVersion,
+      deliveryTopologyHash: expectedTopology,
+      reservedJobVersion: fixture.job.version,
+    });
+    expect(result.resume.recoveryJobVersionBaseline).toBe(result.resume.reservedJobVersion);
   });
 
   it("allows exactly the prescribed state transitions", () => {
@@ -230,6 +261,9 @@ describe("Telegram existing topic resume ledger", () => {
     ["recovery version", (fixture) => raw(databasePath, (db) => db.prepare(
       "UPDATE topic_recoveries SET current_job_version = current_job_version - 1 WHERE job_id = ?",
     ).run(fixture.job.id))],
+    ["recovery version advanced after reservation", (fixture) => raw(databasePath, (db) => db.prepare(
+      "UPDATE topic_recoveries SET current_job_version = current_job_version + 1 WHERE job_id = ?",
+    ).run(fixture.job.id))],
     ["quarantine", (fixture) => insertQuarantine(databasePath, fixture.job.id)],
     ["anchor plan raw JSON", (fixture) => raw(databasePath, (db) => db.prepare(
       "UPDATE status_anchor_plans SET payload_json = ' ' || payload_json WHERE job_id = ?",
@@ -255,6 +289,9 @@ describe("Telegram existing topic resume ledger", () => {
     ["follower ordering", (fixture) => raw(databasePath, (db) => db.prepare(`UPDATE deliveries SET ordinal =
       CASE part_key WHEN 'final:0000' THEN 1 ELSE 0 END
       WHERE job_id = ? AND part_key IN ('final:0000', 'notice:0001')`).run(fixture.job.id))],
+    ["persisted topology hash", (fixture) => raw(databasePath, (db) => db.prepare(
+      "UPDATE topic_resume_attempts SET delivery_topology_hash = ? WHERE job_id = ?",
+    ).run("0".repeat(64), fixture.job.id))],
     ["missing follower", (fixture) => raw(databasePath, (db) => db.prepare(
       "DELETE FROM deliveries WHERE job_id = ? AND part_key = 'notice:0001'",
     ).run(fixture.job.id))],
@@ -441,6 +478,71 @@ describe("Telegram existing topic resume ledger", () => {
     expect(fixture.store.get(fixture.job.id)).toEqual(jobBefore);
   });
 
+  it("does not settle an anchor whose attempt count jumps beyond the stored baseline", () => {
+    const fixture = reserved(open());
+    const handoff = fixture.store.transitionTopicResume(transitionInput(
+      fixture.job.id, fixture.reserved.job.version, fixture.reserved.resume.actionToken,
+      "probe_in_flight", "delivery_handoff",
+    ));
+    const sending = fixture.store.transitionDeliveryAndProject({
+      jobId: fixture.job.id, partKey: "status-anchor", expectedJobVersion: handoff.job.version,
+      expectedState: "failed", expectedAttemptCount: 1, state: "sending", attemptCount: 1,
+      allowFailedRetry: true, eventId: "anchor-jump-sending", updatedAt: NOW + 31,
+    });
+    const failed = fixture.store.transitionDeliveryAndProject({
+      jobId: fixture.job.id, partKey: "status-anchor", expectedJobVersion: sending.job.version,
+      expectedState: "sending", expectedAttemptCount: 1, state: "failed", attemptCount: 3,
+      lastErrorCode: "telegram_permanent", eventId: "anchor-jump-failed", updatedAt: NOW + 32,
+    });
+    const before = snapshot(databasePath, fixture.job.id);
+
+    expect(fixture.store.settleTopicResumeDelivery({
+      jobId: fixture.job.id, expectedVersion: failed.job.version,
+      actionToken: handoff.resume.actionToken, updatedAt: NOW + 33,
+    })).toEqual(handoff.resume);
+    expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
+  });
+
+  it.each([
+    ["failed", 0, "TOPIC_RESUME_FOLLOWER_FAILED"],
+    ["failed", 1, "TOPIC_RESUME_FOLLOWER_FAILED"],
+    ["uncertain", 1, "TOPIC_RESUME_FOLLOWER_UNCERTAIN"],
+  ] as const)("settles a causally later %s follower at attempt %s", (state, attemptCount, reasonCode) => {
+    const fixture = reserved(open());
+    const handoff = fixture.store.transitionTopicResume(transitionInput(
+      fixture.job.id, fixture.reserved.job.version, fixture.reserved.resume.actionToken,
+      "probe_in_flight", "delivery_handoff",
+    ));
+    const anchorSending = fixture.store.transitionDeliveryAndProject({
+      jobId: fixture.job.id, partKey: "status-anchor", expectedJobVersion: handoff.job.version,
+      expectedState: "failed", expectedAttemptCount: 1, state: "sending", attemptCount: 1,
+      allowFailedRetry: true, eventId: `follower-${state}-anchor-sending`, updatedAt: NOW + 31,
+    });
+    const anchorDelivered = fixture.store.transitionDeliveryAndProject({
+      jobId: fixture.job.id, partKey: "status-anchor", expectedJobVersion: anchorSending.job.version,
+      expectedState: "sending", expectedAttemptCount: 1, state: "delivered", attemptCount: 2,
+      telegramMessageId: 71, eventId: `follower-${state}-anchor-delivered`, updatedAt: NOW + 32,
+    });
+    const followerSending = fixture.store.transitionDeliveryAndProject({
+      jobId: fixture.job.id, partKey: "final:0000", expectedJobVersion: anchorDelivered.job.version,
+      expectedState: "pending", expectedAttemptCount: 0, state: "sending", attemptCount: 0,
+      eventId: `follower-${state}-sending`, updatedAt: NOW + 33,
+    });
+    const followerTerminal = fixture.store.transitionDeliveryAndProject({
+      jobId: fixture.job.id, partKey: "final:0000", expectedJobVersion: followerSending.job.version,
+      expectedState: "sending", expectedAttemptCount: 0, state, attemptCount,
+      lastErrorCode: state === "failed" ? "telegram_permanent" : "telegram_send_uncertain",
+      eventId: `follower-${state}-terminal`, updatedAt: NOW + 34,
+    });
+    const jobBefore = fixture.store.get(fixture.job.id);
+
+    expect(fixture.store.settleTopicResumeDelivery({
+      jobId: fixture.job.id, expectedVersion: followerTerminal.job.version,
+      actionToken: handoff.resume.actionToken, updatedAt: NOW + 35,
+    })).toMatchObject({ state: "failed", reasonCode, currentJobVersion: followerTerminal.job.version });
+    expect(fixture.store.get(fixture.job.id)).toEqual(jobBefore);
+  });
+
   it("settles complete only after exactly three delivered rows and terminal completion", () => {
     const fixture = reserved(open());
     const handoff = fixture.store.transitionTopicResume(transitionInput(
@@ -457,9 +559,60 @@ describe("Telegram existing topic resume ledger", () => {
     expect(fixture.store.get(fixture.job.id)).toEqual(jobBefore);
   });
 
+  it("does not complete after the delivered topology drifts", () => {
+    const fixture = reserved(open());
+    const handoff = fixture.store.transitionTopicResume(transitionInput(
+      fixture.job.id, fixture.reserved.job.version, fixture.reserved.resume.actionToken,
+      "probe_in_flight", "delivery_handoff",
+    ));
+    const terminal = deliverAllAndFinalize(fixture.store, handoff.job);
+    raw(databasePath, (db) => {
+      const row = db.prepare("SELECT payload_json FROM deliveries WHERE job_id = ? AND part_key = ?")
+        .get(fixture.job.id, "notice:0001") as { payload_json: string };
+      const payload = JSON.parse(row.payload_json) as { text: string };
+      payload.text = "changed after delivery";
+      db.prepare(`UPDATE deliveries SET payload_json = ?, content_hash = ?
+        WHERE job_id = ? AND part_key = ?`).run(
+        JSON.stringify(payload), hashTelegramDeliveryPayload(payload), fixture.job.id, "notice:0001",
+      );
+    });
+    const before = snapshot(databasePath, fixture.job.id);
+
+    expect(() => fixture.store.settleTopicResumeDelivery({
+      jobId: fixture.job.id, expectedVersion: terminal.version,
+      actionToken: handoff.resume.actionToken, updatedAt: NOW + 50,
+    })).toThrow("Telegram topic resume conflict");
+    expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
+  });
+
+  it("does not complete when delivered rows drift from the job projection", () => {
+    const fixture = reserved(open());
+    const handoff = fixture.store.transitionTopicResume(transitionInput(
+      fixture.job.id, fixture.reserved.job.version, fixture.reserved.resume.actionToken,
+      "probe_in_flight", "delivery_handoff",
+    ));
+    const terminal = deliverAllAndFinalize(fixture.store, handoff.job);
+    raw(databasePath, (db) => db.prepare(`UPDATE deliveries SET attempt_count = attempt_count + 1
+      WHERE job_id = ? AND part_key = ?`).run(fixture.job.id, "notice:0001"));
+    const before = snapshot(databasePath, fixture.job.id);
+
+    expect(() => fixture.store.settleTopicResumeDelivery({
+      jobId: fixture.job.id, expectedVersion: terminal.version,
+      actionToken: handoff.resume.actionToken, updatedAt: NOW + 50,
+    })).toThrow("Telegram topic resume conflict");
+    expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
+  });
+
   it.each([
     ["unknown state", "state = 'unexpected'"],
     ["bad token", "action_token = 'A'"],
+    ["unknown mode", "resume_mode = 'other'"],
+    ["zero anchor baseline", "anchor_attempt_baseline = 0"],
+    ["non-standard anchor baseline", "anchor_attempt_baseline = 2"],
+    ["wrong standard recovery baseline", "recovery_job_version_baseline = reserved_job_version - 1"],
+    ["future recovery baseline", "recovery_job_version_baseline = reserved_job_version + 1"],
+    ["uppercase topology hash", "delivery_topology_hash = upper(delivery_topology_hash)"],
+    ["short topology hash", "delivery_topology_hash = 'abc'"],
     ["version regression", "current_job_version = reserved_job_version - 1"],
     ["timestamp regression", "updated_at_ms = started_at_ms - 1"],
     ["invalid destination", "message_thread_id = 0"],
@@ -469,6 +622,36 @@ describe("Telegram existing topic resume ledger", () => {
     const fixture = reserved(open());
     raw(databasePath, (db) => db.exec(`UPDATE topic_resume_attempts SET ${assignment}`));
     expect(() => fixture.store.getTopicResume(fixture.job.id)).toThrow("Malformed Telegram topic resume");
+  });
+
+  it("decodes a structurally valid warning replay record without reserving one", () => {
+    const fixture = reserved(open());
+    raw(databasePath, (db) => db.prepare(`UPDATE topic_resume_attempts SET
+      resume_mode = 'warning_replay', anchor_attempt_baseline = 2,
+      recovery_job_version_baseline = reserved_job_version - 1
+      WHERE job_id = ?`).run(fixture.job.id));
+
+    expect(fixture.store.getTopicResume(fixture.job.id)).toMatchObject({
+      mode: "warning_replay",
+      anchorAttemptBaseline: 2,
+      recoveryJobVersionBaseline: fixture.reserved.resume.reservedJobVersion - 1,
+    });
+  });
+
+  it("does not let a structurally valid warning replay row authorize a Task 1 transition", () => {
+    const fixture = reserved(open());
+    raw(databasePath, (db) => db.prepare(`UPDATE topic_resume_attempts SET
+      resume_mode = 'warning_replay', anchor_attempt_baseline = 2,
+      recovery_job_version_baseline = reserved_job_version - 1
+      WHERE job_id = ?`).run(fixture.job.id));
+    const warning = fixture.store.getTopicResume(fixture.job.id)!;
+    const before = snapshot(databasePath, fixture.job.id);
+
+    expect(() => fixture.store.transitionTopicResume(transitionInput(
+      fixture.job.id, warning.currentJobVersion, warning.actionToken,
+      "probe_in_flight", "delivery_handoff",
+    ))).toThrow("Telegram topic resume conflict");
+    expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
   });
 });
 

@@ -452,11 +452,13 @@ function insertCompletedResume(databasePath: string, job: TelegramJob): void {
   const database = new Database(databasePath);
   try {
     database.prepare(`INSERT INTO topic_resume_attempts
-      (job_id, action_token, state, chat_id, message_thread_id,
+      (job_id, action_token, state, resume_mode, anchor_attempt_baseline,
+        recovery_job_version_baseline, delivery_topology_hash, chat_id, message_thread_id,
         reserved_job_version, current_job_version, next_attempt_at_ms, reason_code,
         started_at_ms, updated_at_ms)
-      VALUES (?, ?, 'complete', ?, ?, ?, ?, NULL, NULL, ?, ?)`).run(
-      job.id, "a".repeat(64), -1001, 7, job.version - 1, job.version, BASE, BASE,
+      VALUES (?, ?, 'complete', 'standard', 1, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`).run(
+      job.id, "a".repeat(64), job.version - 1, "b".repeat(64), -1001, 7,
+      job.version - 1, job.version, BASE, BASE,
     );
   } finally {
     database.close();

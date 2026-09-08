@@ -12,7 +12,14 @@ import { hashTelegramDeliveryPayload, normalizeTelegramDeliveryPayload } from ".
 import type { TelegramTopicRecoveryRecord } from "./telegram-topic-recovery-ledger.js";
 import { decodeCanonicalTopicRecoverySourceJson } from "./telegram-topic-recovery-source-codec.js";
 import type { TelegramTopicDestination } from "./telegram-topic-recovery.js";
-import { planTelegramTopicResume, type TelegramTopicResumeCandidate } from "./telegram-topic-resume.js";
+import {
+  hashTelegramTopicResumeTopology,
+  isTelegramTopicResumeContinuationValid,
+  planTelegramTopicResume,
+  type TelegramTopicResumeCandidate,
+  type TelegramTopicResumeEligibilityInput,
+  type TelegramTopicResumeMode,
+} from "./telegram-topic-resume.js";
 
 const JOB_ID_MAX_LENGTH = 128;
 const EVENT_ID_MAX_LENGTH = 128;
@@ -32,12 +39,18 @@ export type TelegramTopicResumeReasonCode =
   | "TOPIC_RESUME_SOURCE_MISSING"
   | "TOPIC_RESUME_REOPEN_FAILED"
   | "TOPIC_RESUME_DELIVERY_FAILED"
-  | "TOPIC_RESUME_DELIVERY_UNCERTAIN";
+  | "TOPIC_RESUME_DELIVERY_UNCERTAIN"
+  | "TOPIC_RESUME_FOLLOWER_FAILED"
+  | "TOPIC_RESUME_FOLLOWER_UNCERTAIN";
 
 export interface TelegramTopicResumeRecord {
   readonly jobId: string;
   readonly actionToken: string;
   readonly state: TelegramTopicResumeState;
+  readonly mode: TelegramTopicResumeMode;
+  readonly anchorAttemptBaseline: number;
+  readonly recoveryJobVersionBaseline: number;
+  readonly deliveryTopologyHash: string;
   readonly destination: TelegramTopicDestination;
   readonly reservedJobVersion: number;
   readonly currentJobVersion: number;
@@ -117,8 +130,11 @@ export class TelegramTopicResumeLedger {
       if (this.raw(input.candidate.jobId)) conflict();
       const job = this.host.getJob(input.candidate.jobId);
       if (!job || job.version !== input.candidate.expectedVersion) conflict();
-      const candidate = this.eligibleCandidate(job, input.externalEligibilitySnapshot);
+      const evidence = this.eligibilityInput(job, input.externalEligibilitySnapshot, false);
+      const candidate = evidence ? planTelegramTopicResume(evidence) : null;
       if (!candidate || candidate.anchorAttemptCount !== 1 || !same(candidate, input.candidate)) conflict();
+      const recoveryJobVersionBaseline = evidence!.recovery!.currentJobVersion;
+      const deliveryTopologyHash = hashTelegramTopicResumeTopology(job, evidence!.deliveries);
       const advanced = this.host.applyTransition({
         jobId: job.id,
         eventId: input.eventId,
@@ -126,11 +142,13 @@ export class TelegramTopicResumeLedger {
         event: resumeEvent(input.eventAt, "TOPIC_RESUME_PROBE_IN_FLIGHT"),
       });
       const inserted = this.host.statement(`INSERT INTO topic_resume_attempts
-        (job_id, action_token, state, chat_id, message_thread_id,
+        (job_id, action_token, state, resume_mode, anchor_attempt_baseline,
+          recovery_job_version_baseline, delivery_topology_hash, chat_id, message_thread_id,
           reserved_job_version, current_job_version, next_attempt_at_ms,
           reason_code, started_at_ms, updated_at_ms)
-        VALUES (?, ?, 'probe_in_flight', ?, ?, ?, ?, NULL, NULL, ?, ?)`).run(
-        job.id, input.actionToken, candidate.destination.chatId, candidate.destination.messageThreadId,
+        VALUES (?, ?, 'probe_in_flight', 'standard', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`).run(
+        job.id, input.actionToken, candidate.anchorAttemptCount, recoveryJobVersionBaseline,
+        deliveryTopologyHash, candidate.destination.chatId, candidate.destination.messageThreadId,
         job.version, advanced.version, input.eventAt, input.eventAt,
       );
       if (inserted.changes !== 1) conflict();
@@ -186,9 +204,18 @@ export class TelegramTopicResumeLedger {
       const rows = this.host.listDeliveries(input.jobId);
       const anchors = rows.filter((part) => part.partKey === "status-anchor");
       if (anchors.length !== 1) conflict();
+      if (hashTelegramTopicResumeTopology(job, rows) !== resume.deliveryTopologyHash
+        || !deliveryProjectionMatches(job, rows)) conflict();
       const anchor = anchors[0]!;
       const anchorIsCausallyLater = job.version > resume.currentJobVersion
-        && anchor.updatedAt >= resume.updatedAt && anchor.attemptCount > 1;
+        && anchor.updatedAt >= resume.updatedAt
+        && anchor.attemptCount === resume.anchorAttemptBaseline + 1;
+      const followers = rows.filter((part) => part.partKey !== "status-anchor");
+      const failedFollower = followers.find((part) => part.state === "failed"
+        && part.updatedAt >= resume.updatedAt);
+      const uncertainFollower = followers.find((part) => part.state === "uncertain"
+        && part.updatedAt >= resume.updatedAt);
+      const followerIsCausallyLater = job.version > resume.currentJobVersion;
       let state: "complete" | "failed" | null = null;
       let reasonCode: TelegramTopicResumeReasonCode | null = null;
       if (anchor.state === "failed" && anchorIsCausallyLater) {
@@ -197,7 +224,14 @@ export class TelegramTopicResumeLedger {
       } else if (anchor.state === "uncertain" && anchorIsCausallyLater) {
         state = "failed";
         reasonCode = "TOPIC_RESUME_DELIVERY_UNCERTAIN";
-      } else if (job.phase === "terminal" && job.outcome === "completed" && rows.length === 3
+      } else if (failedFollower && followerIsCausallyLater) {
+        state = "failed";
+        reasonCode = "TOPIC_RESUME_FOLLOWER_FAILED";
+      } else if (uncertainFollower && followerIsCausallyLater) {
+        state = "failed";
+        reasonCode = "TOPIC_RESUME_FOLLOWER_UNCERTAIN";
+      } else if (job.version > resume.currentJobVersion
+        && job.phase === "terminal" && job.outcome === "completed" && rows.length === 3
         && rows.every((part) => part.state === "delivered") && anchor.telegramMessageId !== null) {
         state = "complete";
       }
@@ -255,10 +289,11 @@ export class TelegramTopicResumeLedger {
     return this.host.statement("SELECT 1 FROM job_quarantine WHERE job_id = ?").get(jobId) !== undefined;
   }
 
-  private eligibleCandidate(
+  private eligibilityInput(
     job: TelegramJob,
     external: TelegramTopicResumeExternalEligibilitySnapshot,
-  ): TelegramTopicResumeCandidate | null {
+    hasExistingAttempt: boolean,
+  ): TelegramTopicResumeEligibilityInput | null {
     const sourceRow = this.host.statement("SELECT source_json FROM inbox_updates WHERE job_id = ?")
       .get(job.id) as Record<string, unknown> | undefined;
     if (!sourceRow) return null;
@@ -300,14 +335,14 @@ export class TelegramTopicResumeLedger {
       if (hasMessage(error, "Malformed Telegram status anchor plan")) return null;
       throw error;
     }
-    return planTelegramTopicResume({
+    return {
       job, source, deliveries, anchorPlan, recovery,
       thread: external.thread,
-      hasExistingAttempt: false,
+      hasExistingAttempt,
       forumChatId: external.forumChatId,
       hasThreadTopicBinding: external.hasThreadTopicBinding,
       quarantined: this.hasJobQuarantine(job.id),
-    });
+    };
   }
 
   private currentEligibilityMatches(
@@ -315,13 +350,17 @@ export class TelegramTopicResumeLedger {
     job: TelegramJob,
     external: TelegramTopicResumeExternalEligibilitySnapshot,
   ): boolean {
-    const candidate = this.eligibleCandidate({ ...job, version: resume.reservedJobVersion }, external);
-    return candidate !== null && candidate.jobId === resume.jobId
-      && candidate.expectedVersion === resume.reservedJobVersion
-      && candidate.threadId === job.threadId
-      && candidate.anchorPartKey === "status-anchor"
-      && candidate.anchorAttemptCount === 1
-      && same(candidate.destination, resume.destination);
+    const evidence = this.eligibilityInput(job, external, true);
+    return evidence !== null && isTelegramTopicResumeContinuationValid({
+      ...evidence,
+      mode: resume.mode,
+      reservedJobVersion: resume.reservedJobVersion,
+      currentJobVersion: resume.currentJobVersion,
+      anchorAttemptBaseline: resume.anchorAttemptBaseline,
+      recoveryJobVersionBaseline: resume.recoveryJobVersionBaseline,
+      deliveryTopologyHash: resume.deliveryTopologyHash,
+    }) && same(evidence.thread?.id, job.threadId)
+      && same(evidence.recovery?.oldDestination, resume.destination);
   }
 
   private raw(jobId: string): Record<string, unknown> | undefined {
@@ -342,6 +381,12 @@ function decodeResume(row: Record<string, unknown>): TelegramTopicResumeRecord {
       jobId: bounded(row.job_id, "jobId", JOB_ID_MAX_LENGTH),
       actionToken: actionToken(row.action_token),
       state: state(row.state),
+      mode: resumeMode(row.resume_mode),
+      anchorAttemptBaseline: positiveInteger(row.anchor_attempt_baseline, "anchorAttemptBaseline"),
+      recoveryJobVersionBaseline: positiveInteger(
+        row.recovery_job_version_baseline, "recoveryJobVersionBaseline",
+      ),
+      deliveryTopologyHash: topologyHash(row.delivery_topology_hash),
       destination: {
         chatId: nonzeroInteger(row.chat_id, "chatId"),
         messageThreadId: positiveInteger(row.message_thread_id, "messageThreadId"),
@@ -353,7 +398,13 @@ function decodeResume(row: Record<string, unknown>): TelegramTopicResumeRecord {
       startedAt: timestamp(row.started_at_ms, "startedAt"),
       updatedAt: timestamp(row.updated_at_ms, "updatedAt"),
     };
-    if (resume.currentJobVersion <= resume.reservedJobVersion || resume.updatedAt < resume.startedAt) invalidRow();
+    if (resume.currentJobVersion <= resume.reservedJobVersion
+      || resume.recoveryJobVersionBaseline > resume.reservedJobVersion
+      || resume.updatedAt < resume.startedAt) invalidRow();
+    if (resume.mode === "standard"
+      ? resume.anchorAttemptBaseline !== 1
+        || resume.recoveryJobVersionBaseline !== resume.reservedJobVersion
+      : resume.anchorAttemptBaseline < 2) invalidRow();
     validateRecordShape(resume);
     return structuredClone(resume);
   } catch (error) {
@@ -383,6 +434,7 @@ function validateRecordShape(resume: TelegramTopicResumeRecord): void {
 const FAILED_REASONS = new Set<TelegramTopicResumeReasonCode>([
   "TOPIC_RESUME_PROBE_UNKNOWN", "TOPIC_RESUME_SOURCE_MISSING", "TOPIC_RESUME_REOPEN_FAILED",
   "TOPIC_RESUME_DELIVERY_FAILED", "TOPIC_RESUME_DELIVERY_UNCERTAIN",
+  "TOPIC_RESUME_FOLLOWER_FAILED", "TOPIC_RESUME_FOLLOWER_UNCERTAIN",
 ]);
 
 function validateReserveInput(input: ReserveTopicResumeInput): void {
@@ -491,7 +543,8 @@ function isReason(value: unknown): value is TelegramTopicResumeReasonCode {
   return value === "TOPIC_RESUME_PROBE_RATE_LIMITED" || value === "TOPIC_RESUME_PROBE_UNKNOWN"
     || value === "TOPIC_RESUME_REOPEN_RATE_LIMITED" || value === "TOPIC_RESUME_REOPEN_UNKNOWN"
     || value === "TOPIC_RESUME_SOURCE_MISSING" || value === "TOPIC_RESUME_REOPEN_FAILED"
-    || value === "TOPIC_RESUME_DELIVERY_FAILED" || value === "TOPIC_RESUME_DELIVERY_UNCERTAIN";
+    || value === "TOPIC_RESUME_DELIVERY_FAILED" || value === "TOPIC_RESUME_DELIVERY_UNCERTAIN"
+    || value === "TOPIC_RESUME_FOLLOWER_FAILED" || value === "TOPIC_RESUME_FOLLOWER_UNCERTAIN";
 }
 function nullableReason(value: unknown): TelegramTopicResumeReasonCode | null {
   if (value === null || isReason(value)) return value;
@@ -500,6 +553,30 @@ function nullableReason(value: unknown): TelegramTopicResumeReasonCode | null {
 function actionToken(value: unknown): string {
   if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) throw new Error("Invalid actionToken");
   return value;
+}
+function resumeMode(value: unknown): TelegramTopicResumeMode {
+  if (value === "standard" || value === "warning_replay") return value;
+  return invalidRow();
+}
+function topologyHash(value: unknown): string {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) return invalidRow();
+  return value;
+}
+function deliveryProjectionMatches(job: TelegramJob, rows: readonly DeliveryPart[]): boolean {
+  if (!job.responsePlan) return false;
+  const projection = job.responsePlan.map((planned) => {
+    const matches = rows.filter((row) => row.partKey === planned.partId);
+    if (matches.length !== 1) return null;
+    const row = matches[0]!;
+    return {
+      partId: row.partKey,
+      state: row.state,
+      attempts: row.attemptCount,
+      messageId: row.telegramMessageId,
+      deliveredAt: row.state === "delivered" ? row.updatedAt : null,
+    };
+  });
+  return projection.every((part) => part !== null) && isDeepStrictEqual(job.deliveries, projection);
 }
 function bounded(value: unknown, name: string, maximum: number): string {
   if (typeof value !== "string" || value.length === 0 || value.length > maximum) throw new Error(`Invalid ${name}`);

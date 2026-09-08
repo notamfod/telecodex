@@ -349,6 +349,7 @@ export function telegramStatusActionCallbackData(action: TelegramStatusAction): 
     details: "d",
     inspect: "i",
     retry_delivery: "y",
+    recover_missing_topic: "o",
     send_again_warning: "s",
     guardian_restore: "g",
   };
@@ -362,6 +363,7 @@ function actionLabel(action: TelegramStatusAction): string {
   const labels: Record<TelegramStatusAction["kind"], string> = {
     abort: "Stop", refresh: "Refresh", details: "Details", inspect: "Inspect",
     retry_new_turn: "Retry", guardian_restore: "Restore", retry_delivery: "Retry delivery",
+    recover_missing_topic: "Recover topic",
     send_again_warning: "Send again",
   };
   return labels[action.kind];

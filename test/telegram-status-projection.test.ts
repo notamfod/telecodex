@@ -1,9 +1,11 @@
 import {
+  enrichTopicRecoveryAction,
   projectTelegramJobStatus,
   type TelegramJobStatusProjection,
   type TelegramStatusActionKind,
   type TelegramStatusGuardianEvidence,
 } from "../src/telegram-status-projection.js";
+import type { TelegramTopicRecoveryCandidate } from "../src/telegram-topic-recovery.js";
 import type { DeliveryPart } from "../src/telegram-job-store.js";
 import type { GuardianThreadInspection } from "../src/session-guardian-ipc-client.js";
 import type { TelegramJob, TelegramJobEvent } from "../src/telegram-job-types.js";
@@ -185,6 +187,52 @@ describe("projectTelegramJobStatus", () => {
       action("details", 4),
     ]);
   });
+
+  it("enriches only a matching server-proven missing-topic candidate", () => {
+    const projection = project({
+      job: job({ phase: "delivering", version: 7 }),
+      deliveries: [delivery("status-anchor", "status-anchor", "failed")],
+    });
+    const original = structuredClone(projection);
+
+    expect(enrichTopicRecoveryAction(projection, recoveryCandidate()).actions[0]).toEqual({
+      kind: "recover_missing_topic",
+      jobId: projection.jobId,
+      expectedVersion: projection.expectedVersion,
+    });
+    expect(enrichTopicRecoveryAction(projection, null)).toBe(projection);
+    expect(projection).toEqual(original);
+    expect(() => enrichTopicRecoveryAction(projection, recoveryCandidate({ expectedVersion: 8 })))
+      .toThrow("Topic recovery candidate does not match status projection");
+  });
+
+  it.each(["in_flight", "retry_wait", "unknown"] as const)(
+    "suppresses only the affected anchor retry while recovery is %s",
+    (recoveryState) => {
+      const projection = project({
+        job: job({ phase: "delivering", version: 7, responsePlan: [
+          { partId: "final:0000", kind: "final" },
+        ] }),
+        deliveries: [
+          delivery("status-anchor", "status-anchor", "failed"),
+          delivery("final:0000", "final", "failed"),
+        ],
+      });
+
+      expect(enrichTopicRecoveryAction(projection, null, recoveryState).actions).toEqual([
+        action("retry_delivery", 7, { partKey: "final:0000" }),
+        action("details", 7),
+      ]);
+      expect(enrichTopicRecoveryAction(
+        projection,
+        recoveryCandidate(),
+        recoveryState,
+      ).actions).toEqual([
+        action("retry_delivery", 7, { partKey: "final:0000" }),
+        action("details", 7),
+      ]);
+    },
+  );
 
   it("never renders completed as Done until the anchor identity and all planned parts are delivered", () => {
     const incomplete = project({
@@ -393,4 +441,28 @@ function action(
 
 function actions(projection: TelegramJobStatusProjection): TelegramStatusActionKind[] {
   return projection.actions.map((value) => value.kind);
+}
+
+function recoveryCandidate(
+  overrides: Partial<TelegramTopicRecoveryCandidate> = {},
+): TelegramTopicRecoveryCandidate {
+  return {
+    jobId: "job-123456789",
+    expectedVersion: 7,
+    threadId: THREAD_ID,
+    topicName: "Recovered topic",
+    oldDestination: { chatId: -1001, messageThreadId: 7 },
+    parts: [],
+    anchorPlan: {
+      partKey: "status-anchor",
+      payload: {
+        operation: "send_text",
+        chatId: -1001,
+        messageThreadId: 7,
+        text: "Status",
+      },
+      contentHash: "a".repeat(64),
+    },
+    ...overrides,
+  };
 }

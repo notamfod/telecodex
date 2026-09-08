@@ -1124,6 +1124,89 @@ describe("Telegram reliability runtime", () => {
     await expect(runtime.runDashboardAction(details)).resolves.toBeUndefined();
   });
 
+  it("exposes and executes only the exact server-proven missing-topic recovery action", async () => {
+    const seeded = seedTopicRecoveryCandidate(store);
+    const harness = createHarness(store, directory);
+    const recovery = recoveryOptions(seeded);
+    harness.options.topicRecovery = recovery.options;
+    runtime = createTelegramReliabilityRuntime(harness.options);
+
+    const snapshot = await runtime.loadDashboardReliability();
+    const projection = snapshot.jobs.find(({ projection: value }) =>
+      value.jobId === seeded.candidate.jobId)!.projection;
+    const action = projection.actions.find(({ kind }) => kind === "recover_missing_topic");
+
+    expect(action).toEqual({
+      kind: "recover_missing_topic",
+      jobId: seeded.candidate.jobId,
+      expectedVersion: seeded.candidate.expectedVersion,
+    });
+    expect(store.getTopicRecovery(seeded.candidate.jobId)).toBeNull();
+    await expect(runtime.runDashboardAction({ ...action!, expectedVersion: action!.expectedVersion + 1 }))
+      .rejects.toThrow("Dashboard action is no longer legal");
+    expect(recovery.createForumTopic).not.toHaveBeenCalled();
+
+    await runtime.runDashboardAction(action!);
+
+    expect(recovery.probeForumTopic).toHaveBeenCalledOnce();
+    expect(recovery.createForumTopic).toHaveBeenCalledOnce();
+    expect(store.getTopicRecovery(seeded.candidate.jobId)).toMatchObject({ state: "complete" });
+  });
+
+  it("hides recovery and anchor retry actions while topic recovery is active", async () => {
+    const seeded = seedTopicRecoveryCandidate(store);
+    store.reserveTopicRecovery({
+      candidate: seeded.candidate,
+      eventId: "dashboard-recovery-reserved",
+      actionToken: "c".repeat(64),
+      eventAt: NOW - 1,
+    });
+    const harness = createHarness(store, directory);
+    harness.options.topicRecovery = recoveryOptions(seeded).options;
+    runtime = createTelegramReliabilityRuntime(harness.options);
+
+    const snapshot = await runtime.loadDashboardReliability();
+    const projection = snapshot.jobs.find(({ projection: value }) =>
+      value.jobId === seeded.candidate.jobId)!.projection;
+
+    expect(projection.actions.some(({ kind }) => kind === "recover_missing_topic")).toBe(false);
+    expect(projection.actions.some(({ kind, partKey }) =>
+      kind === "retry_delivery" && partKey === "status-anchor")).toBe(false);
+    expect(projection.actions.some(({ kind }) => kind === "details")).toBe(true);
+  });
+
+  it("keeps missing-topic recovery unreachable when its runtime is disabled", async () => {
+    const seeded = seedTopicRecoveryCandidate(store);
+    const harness = createHarness(store, directory);
+    runtime = createTelegramReliabilityRuntime(harness.options);
+
+    const snapshot = await runtime.loadDashboardReliability();
+    const projection = snapshot.jobs.find(({ projection: value }) =>
+      value.jobId === seeded.candidate.jobId)!.projection;
+
+    expect(projection.actions.some(({ kind }) => kind === "recover_missing_topic")).toBe(false);
+    expect(projection.actions).toContainEqual(expect.objectContaining({
+      kind: "retry_delivery",
+      partKey: "status-anchor",
+    }));
+  });
+
+  it("keeps Dashboard available when a recovery candidate source is malformed", async () => {
+    const seeded = seedTopicRecoveryCandidate(store);
+    const readSourcePayload = store.readSourcePayload.bind(store);
+    vi.spyOn(store, "readSourcePayload").mockImplementation((jobId) =>
+      jobId === seeded.candidate.jobId ? { malformed: true } : readSourcePayload(jobId));
+    const harness = createHarness(store, directory);
+    harness.options.topicRecovery = recoveryOptions(seeded).options;
+    runtime = createTelegramReliabilityRuntime(harness.options);
+
+    const snapshot = await runtime.loadDashboardReliability();
+    const projection = snapshot.jobs.find(({ projection: value }) =>
+      value.jobId === seeded.candidate.jobId)!.projection;
+
+    expect(projection.actions.some(({ kind }) => kind === "recover_missing_topic")).toBe(false);
+  });
+
   it("loads durable Dashboard session statuses without live Guardian or connectivity probes", async () => {
     const harness = createHarness(store, directory);
     runtime = createTelegramReliabilityRuntime(harness.options);
@@ -1429,7 +1512,7 @@ function createHarness(store: SqliteTelegramJobStore, directory: string) {
   return { options, session, registry, delivery, status };
 }
 
-function seedDueTopicRecovery(store: SqliteTelegramJobStore) {
+function seedTopicRecoveryCandidate(store: SqliteTelegramJobStore) {
   const oldDestination = { chatId: -1001, messageThreadId: 7 } as const;
   const newDestination = { chatId: oldDestination.chatId, messageThreadId: 99 } as const;
   const input = source({ updateId: 404, messageId: 404, ...oldDestination });
@@ -1515,6 +1598,12 @@ function seedDueTopicRecovery(store: SqliteTelegramJobStore) {
     thread,
   });
   if (!candidate) throw new Error("Expected topic recovery drain candidate");
+  return { oldDestination, newDestination, thread, candidate };
+}
+
+function seedDueTopicRecovery(store: SqliteTelegramJobStore) {
+  const seeded = seedTopicRecoveryCandidate(store);
+  const { candidate } = seeded;
   const reserved = store.reserveTopicRecovery({
     candidate,
     eventId: "recovery-drain-reserved",
@@ -1522,13 +1611,37 @@ function seedDueTopicRecovery(store: SqliteTelegramJobStore) {
     eventAt: NOW - 92,
   });
   store.deferTopicRecovery({
-    jobId: job.id,
+    jobId: candidate.jobId,
     expectedVersion: reserved.job.version,
     actionToken: reserved.recovery.actionToken,
     updatedAt: NOW - 1,
     nextAttemptAt: NOW,
   });
-  return { oldDestination, newDestination, thread };
+  return seeded;
+}
+
+function recoveryOptions(seeded: ReturnType<typeof seedTopicRecoveryCandidate>) {
+  const probeForumTopic = vi.fn(async () => false);
+  const createForumTopic = vi.fn(async () => seeded.newDestination);
+  return {
+    probeForumTopic,
+    createForumTopic,
+    options: {
+      forumChatId: seeded.oldDestination.chatId,
+      hasThreadTopicBinding: vi.fn((threadId, destination) =>
+        threadId === seeded.thread.id
+        && destination.chatId === seeded.oldDestination.chatId
+        && destination.messageThreadId === seeded.oldDestination.messageThreadId),
+      probeForumTopic,
+      createForumTopic,
+      getThread: vi.fn((threadId) => threadId === seeded.thread.id
+        ? structuredClone(seeded.thread) : null),
+      rebindThreadTopic: vi.fn(),
+      sendWelcome: vi.fn(async () => undefined),
+      scheduleWakeup: vi.fn(),
+      reportReason: vi.fn(),
+    } satisfies NonNullable<TelegramReliabilityRuntimeOptions["topicRecovery"]>,
+  };
 }
 
 function source(overrides: Partial<TelegramWorkSource> = {}): TelegramWorkSource {

@@ -139,6 +139,21 @@ describe("unified status board rendering", () => {
     });
   });
 
+  it("renders the bounded missing-topic recovery action", () => {
+    const value = projection({ actions: [{
+      kind: "recover_missing_topic",
+      jobId: "job-123456789",
+      expectedVersion: 541,
+    }], expectedVersion: 541 });
+
+    expect(renderStatusBoard(snapshot([{
+      projection: value, label: "Missing topic", workspace: "/srv/telecodex",
+    }]), CHAT_ID).buttons[0]).toEqual({
+      text: "Recover topic",
+      callbackData: "tcj:o:job-123456789:541",
+    });
+  });
+
   it("counts only projected running or delivering work against Telegram slots", () => {
     expect(buildProjected([
       projection({ phase: "accepted", state: "accepted" }),

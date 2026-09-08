@@ -34,7 +34,7 @@ const PROBE_REASON_CODES = new Set([
 ]);
 const ACTION_KINDS = new Set<TelegramStatusActionKind>([
   "abort", "refresh", "details", "inspect", "retry_new_turn", "guardian_restore",
-  "retry_delivery", "send_again_warning",
+  "retry_delivery", "recover_missing_topic", "send_again_warning",
 ]);
 
 export interface MiniAppProbeResult {

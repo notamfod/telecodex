@@ -222,6 +222,38 @@ describe("Mini App HTTP server", () => {
     });
   });
 
+  it("accepts missing-topic recovery without client-supplied destination data", async () => {
+    const { server, runJobAction } = await start();
+    const jobId = "11111111-1111-4111-8111-111111111111";
+    const headers = {
+      "content-type": "application/json",
+      "x-telegram-init-data": signedInitData(),
+    };
+
+    const accepted = await fetch(
+      `${server.url}/api/dashboard/jobs/${jobId}/actions/recover_missing_topic`,
+      { method: "POST", headers, body: JSON.stringify({ expectedVersion: 541 }) },
+    );
+    const tampered = await fetch(
+      `${server.url}/api/dashboard/jobs/${jobId}/actions/recover_missing_topic`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ expectedVersion: 541, messageThreadId: 99 }),
+      },
+    );
+
+    expect(accepted.status).toBe(200);
+    expect(await accepted.json()).toEqual({ ok: true });
+    expect(runJobAction).toHaveBeenCalledOnce();
+    expect(runJobAction).toHaveBeenCalledWith({
+      kind: "recover_missing_topic",
+      jobId,
+      expectedVersion: 541,
+    });
+    expect(tampered.status).toBe(400);
+  });
+
   it("rejects malformed thread ids without calling Telegram", async () => {
     const { server, ensureTopic } = await start();
 

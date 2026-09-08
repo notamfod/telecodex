@@ -1,5 +1,6 @@
 import type { GuardianThreadInspection } from "./session-guardian-ipc-client.js";
 import type { DeliveryPart } from "./telegram-job-store.js";
+import type { TelegramTopicRecoveryCandidate } from "./telegram-topic-recovery.js";
 import {
   TELEGRAM_STATUS_ANCHOR_PART_KEY,
   type DeliveryState,
@@ -20,7 +21,10 @@ export type TelegramStatusActionKind =
   | "retry_new_turn"
   | "guardian_restore"
   | "retry_delivery"
+  | "recover_missing_topic"
   | "send_again_warning";
+
+export type TelegramTopicRecoveryActionState = "in_flight" | "retry_wait" | "unknown";
 
 export type TelegramJobStatusState =
   | "accepted"
@@ -124,6 +128,33 @@ export interface TelegramJobStatusProjection {
   readonly attention: JobAttention;
   readonly reasonCodes: readonly string[];
   readonly actions: readonly TelegramStatusAction[];
+}
+
+export function enrichTopicRecoveryAction(
+  projection: TelegramJobStatusProjection,
+  candidate: TelegramTopicRecoveryCandidate | null,
+  recoveryState?: TelegramTopicRecoveryActionState,
+): TelegramJobStatusProjection {
+  const actions = recoveryState === undefined
+    ? projection.actions
+    : projection.actions.filter((action) => !(
+        action.kind === "retry_delivery" && action.partKey === TELEGRAM_STATUS_ANCHOR_PART_KEY
+      ));
+  if (candidate === null || recoveryState !== undefined) {
+    return actions === projection.actions ? projection : { ...projection, actions };
+  }
+  if (candidate.jobId !== projection.jobId
+    || candidate.expectedVersion !== projection.expectedVersion) {
+    throw new Error("Topic recovery candidate does not match status projection");
+  }
+  return {
+    ...projection,
+    actions: [{
+      kind: "recover_missing_topic",
+      jobId: projection.jobId,
+      expectedVersion: projection.expectedVersion,
+    }, ...actions],
+  };
 }
 
 export function projectTelegramJobStatus(input: TelegramJobStatusProjectionInput): TelegramJobStatusProjection {

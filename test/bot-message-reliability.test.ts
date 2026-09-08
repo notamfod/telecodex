@@ -283,6 +283,20 @@ describe("canonical Telegram control routing", () => {
     });
   });
 
+  it("routes missing-topic recovery only through the exact Dashboard action envelope", async () => {
+    const subject = harness({ telegramForumChatId: -1001 });
+    vi.spyOn(subject.bot.statusBoard!, "isDashboardMessage").mockReturnValue(true);
+
+    await subject.bot.handleUpdate(callbackUpdate(562, "tcj:o:job-exact:541"));
+
+    expect(subject.reliability.runDashboardAction).toHaveBeenCalledWith({
+      kind: "recover_missing_topic", jobId: "job-exact", expectedVersion: 541,
+    }, undefined);
+    expect(subject.apiCalls.at(-1)).toEqual([
+      "answerCallbackQuery", expect.objectContaining({ text: "Topic recovery started" }),
+    ]);
+  });
+
   it.each([
     "tcj:a::1",
     "tcj:a:job:0",

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  createForumTopicLivenessClassifier,
   createForumTopicLivenessProbe,
   isMissingForumTopicError,
   type ForumTopicDestination,
@@ -38,6 +39,25 @@ describe("forum topic liveness", () => {
       timeoutMs: 2_147_483_647,
       cacheTtlMs: 2_147_483_648,
     })).not.toThrow();
+  });
+
+  it("classifies a successful probe as live", async () => {
+    const sendChatAction = vi.fn(async () => true);
+    const classify = createForumTopicLivenessClassifier({ sendChatAction });
+
+    await expect(classify(destination)).resolves.toBe("live");
+  });
+
+  it("classifies a closed topic as closed", async () => {
+    await expect(createForumTopicLivenessClassifier({
+      sendChatAction: vi.fn().mockRejectedValue(new Error("TOPIC_CLOSED")),
+    })(destination)).resolves.toBe("closed");
+  });
+
+  it("classifies a deleted topic as missing", async () => {
+    await expect(createForumTopicLivenessClassifier({
+      sendChatAction: vi.fn().mockRejectedValue(new Error("TOPIC_DELETED")),
+    })(destination)).resolves.toBe("missing");
   });
 
   it("uses an ephemeral typing action in the target topic", async () => {

@@ -15,6 +15,8 @@ export interface ForumTopicLivenessOptions {
   readonly cacheTtlMs?: number;
 }
 
+export type ForumTopicLiveness = "live" | "closed" | "missing";
+
 const DEFAULT_TIMEOUT_MS = 3_000;
 const DEFAULT_CACHE_TTL_MS = 5_000;
 
@@ -26,18 +28,26 @@ function isClosedForumTopicError(error: unknown): boolean {
   return /TOPIC_CLOSED|topic is closed/i.test(describe(error));
 }
 
-export function createForumTopicLivenessProbe(options: ForumTopicLivenessOptions) {
+export function createForumTopicLivenessClassifier(
+  options: ForumTopicLivenessOptions,
+): (
+  destination: ForumTopicDestination,
+  callerSignal?: AbortSignal,
+) => Promise<ForumTopicLiveness> {
   const now = options.now ?? Date.now;
   const timeoutMs = positiveInteger(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, "timeoutMs");
   if (timeoutMs > 2_147_483_647) throw new Error("Invalid timeoutMs");
   const cacheTtlMs = positiveInteger(options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS, "cacheTtlMs");
-  const cache = new Map<string, { readonly value: boolean; readonly expiresAt: number }>();
+  const cache = new Map<
+    string,
+    { readonly value: ForumTopicLiveness; readonly expiresAt: number }
+  >();
   const inFlight = new Map<string, SharedRequest>();
 
   return (
     destination: ForumTopicDestination,
     callerSignal?: AbortSignal,
-  ): Promise<boolean> => {
+  ): Promise<ForumTopicLiveness> => {
     validateDestination(destination);
     if (callerSignal?.aborted) {
       return Promise.reject(new Error("Telegram topic probe aborted"));
@@ -66,8 +76,23 @@ export function createForumTopicLivenessProbe(options: ForumTopicLivenessOptions
   };
 }
 
+export function createForumTopicLivenessProbe(
+  options: ForumTopicLivenessOptions,
+): (
+  destination: ForumTopicDestination,
+  callerSignal?: AbortSignal,
+) => Promise<boolean> {
+  const classify = createForumTopicLivenessClassifier(options);
+  return (destination, signal) => {
+    const probe = classify(destination, signal)
+      .then((liveness) => liveness !== "missing");
+    void probe.catch(() => {});
+    return probe;
+  };
+}
+
 interface SharedRequest {
-  readonly promise: Promise<boolean>;
+  readonly promise: Promise<ForumTopicLiveness>;
   readonly controller: AbortController;
   readonly subscribers: Set<symbol>;
   cancel(): void;
@@ -79,17 +104,17 @@ function createSharedRequest(
   destination: ForumTopicDestination,
   sendChatAction: ForumTopicLivenessOptions["sendChatAction"],
   timeoutMs: number,
-  cache: Map<string, { readonly value: boolean; readonly expiresAt: number }>,
+  cache: Map<string, { readonly value: ForumTopicLiveness; readonly expiresAt: number }>,
   cacheTtlMs: number,
   now: () => number,
   inFlight: Map<string, SharedRequest>,
 ): SharedRequest {
   const controller = new AbortController();
-  let resolveRequest!: (value: boolean) => void;
+  let resolveRequest!: (value: ForumTopicLiveness) => void;
   let rejectRequest!: (error: unknown) => void;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const request: SharedRequest = {
-    promise: new Promise<boolean>((resolve, reject) => {
+    promise: new Promise<ForumTopicLiveness>((resolve, reject) => {
       resolveRequest = resolve;
       rejectRequest = reject;
     }),
@@ -123,10 +148,10 @@ function createSharedRequest(
           { message_thread_id: destination.messageThreadId },
           controller.signal,
         );
-        return true;
+        return "live" as const;
       } catch (error) {
-        if (isClosedForumTopicError(error)) return true;
-        if (isMissingForumTopicError(error)) return false;
+        if (isClosedForumTopicError(error)) return "closed" as const;
+        if (isMissingForumTopicError(error)) return "missing" as const;
         throw error;
       }
     })();
@@ -146,10 +171,13 @@ function createSharedRequest(
   return request;
 }
 
-function subscribe(request: SharedRequest, callerSignal?: AbortSignal): Promise<boolean> {
+function subscribe(
+  request: SharedRequest,
+  callerSignal?: AbortSignal,
+): Promise<ForumTopicLiveness> {
   const token = Symbol();
   request.subscribers.add(token);
-  const subscription = new Promise<boolean>((resolve, reject) => {
+  const subscription = new Promise<ForumTopicLiveness>((resolve, reject) => {
     let settled = false;
     const cleanup = () => callerSignal?.removeEventListener("abort", abort);
     const finish = (complete: () => void) => {

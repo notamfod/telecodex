@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { CodexThreadRecord } from "../src/codex-state.js";
 import type { TelegramWorkSource } from "../src/telegram-job-ingress.js";
 import type { DeliveryPart, TelegramJob } from "../src/telegram-job-store.js";
@@ -150,6 +152,15 @@ describe("Telegram existing topic resume eligibility", () => {
     });
   });
 
+  it("rejects an otherwise valid failed anchor whose attempt count is not exactly one", () => {
+    const input = fixture();
+    input.deliveries[0] = { ...input.deliveries[0]!, attemptCount: 2 };
+    const before = structuredClone(input);
+
+    expect(planTelegramTopicResume(input)).toBeNull();
+    expect(input).toEqual(before);
+  });
+
   it.each([
     ["non-failed recovery", (value: Fixture) => { value.recovery = { ...value.recovery!, state: "unknown", reasonCode: "TOPIC_RECOVERY_UNKNOWN" }; }],
     ["recovery with a new topic", (value: Fixture) => { value.recovery = { ...value.recovery!, newMessageThreadId: 42 }; }],
@@ -195,7 +206,8 @@ describe("Telegram existing topic resume eligibility", () => {
       };
       payload.fallbackParts[0]!.payload.messageThreadId = 42;
       value.deliveries[1] = {
-        ...value.deliveries[1]!, payload, contentHash: "0".repeat(64),
+        ...value.deliveries[1]!, payload,
+        contentHash: createHash("sha256").update(JSON.stringify(payload)).digest("hex"),
       };
     }],
   ])("rejects %s without mutating its input", (_name, mutate) => {

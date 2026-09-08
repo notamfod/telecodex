@@ -158,7 +158,7 @@ function validAnchor(
   return row !== undefined && validDeliveryRow(row)
     && row.jobId === jobId && row.kind === "status-anchor" && row.ordinal === 0
     && row.state === "failed" && row.telegramMessageId === null
-    && Number.isSafeInteger(row.attemptCount) && row.attemptCount > 0
+    && row.attemptCount === 1
     && row.nextAttemptAt === null
     && canonicalPayload(row.payload, row.contentHash)
     && isDeepStrictEqual(row.payload, plan.payload) && row.contentHash === plan.contentHash

@@ -70,6 +70,7 @@ export interface TransitionTopicResumeInput {
   readonly actionToken: string;
   readonly expectedState: TelegramTopicResumeState;
   readonly state: TelegramTopicResumeState;
+  readonly externalEligibilitySnapshot?: TelegramTopicResumeExternalEligibilitySnapshot;
   readonly nextAttemptAt?: number | null;
   readonly reasonCode?: TelegramTopicResumeReasonCode | null;
   readonly updatedAt: number;
@@ -117,7 +118,7 @@ export class TelegramTopicResumeLedger {
       const job = this.host.getJob(input.candidate.jobId);
       if (!job || job.version !== input.candidate.expectedVersion) conflict();
       const candidate = this.eligibleCandidate(job, input.externalEligibilitySnapshot);
-      if (!candidate || !same(candidate, input.candidate)) conflict();
+      if (!candidate || candidate.anchorAttemptCount !== 1 || !same(candidate, input.candidate)) conflict();
       const advanced = this.host.applyTransition({
         jobId: job.id,
         eventId: input.eventId,
@@ -153,6 +154,8 @@ export class TelegramTopicResumeLedger {
       if (resume.state === "reopen_unknown" && resume.nextAttemptAt !== null
         && input.updatedAt < resume.nextAttemptAt) conflict();
       validateTransitionShape(resume.state, input.state, reasonCode, nextAttemptAt, input.updatedAt);
+      if (effectAuthorizing(input.state)
+        && !this.currentEligibilityMatches(resume, job, input.externalEligibilitySnapshot!)) conflict();
       const advanced = this.host.applyTransition({
         jobId: input.jobId,
         eventId: transitionEventId(input.state, input.actionToken, input.expectedVersion),
@@ -184,12 +187,14 @@ export class TelegramTopicResumeLedger {
       const anchors = rows.filter((part) => part.partKey === "status-anchor");
       if (anchors.length !== 1) conflict();
       const anchor = anchors[0]!;
+      const anchorIsCausallyLater = job.version > resume.currentJobVersion
+        && anchor.updatedAt >= resume.updatedAt && anchor.attemptCount > 1;
       let state: "complete" | "failed" | null = null;
       let reasonCode: TelegramTopicResumeReasonCode | null = null;
-      if (anchor.state === "failed" && anchor.updatedAt > resume.updatedAt) {
+      if (anchor.state === "failed" && anchorIsCausallyLater) {
         state = "failed";
         reasonCode = "TOPIC_RESUME_DELIVERY_FAILED";
-      } else if (anchor.state === "uncertain" && anchor.updatedAt > resume.updatedAt) {
+      } else if (anchor.state === "uncertain" && anchorIsCausallyLater) {
         state = "failed";
         reasonCode = "TOPIC_RESUME_DELIVERY_UNCERTAIN";
       } else if (job.phase === "terminal" && job.outcome === "completed" && rows.length === 3
@@ -305,6 +310,20 @@ export class TelegramTopicResumeLedger {
     });
   }
 
+  private currentEligibilityMatches(
+    resume: TelegramTopicResumeRecord,
+    job: TelegramJob,
+    external: TelegramTopicResumeExternalEligibilitySnapshot,
+  ): boolean {
+    const candidate = this.eligibleCandidate({ ...job, version: resume.reservedJobVersion }, external);
+    return candidate !== null && candidate.jobId === resume.jobId
+      && candidate.expectedVersion === resume.reservedJobVersion
+      && candidate.threadId === job.threadId
+      && candidate.anchorPartKey === "status-anchor"
+      && candidate.anchorAttemptCount === 1
+      && same(candidate.destination, resume.destination);
+  }
+
   private raw(jobId: string): Record<string, unknown> | undefined {
     return this.host.statement("SELECT * FROM topic_resume_attempts WHERE job_id = ?")
       .get(jobId) as Record<string, unknown> | undefined;
@@ -371,17 +390,11 @@ function validateReserveInput(input: ReserveTopicResumeInput): void {
   positiveInteger(input.candidate.expectedVersion, "expectedVersion");
   bounded(input.candidate.threadId, "threadId", JOB_ID_MAX_LENGTH);
   if (input.candidate.anchorPartKey !== "status-anchor"
-    || !Number.isSafeInteger(input.candidate.anchorAttemptCount) || input.candidate.anchorAttemptCount < 1) {
+    || input.candidate.anchorAttemptCount !== 1) {
     throw new Error("Invalid Telegram topic resume candidate");
   }
   destination(input.candidate.destination);
-  if (!input.externalEligibilitySnapshot || typeof input.externalEligibilitySnapshot !== "object"
-    || (input.externalEligibilitySnapshot.thread !== null
-      && typeof input.externalEligibilitySnapshot.thread !== "object")
-    || typeof input.externalEligibilitySnapshot.hasThreadTopicBinding !== "boolean") {
-    throw new Error("Invalid Telegram topic resume external eligibility snapshot");
-  }
-  nonzeroInteger(input.externalEligibilitySnapshot.forumChatId, "forumChatId");
+  validateExternalEligibilitySnapshot(input.externalEligibilitySnapshot);
   bounded(input.eventId, "eventId", EVENT_ID_MAX_LENGTH);
   actionToken(input.actionToken);
   timestamp(input.eventAt, "eventAt");
@@ -392,6 +405,12 @@ function validateTransitionInput(input: TransitionTopicResumeInput): void {
   positiveInteger(input.expectedVersion, "expectedVersion");
   actionToken(input.actionToken);
   if (!isState(input.expectedState) || !isState(input.state)) throw new Error("Invalid topic resume state");
+  if (effectAuthorizing(input.state) && input.externalEligibilitySnapshot === undefined) {
+    throw new Error("Missing Telegram topic resume external eligibility snapshot");
+  }
+  if (input.externalEligibilitySnapshot !== undefined) {
+    validateExternalEligibilitySnapshot(input.externalEligibilitySnapshot);
+  }
   if (input.reasonCode !== undefined && input.reasonCode !== null && !isReason(input.reasonCode)) {
     throw new Error("Invalid topic resume reason code");
   }
@@ -455,6 +474,16 @@ function transitionEventId(state: string, token: string, version: number): strin
 function destination(value: TelegramTopicDestination): void {
   nonzeroInteger(value.chatId, "chatId");
   positiveInteger(value.messageThreadId, "messageThreadId");
+}
+function validateExternalEligibilitySnapshot(value: TelegramTopicResumeExternalEligibilitySnapshot): void {
+  if (!value || typeof value !== "object" || (value.thread !== null && typeof value.thread !== "object")
+    || typeof value.hasThreadTopicBinding !== "boolean") {
+    throw new Error("Invalid Telegram topic resume external eligibility snapshot");
+  }
+  nonzeroInteger(value.forumChatId, "forumChatId");
+}
+function effectAuthorizing(state: TelegramTopicResumeState): boolean {
+  return state === "reopen_in_flight" || state === "delivery_handoff";
 }
 function isState(value: unknown): value is TelegramTopicResumeState { return Object.hasOwn(LEGAL_TRANSITIONS, String(value)); }
 function state(value: unknown): TelegramTopicResumeState { if (isState(value)) return value; return invalidRow(); }

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,7 +13,10 @@ import { SqliteTelegramJobStore, type TelegramJob } from "../src/telegram-job-st
 import { hashTelegramDeliveryPayload } from "../src/telegram-response-plan.js";
 import { planTelegramTopicRecovery } from "../src/telegram-topic-recovery.js";
 import { planTelegramTopicResume, type TelegramTopicResumeCandidate } from "../src/telegram-topic-resume.js";
-import type { TelegramTopicResumeState } from "../src/telegram-topic-resume-ledger.js";
+import type {
+  TelegramTopicResumeExternalEligibilitySnapshot,
+  TelegramTopicResumeState,
+} from "../src/telegram-topic-resume-ledger.js";
 
 const NOW = 1_700_000_000_000;
 const DESTINATION = { chatId: -100_123, messageThreadId: 41 } as const;
@@ -74,10 +78,25 @@ describe("Telegram existing topic resume ledger", () => {
       actionToken: token(1),
       expectedState: "probe_in_flight",
       state: "delivery_handoff",
+      externalEligibilitySnapshot: externalSnapshot(),
       reasonCode: null,
       nextAttemptAt: null,
       updatedAt: NOW + 31,
     })).toThrow(/readonly/i);
+  });
+
+  it("rejects reservation when the historical anchor attempt count is not exactly one", () => {
+    const fixture = resumable(open());
+    raw(databasePath, (db) => db.prepare(`UPDATE deliveries SET attempt_count = 2
+      WHERE job_id = ? AND part_key = 'status-anchor'`).run(fixture.job.id));
+    const before = snapshot(databasePath, fixture.job.id);
+    const input = reserveInput(fixture, 1);
+
+    expect(() => fixture.store.reserveTopicResume({
+      ...input,
+      candidate: { ...input.candidate, anchorAttemptCount: 2 },
+    })).toThrow();
+    expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
   });
 
   it("allows exactly the prescribed state transitions", () => {
@@ -175,9 +194,90 @@ describe("Telegram existing topic resume ledger", () => {
       jobId: fixture.job.id, expectedVersion: waiting.job.version,
       actionToken: waiting.resume.actionToken, expectedState: "reopen_unknown",
       state: "delivery_handoff", reasonCode: null, nextAttemptAt: null, updatedAt: NOW + 49,
+      externalEligibilitySnapshot: externalSnapshot(),
     })).toThrow("Telegram topic resume conflict");
     expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
   });
+
+  it.each(["reopen_in_flight", "delivery_handoff"] as const)(
+    "requires a fresh external snapshot before entering %s",
+    (state) => {
+      const fixture = reserved(open());
+      const before = snapshot(databasePath, fixture.job.id);
+      const { externalEligibilitySnapshot: _omitted, ...input } = transitionInput(
+        fixture.job.id, fixture.reserved.job.version, fixture.reserved.resume.actionToken,
+        "probe_in_flight", state,
+      );
+      expect(() => fixture.store.transitionTopicResume(input)).toThrow();
+      expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
+    },
+  );
+
+  const revalidationFailures: Array<[
+    string,
+    (fixture: ReservedFixture) => void,
+    Partial<TelegramTopicResumeExternalEligibilitySnapshot>?,
+  ]> = [
+    ["source destination", (fixture) => rewriteSourceDestination(databasePath, fixture.job.id)],
+    ["recovery state", (fixture) => raw(databasePath, (db) => db.prepare(`UPDATE topic_recoveries
+      SET state = 'unknown', reason_code = 'TOPIC_RECOVERY_UNKNOWN' WHERE job_id = ?`).run(fixture.job.id))],
+    ["recovery topic", (fixture) => raw(databasePath, (db) => db.prepare(
+      "UPDATE topic_recoveries SET new_message_thread_id = 42 WHERE job_id = ?",
+    ).run(fixture.job.id))],
+    ["recovery destination", (fixture) => raw(databasePath, (db) => db.prepare(
+      "UPDATE topic_recoveries SET old_message_thread_id = old_message_thread_id + 1 WHERE job_id = ?",
+    ).run(fixture.job.id))],
+    ["recovery version", (fixture) => raw(databasePath, (db) => db.prepare(
+      "UPDATE topic_recoveries SET current_job_version = current_job_version - 1 WHERE job_id = ?",
+    ).run(fixture.job.id))],
+    ["quarantine", (fixture) => insertQuarantine(databasePath, fixture.job.id)],
+    ["anchor plan raw JSON", (fixture) => raw(databasePath, (db) => db.prepare(
+      "UPDATE status_anchor_plans SET payload_json = ' ' || payload_json WHERE job_id = ?",
+    ).run(fixture.job.id))],
+    ["anchor plan hash", (fixture) => raw(databasePath, (db) => db.prepare(
+      "UPDATE status_anchor_plans SET content_hash = ? WHERE job_id = ?",
+    ).run("0".repeat(64), fixture.job.id))],
+    ["anchor state", (fixture) => raw(databasePath, (db) => db.prepare(
+      "UPDATE deliveries SET state = 'pending' WHERE job_id = ? AND part_key = 'status-anchor'",
+    ).run(fixture.job.id))],
+    ["anchor baseline attempt", (fixture) => raw(databasePath, (db) => db.prepare(
+      "UPDATE deliveries SET attempt_count = 2 WHERE job_id = ? AND part_key = 'status-anchor'",
+    ).run(fixture.job.id))],
+    ["follower state", (fixture) => raw(databasePath, (db) => db.prepare(
+      "UPDATE deliveries SET state = 'sending' WHERE job_id = ? AND part_key = 'final:0000'",
+    ).run(fixture.job.id))],
+    ["follower raw JSON", (fixture) => raw(databasePath, (db) => db.prepare(`UPDATE deliveries
+      SET payload_json = ' ' || payload_json WHERE job_id = ? AND part_key = 'final:0000'`).run(fixture.job.id))],
+    ["follower hash", (fixture) => raw(databasePath, (db) => db.prepare(`UPDATE deliveries
+      SET content_hash = ? WHERE job_id = ? AND part_key = 'final:0000'`).run("0".repeat(64), fixture.job.id))],
+    ["follower destination", (fixture) => rewriteFollowerDestination(databasePath, fixture.job.id, false)],
+    ["rich fallback destination", (fixture) => rewriteFollowerDestination(databasePath, fixture.job.id, true)],
+    ["follower ordering", (fixture) => raw(databasePath, (db) => db.prepare(`UPDATE deliveries SET ordinal =
+      CASE part_key WHEN 'final:0000' THEN 1 ELSE 0 END
+      WHERE job_id = ? AND part_key IN ('final:0000', 'notice:0001')`).run(fixture.job.id))],
+    ["missing follower", (fixture) => raw(databasePath, (db) => db.prepare(
+      "DELETE FROM deliveries WHERE job_id = ? AND part_key = 'notice:0001'",
+    ).run(fixture.job.id))],
+    ["thread", () => undefined, { thread: null }],
+    ["forum", () => undefined, { forumChatId: DESTINATION.chatId - 1 }],
+    ["binding", () => undefined, { hasThreadTopicBinding: false }],
+  ];
+  it.each((["reopen_in_flight", "delivery_handoff"] as const).flatMap((state) =>
+    revalidationFailures.map(([name, mutate, external]) => [state, name, mutate, external] as const)))(
+    "rolls back %s when current %s evidence no longer matches",
+    (state, _name, mutate, external = {}) => {
+      const fixture = reserved(open());
+      mutate(fixture);
+      const before = snapshot(databasePath, fixture.job.id);
+      const input = {
+        ...transitionInput(fixture.job.id, fixture.reserved.job.version,
+          fixture.reserved.resume.actionToken, "probe_in_flight", state),
+        externalEligibilitySnapshot: externalSnapshot(external),
+      };
+      expect(() => fixture.store.transitionTopicResume(input)).toThrow("Telegram topic resume conflict");
+      expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
+    },
+  );
 
   it.each([
     ["missing thread", { thread: null }],
@@ -269,6 +369,8 @@ describe("Telegram existing topic resume ledger", () => {
       "probe_in_flight",
       "delivery_handoff",
     ));
+    raw(databasePath, (db) => db.prepare(`UPDATE deliveries SET updated_at_ms = ?
+      WHERE job_id = ? AND part_key = 'status-anchor'`).run(handoff.resume.updatedAt, fixture.job.id));
     const before = snapshot(databasePath, fixture.job.id);
 
     expect(fixture.store.settleTopicResumeDelivery({
@@ -280,10 +382,41 @@ describe("Telegram existing topic resume ledger", () => {
     expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
   });
 
+  it.each(["failed", "uncertain"] as const)(
+    "does not treat an attempt-one %s anchor as post-handoff after an unrelated job advance",
+    (state) => {
+      const fixture = reserved(open());
+      const handoff = fixture.store.transitionTopicResume(transitionInput(
+        fixture.job.id, fixture.reserved.job.version, fixture.reserved.resume.actionToken,
+        "probe_in_flight", "delivery_handoff",
+      ));
+      raw(databasePath, (db) => db.prepare(`UPDATE deliveries
+        SET state = ?, attempt_count = 1, updated_at_ms = ?
+        WHERE job_id = ? AND part_key = 'status-anchor'`).run(
+        state, handoff.resume.updatedAt, fixture.job.id,
+      ));
+      const advanced = fixture.store.transition({
+        jobId: fixture.job.id,
+        eventId: `unrelated-job-advance-${state}`,
+        expectedVersion: handoff.job.version,
+        event: { schemaVersion: 1, type: "delivery.changed", eventAt: handoff.resume.updatedAt },
+      });
+      const before = snapshot(databasePath, fixture.job.id);
+
+      expect(fixture.store.settleTopicResumeDelivery({
+        jobId: fixture.job.id,
+        expectedVersion: advanced.version,
+        actionToken: handoff.resume.actionToken,
+        updatedAt: NOW + 32,
+      })).toEqual(handoff.resume);
+      expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
+    },
+  );
+
   it.each([
     ["failed", "TOPIC_RESUME_DELIVERY_FAILED"],
     ["uncertain", "TOPIC_RESUME_DELIVERY_UNCERTAIN"],
-  ] as const)("settles a later %s anchor without changing the job", (state, reasonCode) => {
+  ] as const)("settles a causally later same-millisecond %s anchor without changing the job", (state, reasonCode) => {
     const fixture = reserved(open());
     const handoff = fixture.store.transitionTopicResume(transitionInput(
       fixture.job.id, fixture.reserved.job.version, fixture.reserved.resume.actionToken,
@@ -292,18 +425,18 @@ describe("Telegram existing topic resume ledger", () => {
     const sending = fixture.store.transitionDeliveryAndProject({
       jobId: fixture.job.id, partKey: "status-anchor", expectedJobVersion: handoff.job.version,
       expectedState: "failed", expectedAttemptCount: 1, state: "sending", attemptCount: 1,
-      allowFailedRetry: true, eventId: `anchor-retry-${state}`, updatedAt: NOW + 32,
+      allowFailedRetry: true, eventId: `anchor-retry-${state}`, updatedAt: NOW + 31,
     });
     const terminal = fixture.store.transitionDeliveryAndProject({
       jobId: fixture.job.id, partKey: "status-anchor", expectedJobVersion: sending.job.version,
       expectedState: "sending", expectedAttemptCount: 1, state, attemptCount: 2,
-      lastErrorCode: "telegram_permanent", eventId: `anchor-${state}`, updatedAt: NOW + 33,
+      lastErrorCode: "telegram_permanent", eventId: `anchor-${state}`, updatedAt: NOW + 31,
     });
     const jobBefore = fixture.store.get(fixture.job.id);
 
     expect(fixture.store.settleTopicResumeDelivery({
       jobId: fixture.job.id, expectedVersion: terminal.job.version,
-      actionToken: handoff.resume.actionToken, updatedAt: NOW + 34,
+      actionToken: handoff.resume.actionToken, updatedAt: NOW + 31,
     })).toMatchObject({ state: "failed", reasonCode, currentJobVersion: terminal.job.version });
     expect(fixture.store.get(fixture.job.id)).toEqual(jobBefore);
   });
@@ -385,6 +518,20 @@ function reserveInput(
   };
 }
 
+function externalSnapshot(
+  override: Partial<TelegramTopicResumeExternalEligibilitySnapshot> = {},
+): TelegramTopicResumeExternalEligibilitySnapshot {
+  return {
+    thread: {
+      id: THREAD_ID, title: "Resume topic", cwd: "/work/telecodex", model: null, modelProvider: null,
+      createdAt: new Date(0), updatedAt: new Date(0), firstUserMessage: "request",
+    },
+    forumChatId: DESTINATION.chatId,
+    hasThreadTopicBinding: true,
+    ...override,
+  };
+}
+
 function transitionInput(
   jobId: string,
   expectedVersion: number,
@@ -399,6 +546,9 @@ function transitionInput(
     ? expectedState === "probe_in_flight" ? "TOPIC_RESUME_SOURCE_MISSING" : "TOPIC_RESUME_REOPEN_FAILED"
     : state === "reopen_unknown" && expectedState !== "reopen_unknown" ? "TOPIC_RESUME_REOPEN_UNKNOWN"
     : retry;
+  const external = state === "reopen_in_flight" || state === "delivery_handoff"
+    ? { externalEligibilitySnapshot: externalSnapshot() }
+    : {};
   return {
     jobId,
     expectedVersion,
@@ -408,6 +558,7 @@ function transitionInput(
     reasonCode,
     nextAttemptAt: retry ? NOW + 40 : null,
     updatedAt: NOW + 31,
+    ...external,
   } as const;
 }
 
@@ -535,6 +686,45 @@ function deliverAllAndFinalize(store: SqliteTelegramJobStore, initial: TelegramJ
   return store.finalizeDeliveredPlan({
     jobId: job.id, expectedVersion: job.version, eventId: "resume-finalize", eventAt: updatedAt,
   })!;
+}
+
+function rewriteSourceDestination(databasePath: string, jobId: string): void {
+  raw(databasePath, (database) => {
+    const row = database.prepare("SELECT source_json FROM inbox_updates WHERE job_id = ?")
+      .get(jobId) as { source_json: string };
+    const source = JSON.parse(row.source_json) as { messageThreadId: number };
+    source.messageThreadId += 1;
+    database.prepare("UPDATE inbox_updates SET source_json = ? WHERE job_id = ?")
+      .run(JSON.stringify(source), jobId);
+  });
+}
+
+function rewriteFollowerDestination(databasePath: string, jobId: string, fallback: boolean): void {
+  raw(databasePath, (database) => {
+    const partKey = fallback ? "final:0000" : "notice:0001";
+    const row = database.prepare("SELECT payload_json FROM deliveries WHERE job_id = ? AND part_key = ?")
+      .get(jobId, partKey) as { payload_json: string };
+    const payload = JSON.parse(row.payload_json) as {
+      messageThreadId: number;
+      fallbackParts?: Array<{ payload: { messageThreadId: number } }>;
+    };
+    if (fallback) payload.fallbackParts![0]!.payload.messageThreadId += 1;
+    else payload.messageThreadId += 1;
+    database.prepare(`UPDATE deliveries SET payload_json = ?, content_hash = ?
+      WHERE job_id = ? AND part_key = ?`).run(
+      JSON.stringify(payload), hashRawPayload(payload), jobId, partKey,
+    );
+  });
+}
+
+function hashRawPayload(payload: unknown): string {
+  return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+}
+
+function insertQuarantine(databasePath: string, jobId: string): void {
+  raw(databasePath, (database) => database.prepare(`INSERT INTO job_quarantine
+    (job_id, reason_code, fingerprint, quarantined_at_ms) VALUES (?, 'TEST', ?, ?)`)
+    .run(jobId, "f".repeat(64), NOW + 31));
 }
 
 function snapshot(databasePath: string, jobId: string): unknown {

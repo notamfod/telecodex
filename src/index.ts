@@ -41,6 +41,7 @@ import {
   type TelegramReliabilityRuntime,
 } from "./telegram-reliability-runtime.js";
 import { createTelegramTopicRecoveryAdapter } from "./telegram-topic-recovery-adapter.js";
+import { createTelegramTopicResumeAdapter } from "./telegram-topic-resume-adapter.js";
 import { createTelegramGuardianRuntimeFacade }
   from "./telegram-guardian-reconciliation.js";
 import type { TelegramCompletionProcessor } from "./telegram-inbox-completion.js";
@@ -170,6 +171,13 @@ try {
         console.warn(`Telegram topic recovery: ${reasonCode}`);
       },
     });
+    const topicResume = config.telegramTopicResumeEnabled
+      ? createTelegramTopicResumeAdapter({
+          token: config.telegramBotToken,
+          forumChatId: config.telegramForumChatId ?? 0,
+          registry,
+        })
+      : undefined;
     reliabilityRuntime = createTelegramReliabilityRuntime({
       store: canonicalJobStore,
       registry,
@@ -208,6 +216,12 @@ try {
       deliveryTimeoutMs: config.reliabilityTimeouts.telegramDeliveryMs,
       maxAttempts: config.telegramJobs.maxAttempts,
       ...(topicRecovery ? { topicRecovery } : {}),
+      ...(topicResume ? {
+        topicResume: {
+          ...topicResume,
+          operationTimeoutMs: config.reliabilityTimeouts.telegramDeliveryMs,
+        },
+      } : {}),
       prepareCompletion: async (input) => {
         if (!completionProcessor) throw new Error("Telegram completion processor is unavailable");
         return completionProcessor(input);

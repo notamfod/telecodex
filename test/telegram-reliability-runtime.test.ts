@@ -74,6 +74,113 @@ describe("Telegram reliability runtime", () => {
     expect(listRecoveries).toHaveBeenCalledWith(["complete"]);
   });
 
+  it("owns optional topic resume reconciliation only when composed", async () => {
+    const harness = createHarness(store, directory);
+    const listResumes = vi.spyOn(store, "listTopicResumes");
+    runtime = createTelegramReliabilityRuntime({
+      ...harness.options,
+      topicResume: {
+        forumChatId: -1001,
+        classifyForumTopic: vi.fn(async () => "live" as const),
+        reopenForumTopic: vi.fn(async () => true as const),
+        getThread: vi.fn(() => null),
+        hasThreadTopicBinding: vi.fn(() => false),
+        scheduleWakeup: vi.fn(),
+      },
+    });
+
+    await runtime.reconcile();
+
+    expect(listResumes).toHaveBeenCalledWith(["reopen_in_flight"]);
+    expect(listResumes).toHaveBeenCalledWith(["probe_in_flight"]);
+    expect(listResumes).toHaveBeenCalledWith(["probe_retry_wait", "reopen_retry_wait"]);
+    expect(listResumes).toHaveBeenCalledWith(["reopen_unknown"]);
+    expect(listResumes).toHaveBeenCalledWith(["delivery_handoff"]);
+  });
+
+  it("keeps topic resume absent and unreachable when it is not composed", async () => {
+    const harness = createHarness(store, directory);
+    const listResumes = vi.spyOn(store, "listTopicResumes");
+    runtime = createTelegramReliabilityRuntime(harness.options);
+
+    const accepted = await runtime.handle(source());
+    await runtime.reconcile();
+    const snapshot = await runtime.loadDashboardReliability();
+    const projection = snapshot.jobs.find(({ projection: value }) =>
+      value.jobId === accepted.job.id)!.projection;
+    expect(listResumes).not.toHaveBeenCalled();
+    expect(JSON.stringify(projection.actions)).not.toContain("resume_existing_topic");
+  });
+
+  it("reconciles topic resume only after a scheduled delivery pump finishes", async () => {
+    const harness = createHarness(store, directory);
+    const listResumes = vi.spyOn(store, "listTopicResumes");
+    let clock = NOW;
+    let scheduledWake!: () => void | Promise<void>;
+    let releaseDelivery!: () => void;
+    let deliveryStarted!: () => void;
+    const started = new Promise<void>((resolve) => { deliveryStarted = resolve; });
+    let call = 0;
+    harness.delivery.deliver.mockImplementation(async () => {
+      call += 1;
+      if (call === 1) throw new TelegramDeliveryApiError("retry_after", 1_000);
+      if (call === 2) {
+        deliveryStarted();
+        await new Promise<void>((resolve) => { releaseDelivery = resolve; });
+      }
+      return { messageId: 500 + call };
+    });
+    runtime = createTelegramReliabilityRuntime({
+      ...harness.options,
+      now: () => clock,
+      scheduleDeliveryWakeup: (_at, wake) => { scheduledWake = wake; },
+      topicResume: {
+        forumChatId: -1001,
+        classifyForumTopic: vi.fn(async () => "live" as const),
+        reopenForumTopic: vi.fn(async () => true as const),
+        getThread: vi.fn(() => null),
+        hasThreadTopicBinding: vi.fn(() => false),
+        scheduleWakeup: vi.fn(),
+      },
+    });
+
+    await runtime.handle(source({ updateId: 2, messageId: 2 }));
+    const callsBeforeWake = listResumes.mock.calls.length;
+    clock += 1_000;
+    const waking = Promise.resolve(scheduledWake());
+    await started;
+
+    expect(listResumes.mock.calls).toHaveLength(callsBeforeWake);
+    releaseDelivery();
+    await waking;
+    expect(listResumes.mock.calls.length).toBeGreaterThan(callsBeforeWake);
+  });
+
+  it("reconciles topic resume only after an automatic delivery pump finishes", async () => {
+    const harness = createHarness(store, directory);
+    const listResumes = vi.spyOn(store, "listTopicResumes");
+    let releaseDelivery!: () => void;
+    let deliveryStarted!: () => void;
+    const started = new Promise<void>((resolve) => { deliveryStarted = resolve; });
+    harness.delivery.deliver.mockImplementationOnce(async () => {
+      deliveryStarted();
+      await new Promise<void>((resolve) => { releaseDelivery = resolve; });
+      return { messageId: 601 };
+    });
+    runtime = createTelegramReliabilityRuntime({
+      ...harness.options,
+      topicResume: dormantTopicResumeOptions(),
+    });
+
+    const handling = runtime.handle(source({ updateId: 3, messageId: 3 }));
+    await started;
+
+    expect(listResumes).not.toHaveBeenCalled();
+    releaseDelivery();
+    await handling;
+    expect(listResumes).toHaveBeenCalled();
+  });
+
   it("drains a scheduled recovery outbox pump before shutdown can close the store", async () => {
     const recovery = seedDueTopicRecovery(store);
     vi.spyOn(store, "scanReconciliationCandidates").mockReturnValue({
@@ -127,6 +234,50 @@ describe("Telegram reliability runtime", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(storeMethods.map((spy) => spy.mock.calls.length)).toEqual(callsAtResolution);
     runtime = null;
+  });
+
+  it("reconciles topic resume only after a recovery-triggered outbox pump finishes", async () => {
+    const recovery = seedDueTopicRecovery(store);
+    vi.spyOn(store, "scanReconciliationCandidates").mockReturnValue({
+      jobs: [], quarantined: [], nextCursor: null,
+    });
+    const harness = createHarness(store, directory);
+    const listResumes = vi.spyOn(store, "listTopicResumes");
+    let scheduledWake!: () => void | Promise<void>;
+    let deliveryStarted!: () => void;
+    let releaseDelivery!: () => void;
+    const started = new Promise<void>((resolve) => { deliveryStarted = resolve; });
+    runtime = createTelegramReliabilityRuntime({
+      ...harness.options,
+      topicRecovery: {
+        forumChatId: recovery.oldDestination.chatId,
+        hasThreadTopicBinding: vi.fn((_threadId, destination) =>
+          destination.messageThreadId === recovery.oldDestination.messageThreadId),
+        probeForumTopic: vi.fn(async () => false),
+        createForumTopic: vi.fn(async () => recovery.newDestination),
+        getThread: vi.fn(() => structuredClone(recovery.thread)),
+        rebindThreadTopic: vi.fn(),
+        sendWelcome: vi.fn(async () => undefined),
+        scheduleWakeup: (_at, wake) => { scheduledWake = wake; },
+        reportReason: vi.fn(),
+      },
+      topicResume: dormantTopicResumeOptions(),
+    });
+    await runtime.reconcile();
+    const resumeCallsBeforeWake = listResumes.mock.calls.length;
+    harness.delivery.deliver.mockImplementationOnce(async () => {
+      deliveryStarted();
+      await new Promise<void>((resolve) => { releaseDelivery = resolve; });
+      return { messageId: 602 };
+    });
+
+    const waking = Promise.resolve(scheduledWake());
+    await started;
+
+    expect(listResumes.mock.calls).toHaveLength(resumeCallsBeforeWake);
+    releaseDelivery();
+    await waking;
+    expect(listResumes.mock.calls.length).toBeGreaterThan(resumeCallsBeforeWake);
   });
 
   it("uses urgent physical status writes for explicit and Dashboard refreshes", async () => {
@@ -1226,6 +1377,8 @@ describe("Telegram reliability runtime", () => {
 
   it("uses the current Dashboard delivery retry to recover an installed missing anchor", async () => {
     const harness = createHarness(store, directory);
+    const listResumes = vi.spyOn(store, "listTopicResumes");
+    harness.options.topicResume = dormantTopicResumeOptions();
     harness.options.prepareCompletion = vi.fn(async ({ result }) => ({
       result,
       supplementalParts: [{
@@ -1264,6 +1417,7 @@ describe("Telegram reliability runtime", () => {
     await expect(runtime.runDashboardAction({ ...action, expectedVersion: action.expectedVersion - 1 }))
       .rejects.toThrow("Dashboard action is no longer legal");
     expect(harness.delivery.deliver).not.toHaveBeenCalled();
+    const resumeCallsBeforeRetry = listResumes.mock.calls.length;
     await runtime.runDashboardAction(action);
 
     expect(harness.delivery.deliver.mock.calls.map(([payload]) => payload.operation)).toEqual([
@@ -1275,10 +1429,92 @@ describe("Telegram reliability runtime", () => {
     expect(store.get(accepted.job.id)).toMatchObject({ phase: "terminal", outcome: "completed" });
     expect(harness.session.prompt).not.toHaveBeenCalled();
     expect(harness.session.recoverPrompt).not.toHaveBeenCalled();
+    expect(listResumes.mock.calls.length).toBeGreaterThan(resumeCallsBeforeRetry);
+  });
+
+  it("reconciles topic resume after an explicit uncertain-delivery resend", async () => {
+    const seeded = seedTopicRecoveryCandidate(store);
+    let job = store.get(seeded.candidate.jobId)!;
+    const anchor = store.listDeliveries(job.id).find((part) =>
+      part.partKey === "status-anchor")!;
+    const anchorSending = store.transitionDeliveryAndProject({
+      jobId: job.id,
+      partKey: anchor.partKey,
+      expectedJobVersion: job.version,
+      expectedState: "failed",
+      expectedAttemptCount: anchor.attemptCount,
+      state: "sending",
+      attemptCount: anchor.attemptCount,
+      allowFailedRetry: true,
+      nextAttemptAt: NOW + 1_000,
+      eventId: "explicit-resend-anchor-sending",
+      updatedAt: NOW,
+    });
+    const anchorDelivered = store.transitionDeliveryAndProject({
+      jobId: job.id,
+      partKey: anchor.partKey,
+      expectedJobVersion: anchorSending.job.version,
+      expectedState: "sending",
+      expectedAttemptCount: anchor.attemptCount,
+      state: "delivered",
+      attemptCount: anchor.attemptCount + 1,
+      telegramMessageId: 701,
+      eventId: "explicit-resend-anchor-delivered",
+      updatedAt: NOW,
+    });
+    const follower = store.listDeliveries(job.id).find((part) =>
+      part.partKey !== "status-anchor")!;
+    const followerSending = store.transitionDeliveryAndProject({
+      jobId: job.id,
+      partKey: follower.partKey,
+      expectedJobVersion: anchorDelivered.job.version,
+      expectedState: "pending",
+      expectedAttemptCount: follower.attemptCount,
+      state: "sending",
+      attemptCount: follower.attemptCount,
+      nextAttemptAt: NOW + 1_000,
+      eventId: "explicit-resend-follower-sending",
+      updatedAt: NOW,
+    });
+    store.transitionDeliveryAndProject({
+      jobId: job.id,
+      partKey: follower.partKey,
+      expectedJobVersion: followerSending.job.version,
+      expectedState: "sending",
+      expectedAttemptCount: follower.attemptCount,
+      state: "uncertain",
+      attemptCount: follower.attemptCount + 1,
+      lastErrorCode: "telegram_send_uncertain",
+      attention: {
+        kind: "required",
+        code: "telegram_delivery_uncertain",
+        actions: ["send_again", "inspect"],
+      },
+      eventId: "explicit-resend-follower-uncertain",
+      updatedAt: NOW,
+    });
+    const harness = createHarness(store, directory);
+    const listResumes = vi.spyOn(store, "listTopicResumes");
+    harness.options.topicResume = dormantTopicResumeOptions();
+    runtime = createTelegramReliabilityRuntime(harness.options);
+    const snapshot = await runtime.loadDashboardReliability();
+    const projection = snapshot.jobs.find(({ projection: value }) =>
+      value.jobId === seeded.candidate.jobId)!.projection;
+    expect(projection.state).toBe("delivery_uncertain");
+    const resend = projection.actions.find((candidate) =>
+      candidate.kind === "send_again_warning")!;
+    harness.delivery.deliver.mockResolvedValue({ messageId: 799 });
+    const resumeCallsBeforeResend = listResumes.mock.calls.length;
+
+    await runtime.runDashboardAction(resend);
+
+    expect(listResumes.mock.calls.length).toBeGreaterThan(resumeCallsBeforeResend);
   });
 
   it("rejects a Dashboard delivery retry raced after validation before any Telegram call", async () => {
     const harness = createHarness(store, directory);
+    const listResumes = vi.spyOn(store, "listTopicResumes");
+    harness.options.topicResume = dormantTopicResumeOptions();
     harness.options.prepareCompletion = vi.fn(async ({ result }) => ({
       result,
       supplementalParts: [{
@@ -1317,6 +1553,7 @@ describe("Telegram reliability runtime", () => {
       return inspect(threadId);
     });
 
+    const resumeCallsBeforeRetry = listResumes.mock.calls.length;
     const retrying = runtime.runDashboardAction(action);
     await inspectionStarted;
     const current = store.get(accepted.job.id)!;
@@ -1332,6 +1569,7 @@ describe("Telegram reliability runtime", () => {
     expect(harness.delivery.deliver).not.toHaveBeenCalled();
     expect(store.listDeliveries(accepted.job.id).find((part) => part.partKey === "status-anchor"))
       .toMatchObject({ state: "failed" });
+    expect(listResumes.mock.calls.length).toBeGreaterThan(resumeCallsBeforeRetry);
   });
 
   it("preserves the last Guardian scan and reports a connected stale scanner", async () => {
@@ -1641,6 +1879,17 @@ function recoveryOptions(seeded: ReturnType<typeof seedTopicRecoveryCandidate>) 
       scheduleWakeup: vi.fn(),
       reportReason: vi.fn(),
     } satisfies NonNullable<TelegramReliabilityRuntimeOptions["topicRecovery"]>,
+  };
+}
+
+function dormantTopicResumeOptions(): NonNullable<TelegramReliabilityRuntimeOptions["topicResume"]> {
+  return {
+    forumChatId: -1001,
+    classifyForumTopic: vi.fn(async () => "live" as const),
+    reopenForumTopic: vi.fn(async () => true as const),
+    getThread: vi.fn(() => null),
+    hasThreadTopicBinding: vi.fn(() => false),
+    scheduleWakeup: vi.fn(),
   };
 }
 

@@ -84,6 +84,7 @@ export interface TeleCodexConfig {
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
   telegramTopicRecoveryEnabled: boolean;
+  telegramTopicResumeEnabled: boolean;
   telegramForumChatId?: number;
   statusBoardIntervalMs: number;
   miniApp?: MiniAppConfig;
@@ -164,6 +165,11 @@ export function loadConfig(): TeleCodexConfig {
     optionalString(process.env.TELEGRAM_TOPIC_RECOVERY_ENABLED),
     false,
     { strict: true, name: "TELEGRAM_TOPIC_RECOVERY_ENABLED" },
+  );
+  const telegramTopicResumeEnabled = parseBooleanEnv(
+    process.env.TELEGRAM_TOPIC_RESUME_ENABLED,
+    false,
+    { strict: true, name: "TELEGRAM_TOPIC_RESUME_ENABLED" },
   );
   const telegramForumChatId = parseTelegramForumChatId(
     optionalString(process.env.TELEGRAM_FORUM_CHAT_ID),
@@ -247,6 +253,7 @@ export function loadConfig(): TeleCodexConfig {
     enableTelegramLogin,
     enableTelegramReactions,
     telegramTopicRecoveryEnabled,
+    telegramTopicResumeEnabled,
     telegramForumChatId,
     statusBoardIntervalMs,
     miniApp,
@@ -569,15 +576,15 @@ function parseBooleanEnv(
   defaultValue: boolean,
   options: { readonly strict?: boolean; readonly name?: string } = {},
 ): boolean {
-  if (!raw) {
+  if (raw === undefined || (!options.strict && raw === "")) {
     return defaultValue;
   }
 
-  const lower = raw.toLowerCase();
-  if (lower === "true" || (!options.strict && (lower === "1" || lower === "yes"))) {
+  const value = options.strict ? raw : raw.toLowerCase();
+  if (value === "true" || (!options.strict && (value === "1" || value === "yes"))) {
     return true;
   }
-  if (lower === "false" || (!options.strict && (lower === "0" || lower === "no"))) {
+  if (value === "false" || (!options.strict && (value === "0" || value === "no"))) {
     return false;
   }
 

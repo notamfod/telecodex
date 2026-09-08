@@ -39,6 +39,7 @@ describe("loadConfig", () => {
     delete process.env.TELEGRAM_MAX_ACTIVE_TOPICS;
     delete process.env.TELEGRAM_PROGRESS_HEARTBEAT_SECONDS;
     delete process.env.TELEGRAM_TOPIC_RECOVERY_ENABLED;
+    delete process.env.TELEGRAM_TOPIC_RESUME_ENABLED;
     delete process.env.STATUS_BOARD_INTERVAL_SECONDS;
     delete process.env.TELEGRAM_JOB_STORE_MODE;
     delete process.env.TELEGRAM_JOB_DB_PATH;
@@ -153,6 +154,7 @@ describe("loadConfig", () => {
       enableTelegramLogin: false,
       enableTelegramReactions: false,
       telegramTopicRecoveryEnabled: false,
+      telegramTopicResumeEnabled: false,
       telegramForumChatId: -1001234567890,
       topicSyncIntervalMs: 15_000,
       topicSyncEnabled: true,
@@ -219,6 +221,7 @@ describe("loadConfig", () => {
     expect(config.enableTelegramLogin).toBe(false);
     expect(config.enableTelegramReactions).toBe(false);
     expect(config.telegramTopicRecoveryEnabled).toBe(false);
+    expect(config.telegramTopicResumeEnabled).toBe(false);
     expect(config.telegramForumChatId).toBeUndefined();
     expect(config.topicSyncIntervalMs).toBe(30_000);
     expect(config.telegramMaxActiveTopics).toBe(4);
@@ -640,7 +643,7 @@ describe("loadConfig", () => {
     expect(loadConfig().telegramTopicRecoveryEnabled).toBe(true);
   });
 
-  it.each(["1", "yes", "TRUE-ish", "x".repeat(256)])(
+  it.each(["1", "yes", "TRUE", "False", "TRUE-ish", "x".repeat(256)])(
     "fails closed for invalid TELEGRAM_TOPIC_RECOVERY_ENABLED=%s",
     (value) => {
       process.env.TELEGRAM_BOT_TOKEN = "bot-token";
@@ -652,6 +655,35 @@ describe("loadConfig", () => {
       expect(warning).toHaveBeenCalledOnce();
       expect(warning.mock.calls[0]?.[0]).toMatch(/^Invalid boolean env value: .{1,160}$/);
       expect(warning.mock.calls[0]?.[0]).not.toContain(value);
+    },
+  );
+
+  it("keeps Telegram topic resume disabled unless explicitly enabled", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+
+    expect(loadConfig().telegramTopicResumeEnabled).toBe(false);
+
+    process.env.TELEGRAM_TOPIC_RESUME_ENABLED = "true";
+    expect(loadConfig().telegramTopicResumeEnabled).toBe(true);
+
+    process.env.TELEGRAM_TOPIC_RESUME_ENABLED = "false";
+    expect(loadConfig().telegramTopicResumeEnabled).toBe(false);
+  });
+
+  it.each(["", " ", " true", "true ", " false ", "1", "yes", "TRUE", "False", "TRUE-ish", "x".repeat(256)])(
+    "fails closed for invalid TELEGRAM_TOPIC_RESUME_ENABLED=%s",
+    (value) => {
+      process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+      process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+      process.env.TELEGRAM_TOPIC_RESUME_ENABLED = value;
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      expect(loadConfig().telegramTopicResumeEnabled).toBe(false);
+      expect(warning).toHaveBeenCalledOnce();
+      expect(warning.mock.calls[0]?.[0]).toBe(
+        "Invalid boolean env value: TELEGRAM_TOPIC_RESUME_ENABLED. Falling back to false.",
+      );
     },
   );
 

@@ -52,6 +52,11 @@ import {
   createTelegramTopicRecoveryRuntime,
   type TelegramTopicRecoveryRuntimeOptions,
 } from "./telegram-topic-recovery-runtime.js";
+import {
+  createTelegramTopicResumeRuntime,
+  type TelegramTopicResumeRuntime,
+  type TelegramTopicResumeRuntimeOptions,
+} from "./telegram-topic-resume-runtime.js";
 import type { TelegramTurnResult } from "./telegram-turn-result.js";
 
 const DASHBOARD_JOB_LIMIT = 200;
@@ -132,6 +137,10 @@ export interface TelegramReliabilityRuntimeOptions {
   readonly scheduleCoordinatorWakeup?: Wakeup;
   readonly scheduleDeliveryWakeup?: Wakeup;
   readonly topicRecovery?: Omit<TelegramTopicRecoveryRuntimeOptions, "store" | "outboxPump">;
+  readonly topicResume?: Omit<
+    TelegramTopicResumeRuntimeOptions,
+    "store" | "outboxRetryFailed" | "outboxPump" | "trackEffect"
+  >;
   readonly onRuntimeError?: (input: TelegramReliabilityRuntimeErrorContext) => void;
 }
 
@@ -167,9 +176,11 @@ export function createTelegramReliabilityRuntime(
   );
   const effects = new Map<string, Promise<void>>();
   const topicRecoveryEffects = new Set<Promise<void>>();
+  const topicResumeEffects = new Set<Promise<void>>();
   const turns = new Map<string, Promise<void>>();
   const statusCutovers = new Set<string>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
+  let topicResume: TelegramTopicResumeRuntime | undefined;
   let disposed = false;
 
   const report = (
@@ -186,16 +197,22 @@ export function createTelegramReliabilityRuntime(
   const schedule = (
     provided: Wakeup | undefined,
     operation: TelegramReliabilityRuntimeOperation,
+    afterWake?: () => Promise<void>,
   ): Wakeup => provided
     ? (at, wake) => provided(at, async () => {
-        if (!disposed) await Promise.resolve(wake()).catch((error) => report(null, operation, error));
+        if (disposed) return;
+        await Promise.resolve(wake()).catch((error) => report(null, operation, error));
+        if (!disposed) await afterWake?.().catch((error) => report(null, operation, error));
       })
     : (at, wake) => {
         const delay = Math.max(0, at - now());
         const timer = setTimeout(() => {
           timers.delete(timer);
           if (!disposed) {
-            void Promise.resolve(wake()).catch((error) => report(null, operation, error));
+            void Promise.resolve(wake())
+              .catch((error) => report(null, operation, error))
+              .then(() => disposed ? undefined : afterWake?.())
+              .catch((error) => report(null, operation, error));
           }
         }, delay);
         timers.add(timer);
@@ -243,7 +260,11 @@ export function createTelegramReliabilityRuntime(
       },
     },
     now, createId,
-    scheduleWakeup: schedule(options.scheduleDeliveryWakeup, "delivery"),
+    scheduleWakeup: schedule(
+      options.scheduleDeliveryWakeup,
+      "delivery",
+      async () => { await topicResume?.reconcile(); },
+    ),
     timeoutMs: options.deliveryTimeoutMs,
     attemptLimit: options.deliveryAttemptLimit,
     attachmentRoot: options.attachmentRoot ?? options.materializationRoot,
@@ -257,12 +278,53 @@ export function createTelegramReliabilityRuntime(
     topicRecoveryEffects.add(drain);
     void drain.finally(() => topicRecoveryEffects.delete(drain));
   };
+  const runOutboxAndReconcileTopicResume = async (
+    operation: () => Promise<void>,
+  ): Promise<void> => {
+    let operationFailed = false;
+    try {
+      await operation();
+    } catch (error) {
+      operationFailed = true;
+      throw error;
+    } finally {
+      if (!disposed) {
+        try {
+          await topicResume?.reconcile();
+        } catch (error) {
+          if (!operationFailed) throw error;
+          report(null, "reconciliation", error);
+        }
+      }
+    }
+  };
+  const pumpOutboxAndReconcileTopicResume = () => runOutboxAndReconcileTopicResume(
+    () => outbox.pump(),
+  );
   const topicRecovery = options.topicRecovery
     ? createTelegramTopicRecoveryRuntime({
         ...options.topicRecovery,
         store,
-        outboxPump: () => outbox.pump(),
+        outboxPump: pumpOutboxAndReconcileTopicResume,
         trackEffect: trackTopicRecoveryEffect,
+      })
+    : undefined;
+  const trackTopicResumeEffect = (effect: Promise<void>): void => {
+    const drain = effect.catch(() => undefined);
+    topicResumeEffects.add(drain);
+    void drain.finally(() => topicResumeEffects.delete(drain));
+  };
+  topicResume = options.topicResume
+    ? createTelegramTopicResumeRuntime({
+        ...options.topicResume,
+        store,
+        outboxRetryFailed: (jobId, partKey, expectedJobVersion) => outbox.retryFailed(
+          jobId,
+          partKey,
+          { expectedJobVersion },
+        ),
+        outboxPump: () => outbox.pump(),
+        trackEffect: trackTopicResumeEffect,
       })
     : undefined;
   const session = trackedAdapter(createTelegramSessionCodexAdapter({
@@ -377,7 +439,7 @@ export function createTelegramReliabilityRuntime(
         return;
       }
     }
-    if (job.phase === "delivering") await outbox.pump();
+    if (job.phase === "delivering") await pumpOutboxAndReconcileTopicResume();
   };
   const afterTransition = (job: TelegramJob): void => {
     if (job.phase === "delivering" && job.turnResult) {
@@ -563,6 +625,7 @@ export function createTelegramReliabilityRuntime(
       assertRunning(disposed);
       let result: Awaited<ReturnType<typeof runReconciliation>>;
       try {
+        await topicResume?.reconcile();
         await topicRecovery?.reconcile();
         await reconcileTargetProvisions();
         releasePersistedRetryParents();
@@ -573,7 +636,7 @@ export function createTelegramReliabilityRuntime(
         throw error;
       }
       try {
-        await outbox.pump();
+        await pumpOutboxAndReconcileTopicResume();
       } catch (error) {
         report(null, "delivery", error);
         throw error;
@@ -731,13 +794,17 @@ export function createTelegramReliabilityRuntime(
         return;
       }
       if (action.kind === "send_again_warning" && action.partKey) {
-        await outbox.sendAgainWithWarning(action.jobId, action.partKey);
+        await runOutboxAndReconcileTopicResume(
+          () => outbox.sendAgainWithWarning(action.jobId, action.partKey!),
+        );
         return;
       }
       if (action.kind === "retry_delivery" && action.partKey) {
-        await outbox.retryFailed(action.jobId, action.partKey, {
-          expectedJobVersion: action.expectedVersion,
-        });
+        await runOutboxAndReconcileTopicResume(
+          () => outbox.retryFailed(action.jobId, action.partKey!, {
+            expectedJobVersion: action.expectedVersion,
+          }),
+        );
         return;
       }
       if (action.kind === "retry_new_turn") {
@@ -758,13 +825,19 @@ export function createTelegramReliabilityRuntime(
     async dispose() {
       if (disposed) return;
       disposed = true;
+      topicResume?.dispose();
       topicRecovery?.dispose();
       coordinator.dispose();
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
-      await Promise.allSettled([...effects.values(), ...topicRecoveryEffects]);
+      await Promise.allSettled([
+        ...effects.values(),
+        ...topicRecoveryEffects,
+        ...topicResumeEffects,
+      ]);
       effects.clear();
       topicRecoveryEffects.clear();
+      topicResumeEffects.clear();
       turns.clear();
       statusCutovers.clear();
       await status.dispose();

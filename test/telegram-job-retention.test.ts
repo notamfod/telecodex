@@ -30,6 +30,7 @@ describe("Telegram job retention", () => {
   it("keeps payload for seven days, then retains only safe event metadata until day ninety", () => {
     const relativePath = "job-one/attachment.txt";
     seedDelivered(store, "job-one", 1, BASE, relativePath);
+    insertCompletedResume(databasePath, store.get("job-one")!);
 
     expect(store.runRetention(retention(BASE + 7 * DAY - 1))).toMatchObject({
       payloadsPurged: 0,
@@ -94,6 +95,7 @@ describe("Telegram job retention", () => {
     expect(store.runRetention(retention(BASE + 90 * DAY - 1))).toMatchObject({ jobsDeleted: 0 });
     expect(store.runRetention(retention(BASE + 90 * DAY))).toMatchObject({ jobsDeleted: 1 });
     expect(store.get("job-one")).toBeNull();
+    expect(resumeAttemptCount(databasePath)).toBe(0);
     expect(store.listEventSummaries("job-one")).toEqual([]);
   });
 
@@ -441,6 +443,31 @@ function quarantine(databasePath: string, jobId: string): void {
       (job_id, reason_code, fingerprint, quarantined_at_ms) VALUES (?, ?, ?, ?)`).run(
       jobId, "TEST_QUARANTINE", "fingerprint", BASE,
     );
+  } finally {
+    database.close();
+  }
+}
+
+function insertCompletedResume(databasePath: string, job: TelegramJob): void {
+  const database = new Database(databasePath);
+  try {
+    database.prepare(`INSERT INTO topic_resume_attempts
+      (job_id, action_token, state, chat_id, message_thread_id,
+        reserved_job_version, current_job_version, next_attempt_at_ms, reason_code,
+        started_at_ms, updated_at_ms)
+      VALUES (?, ?, 'complete', ?, ?, ?, ?, NULL, NULL, ?, ?)`).run(
+      job.id, "a".repeat(64), -1001, 7, job.version - 1, job.version, BASE, BASE,
+    );
+  } finally {
+    database.close();
+  }
+}
+
+function resumeAttemptCount(databasePath: string): number {
+  const database = new Database(databasePath, { readonly: true });
+  try {
+    const row = database.prepare("SELECT count(*) AS count FROM topic_resume_attempts").get() as { count: number };
+    return row.count;
   } finally {
     database.close();
   }

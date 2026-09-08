@@ -39,6 +39,11 @@ import type {
   TelegramTopicRecoveryCompletion, TelegramTopicRecoveryRecord, TelegramTopicRecoveryResult,
   TelegramTopicRecoveryState, TopicRecoveryOutcomeInput,
 } from "./telegram-topic-recovery-ledger.js";
+import { TelegramTopicResumeLedger } from "./telegram-topic-resume-ledger.js";
+import type {
+  ReserveTopicResumeInput, SettleTopicResumeDeliveryInput, TelegramTopicResumeRecord,
+  TelegramTopicResumeResult, TelegramTopicResumeState, TransitionTopicResumeInput,
+} from "./telegram-topic-resume-ledger.js";
 
 export type {
   DeliveryCompletionCandidate, DeliveryCompletionScanCursor, DeliveryCompletionScanInput,
@@ -55,6 +60,12 @@ export type {
   TelegramTopicRecoveryCompletion, TelegramTopicRecoveryRecord, TelegramTopicRecoveryResult,
   TelegramTopicRecoveryState, TopicRecoveryOutcomeInput,
 } from "./telegram-topic-recovery-ledger.js";
+export type {
+  ReserveTopicResumeInput, SettleTopicResumeDeliveryInput, TelegramTopicResumeReasonCode,
+  TelegramTopicResumeExternalEligibilitySnapshot, TelegramTopicResumeRecord,
+  TelegramTopicResumeResult, TelegramTopicResumeState,
+  TransitionTopicResumeInput,
+} from "./telegram-topic-resume-ledger.js";
 
 const BUSY_TIMEOUT_MS = 5_000;
 const JOB_ID_MAX_LENGTH = 128;
@@ -143,6 +154,7 @@ export class SqliteTelegramJobStore {
   private readonly statements = new Map<string, Database.Statement>();
   private readonly deliveryLedger: TelegramDeliveryLedger;
   private readonly topicRecoveryLedger: TelegramTopicRecoveryLedger;
+  private readonly topicResumeLedger: TelegramTopicResumeLedger;
   private closed = false;
 
   constructor(private readonly databasePath: string, options: SqliteTelegramJobStoreOptions = {}) {
@@ -165,6 +177,14 @@ export class SqliteTelegramJobStore {
       statement: (sql) => this.statement(sql),
       getJob: (jobId) => this.get(jobId),
       listDeliveries: (jobId) => this.listDeliveries(jobId),
+      applyTransition: (input) => this.applyTransition(input),
+    });
+    this.topicResumeLedger = new TelegramTopicResumeLedger({
+      database: this.database,
+      statement: (sql) => this.statement(sql),
+      getJob: (jobId) => this.get(jobId),
+      listDeliveries: (jobId) => this.listDeliveries(jobId),
+      getTopicRecovery: (jobId) => this.topicRecoveryLedger.get(jobId),
       applyTransition: (input) => this.applyTransition(input),
     });
     try {
@@ -711,6 +731,37 @@ export class SqliteTelegramJobStore {
     this.assertOpen(); return this.topicRecoveryLedger.list(states, limit);
   }
 
+  reserveTopicResume(input: ReserveTopicResumeInput): TelegramTopicResumeResult {
+    this.assertOpen(); return this.topicResumeLedger.reserve(input);
+  }
+
+  transitionTopicResume(input: TransitionTopicResumeInput): TelegramTopicResumeResult {
+    this.assertOpen(); return this.topicResumeLedger.transition(input);
+  }
+
+  settleTopicResumeDelivery(input: SettleTopicResumeDeliveryInput): TelegramTopicResumeRecord {
+    this.assertOpen(); return this.topicResumeLedger.settleDelivery(input);
+  }
+
+  getTopicResume(jobId: string): TelegramTopicResumeRecord | null {
+    this.assertOpen(); return this.topicResumeLedger.get(jobId);
+  }
+
+  listTopicResumes(
+    states: readonly TelegramTopicResumeState[],
+    limit?: number,
+  ): readonly TelegramTopicResumeRecord[] {
+    this.assertOpen(); return this.topicResumeLedger.list(states, limit);
+  }
+
+  getStatusAnchorPlan(jobId: string): { readonly payload: unknown; readonly contentHash: string } | null {
+    this.assertOpen(); return this.topicResumeLedger.getStatusAnchorPlan(jobId);
+  }
+
+  hasJobQuarantine(jobId: string): boolean {
+    this.assertOpen(); return this.topicResumeLedger.hasJobQuarantine(jobId);
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -809,6 +860,7 @@ export class SqliteTelegramJobStore {
     this.statement("DELETE FROM job_quarantine WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM status_anchor_plans WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM status_anchor_plan_bootstrap_eligibility WHERE job_id = ?").run(jobId);
+    this.statement("DELETE FROM topic_resume_attempts WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM topic_recoveries WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM deliveries WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM job_events WHERE job_id = ?").run(jobId);

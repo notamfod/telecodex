@@ -69,6 +69,7 @@ describe("SQLite reconciliation scan", () => {
 
     const legacy = new Database(databasePath);
     try {
+      legacy.exec("DROP TABLE topic_resume_attempts");
       legacy.exec("DROP TABLE topic_recoveries");
       legacy.exec("DROP TABLE status_anchor_plans");
       legacy.exec("DROP TABLE status_anchor_plan_bootstrap_eligibility");
@@ -93,17 +94,18 @@ describe("SQLite reconciliation scan", () => {
     expect(done).toMatchObject({ jobs: [], quarantined: [], nextCursor: null });
     const inspect = new Database(databasePath, { readonly: true });
     try {
-      expect(inspect.pragma("user_version", { simple: true })).toBe(7);
+      expect(inspect.pragma("user_version", { simple: true })).toBe(8);
       expect(inspect.prepare("SELECT count(*) AS count FROM job_quarantine").get()).toEqual({ count: 0 });
       expect(inspect.prepare("SELECT count(*) AS count FROM job_event_archive").get()).toEqual({ count: 0 });
       expect(inspect.prepare("SELECT count(*) AS count FROM status_anchor_plans").get()).toEqual({ count: 0 });
       expect(inspect.prepare("SELECT count(*) AS count FROM topic_recoveries").get()).toEqual({ count: 0 });
+      expect(inspect.prepare("SELECT count(*) AS count FROM topic_resume_attempts").get()).toEqual({ count: 0 });
       expect(inspect.prepare("SELECT count(*) AS count FROM status_anchor_plan_bootstrap_eligibility").get())
         .toEqual({ count: 2 });
     } finally { inspect.close(); }
   });
 
-  it.each([1, 2, 3, 4, 5])("migrates a valid v%s ledger to empty v7 recovery tables", (version) => {
+  it.each([1, 2, 3, 4, 5])("migrates a valid v%s ledger to empty v8 recovery tables", (version) => {
     const migrationPath = path.join(directory, `migration-v${version}.sqlite`);
     const seeded = new SqliteTelegramJobStore(migrationPath);
     accept(seeded, `preserved-v${version}`, version, NOW + version);
@@ -111,6 +113,7 @@ describe("SQLite reconciliation scan", () => {
 
     const legacy = new Database(migrationPath);
     try {
+      legacy.exec("DROP TABLE IF EXISTS topic_resume_attempts");
       legacy.exec("DROP TABLE IF EXISTS topic_recoveries");
       legacy.exec("DROP TABLE IF EXISTS status_anchor_plans");
       legacy.exec("DROP TABLE IF EXISTS status_anchor_plan_bootstrap_eligibility");
@@ -126,9 +129,10 @@ describe("SQLite reconciliation scan", () => {
       expect(migrated.get(`preserved-v${version}`)?.id).toBe(`preserved-v${version}`);
       const inspect = new Database(migrationPath, { readonly: true });
       try {
-        expect(inspect.pragma("user_version", { simple: true })).toBe(7);
+        expect(inspect.pragma("user_version", { simple: true })).toBe(8);
         expect(inspect.prepare("SELECT count(*) AS count FROM status_anchor_plans").get()).toEqual({ count: 0 });
         expect(inspect.prepare("SELECT count(*) AS count FROM topic_recoveries").get()).toEqual({ count: 0 });
+        expect(inspect.prepare("SELECT count(*) AS count FROM topic_resume_attempts").get()).toEqual({ count: 0 });
         expect(inspect.prepare("SELECT job_id FROM status_anchor_plan_bootstrap_eligibility").all())
           .toEqual([{ job_id: `preserved-v${version}` }]);
       } finally { inspect.close(); }
@@ -140,6 +144,7 @@ describe("SQLite reconciliation scan", () => {
     initial.close();
     const malformed = new Database(databasePath);
     try {
+      malformed.exec("DROP TABLE IF EXISTS topic_resume_attempts");
       malformed.exec("DROP TABLE IF EXISTS topic_recoveries");
       malformed.exec("DROP TABLE IF EXISTS status_anchor_plans");
       malformed.exec(`CREATE TABLE status_anchor_plans (

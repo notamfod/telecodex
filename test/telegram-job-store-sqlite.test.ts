@@ -111,7 +111,7 @@ describe("SqliteTelegramJobStore", () => {
       expect(db.prepare("SELECT count(*) AS count FROM inbox_updates").get()).toEqual({ count: 1 });
       expect(db.prepare("SELECT count(*) AS count FROM jobs").get()).toEqual({ count: 1 });
       expect(db.prepare("SELECT count(*) AS count FROM job_events").get()).toEqual({ count: 1 });
-      expect(db.pragma("user_version", { simple: true })).toBe(7);
+      expect(db.pragma("user_version", { simple: true })).toBe(8);
       expect(db.prepare("SELECT count(*) AS count FROM status_anchor_plans").get()).toEqual({ count: 0 });
       expect(db.prepare("SELECT count(*) AS count FROM status_anchor_plan_bootstrap_eligibility").get())
         .toEqual({ count: 0 });
@@ -145,9 +145,10 @@ describe("SqliteTelegramJobStore", () => {
     } finally { db.close(); }
   });
 
-  it("migrates v6 to the exact v7 topic recovery schema", () => {
+  it("preserves the exact v7 topic recovery schema while migrating v6 to v8", () => {
     open().close();
     const legacy = new Database(databasePath);
+    legacy.exec("DROP TABLE topic_resume_attempts");
     legacy.exec("DROP TABLE topic_recoveries");
     legacy.pragma("user_version = 6");
     legacy.close();
@@ -155,7 +156,7 @@ describe("SqliteTelegramJobStore", () => {
     open();
     const db = new Database(databasePath, { readonly: true });
     try {
-      expect(db.pragma("user_version", { simple: true })).toBe(7);
+      expect(db.pragma("user_version", { simple: true })).toBe(8);
       expect(db.prepare("PRAGMA table_info(topic_recoveries)").all()).toEqual([
         { cid: 0, name: "job_id", type: "TEXT", notnull: 0, dflt_value: null, pk: 1 },
         { cid: 1, name: "action_token", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
@@ -175,6 +176,40 @@ describe("SqliteTelegramJobStore", () => {
         expect.objectContaining({ unique: 1, origin: "pk" }),
       ]));
       expect(db.prepare("PRAGMA foreign_key_list(topic_recoveries)").all()).toEqual([
+        expect.objectContaining({ table: "jobs", from: "job_id", to: "id" }),
+      ]);
+    } finally { db.close(); }
+  });
+
+  it("migrates v7 to the exact v8 topic resume schema", () => {
+    open().close();
+    const legacy = new Database(databasePath);
+    legacy.exec("DROP TABLE topic_resume_attempts");
+    legacy.pragma("user_version = 7");
+    legacy.close();
+
+    open();
+    const db = new Database(databasePath, { readonly: true });
+    try {
+      expect(db.pragma("user_version", { simple: true })).toBe(8);
+      expect(db.prepare("PRAGMA table_info(topic_resume_attempts)").all()).toEqual([
+        { cid: 0, name: "job_id", type: "TEXT", notnull: 0, dflt_value: null, pk: 1 },
+        { cid: 1, name: "action_token", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 2, name: "state", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 3, name: "chat_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 4, name: "message_thread_id", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 5, name: "reserved_job_version", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 6, name: "current_job_version", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 7, name: "next_attempt_at_ms", type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 },
+        { cid: 8, name: "reason_code", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+        { cid: 9, name: "started_at_ms", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+        { cid: 10, name: "updated_at_ms", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      ]);
+      expect(db.prepare("PRAGMA index_list(topic_resume_attempts)").all()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ unique: 1, origin: "u" }),
+        expect.objectContaining({ unique: 1, origin: "pk" }),
+      ]));
+      expect(db.prepare("PRAGMA foreign_key_list(topic_resume_attempts)").all()).toEqual([
         expect.objectContaining({ table: "jobs", from: "job_id", to: "id" }),
       ]);
     } finally { db.close(); }

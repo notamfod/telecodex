@@ -109,6 +109,12 @@ git commit -m "NO-TICKET feat: expose existing topic resume action"
 
 Set `TELECODEX_RELEASE_TAG=06.3a-resume-action-disabled`, run the shared installation gate, and complete twenty clean snapshots. An authenticated Dashboard refresh must contain zero `resume_existing_topic` actions, and the database must contain zero resume rows.
 
+#### Decision gate before 06.3b
+
+Do not enable the action if the exact live planner reports `eligible=0`, even when the aggregate failed-recovery, failed-anchor, and pending-follower counts match. In particular, an anchor attempt count above the designed baseline cannot be relaxed from current-row evidence alone: the v8 delivery history has no monotonic proof that an earlier attempt was never `uncertain` before a later operator-approved resend failed permanently.
+
+If the only failed predicates are `RECOVERY_VERSION_MATCH` and `ANCHOR_ATTEMPT_BASELINE_EXACT`, stop for an explicit operator choice. Existing Task 5 and Task 6 below are permanently blocked and must not be executed under either choice. Choosing to leave the two never-attempted followers pending ends this roadmap with the resume flag disabled. Choosing warning-bearing replay starts a separate reviewed schema v9 plan with its own enable and invoke gates plus a separate confirmation before any replay. That separate plan must provide a warning-bearing action, a durable anchor-attempt baseline, exact post-reservation causal guards, and acknowledgement that the small status anchor may be duplicated. The operator choice alone never authorizes existing 06.3b or 06.4, and replay authority must never be inferred from a generic continue instruction.
+
 ### Task 5: Microrelease 06.3b, enable exactly one action
 
 **Files:**
@@ -230,4 +236,3 @@ Take twenty snapshots at 30-second intervals. Require health and readiness OK, s
 - Before 06.4, code-only rollback is allowed only with zero resume rows and no external resume request.
 - After 06.4 starts, never restore an older database, delete or rewrite either saga row, repeat the POST, repeat an ambiguous reopen, repeat an uncertain send, create a replacement topic, or release followers manually.
 - Stop on candidate count other than one, version conflict, active turn, sending or uncertain delivery before the action, Guardian failure, quarantine growth, schema mismatch, SQLite integrity failure, unstable PID, restart, unexpected journal error, or unclassified Telegram result.
-

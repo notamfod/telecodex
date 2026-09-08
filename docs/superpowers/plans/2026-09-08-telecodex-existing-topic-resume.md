@@ -146,3 +146,4 @@ Stop and restore only the saved code trees if a code-only checkpoint fails befor
 2. Execute `docs/superpowers/plans/2026-09-08-telecodex-existing-topic-resume-activation.md` through 06.4.
 3. After every checkpoint, return here for the shared code, installation, and twenty-snapshot gates.
 
+If the activation plan reaches its ambiguous-anchor decision gate, its existing Task 5 and Task 6 are permanently blocked and must not be executed under either choice. Choosing to leave the followers pending ends this roadmap with the resume flag disabled. Choosing warning-bearing replay starts a separate schema v9 plan with its own reviewed enable and invoke gates plus a separate confirmation before any replay. The operator choice alone never authorizes the existing 06.3b or 06.4 steps.

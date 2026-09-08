@@ -21,6 +21,7 @@ import { SqliteTelegramJobStore, type TelegramJob } from "../src/telegram-job-st
 import { TelegramJobIngress, type TelegramWorkSource } from "../src/telegram-job-ingress.js";
 import { hashTelegramDeliveryPayload } from "../src/telegram-response-plan.js";
 import { planTelegramTopicRecovery } from "../src/telegram-topic-recovery.js";
+import { planTelegramTopicResume } from "../src/telegram-topic-resume.js";
 
 const NOW = 1_700_000_500_000;
 const THREAD = "11111111-1111-4111-8111-111111111111";
@@ -1342,6 +1343,130 @@ describe("Telegram reliability runtime", () => {
     }));
   });
 
+  it("exposes and executes only the reloaded exact existing-topic resume action", async () => {
+    const seeded = seedExistingTopicResumeCandidate(store);
+    const harness = createHarness(store, directory);
+    const topicResume = topicResumeOptions(seeded);
+    harness.options.topicRecovery = failedRecoveryProjectionOptions(seeded);
+    harness.options.topicResume = topicResume.options;
+    runtime = createTelegramReliabilityRuntime(harness.options);
+
+    const snapshot = await runtime.loadDashboardReliability();
+    const projection = snapshot.jobs.find(({ projection: value }) =>
+      value.jobId === seeded.candidate.jobId)!.projection;
+    const action = projection.actions.find(({ kind }) => kind === "resume_existing_topic");
+
+    expect(action).toEqual({
+      kind: "resume_existing_topic",
+      jobId: seeded.candidate.jobId,
+      expectedVersion: seeded.candidate.expectedVersion,
+    });
+    expect(projection.actions.some(({ kind, partKey }) =>
+      kind === "retry_delivery" && partKey === "status-anchor")).toBe(true);
+    expect(store.getTopicResume(seeded.candidate.jobId)).toBeNull();
+    await expect(runtime.runDashboardAction({ ...action!, expectedVersion: action!.expectedVersion - 1 }))
+      .rejects.toThrow("Dashboard action is no longer legal");
+    expect(topicResume.classifyForumTopic).not.toHaveBeenCalled();
+
+    await runtime.runDashboardAction(action!);
+
+    expect(topicResume.classifyForumTopic).toHaveBeenCalledOnce();
+    expect(topicResume.reopenForumTopic).not.toHaveBeenCalled();
+    expect(store.getTopicResume(seeded.candidate.jobId)).toMatchObject({ state: "complete" });
+  });
+
+  it("reloads current thread binding evidence before reserving an existing-topic resume", async () => {
+    const seeded = seedExistingTopicResumeCandidate(store);
+    const harness = createHarness(store, directory);
+    const topicResume = topicResumeOptions(seeded);
+    harness.options.topicResume = topicResume.options;
+    runtime = createTelegramReliabilityRuntime(harness.options);
+    const snapshot = await runtime.loadDashboardReliability();
+    const action = snapshot.jobs.find(({ projection }) => projection.jobId === seeded.candidate.jobId)!
+      .projection.actions.find(({ kind }) => kind === "resume_existing_topic")!;
+
+    topicResume.hasThreadTopicBinding.mockReturnValue(false);
+
+    await expect(runtime.runDashboardAction(action)).rejects.toThrow("Dashboard action is no longer legal");
+    expect(topicResume.classifyForumTopic).not.toHaveBeenCalled();
+    expect(topicResume.reopenForumTopic).not.toHaveBeenCalled();
+    expect(store.getTopicResume(seeded.candidate.jobId)).toBeNull();
+  });
+
+  it("keeps exact existing-topic resume projection and execution absent when disabled", async () => {
+    const seeded = seedExistingTopicResumeCandidate(store);
+    const harness = createHarness(store, directory);
+    runtime = createTelegramReliabilityRuntime(harness.options);
+
+    const snapshot = await runtime.loadDashboardReliability();
+    const projection = snapshot.jobs.find(({ projection: value }) =>
+      value.jobId === seeded.candidate.jobId)!.projection;
+
+    expect(projection.actions.some(({ kind }) => kind === "resume_existing_topic")).toBe(false);
+    expect(projection.actions).toContainEqual(expect.objectContaining({
+      kind: "retry_delivery",
+      partKey: "status-anchor",
+    }));
+    await expect(runtime.runDashboardAction({
+      kind: "resume_existing_topic",
+      jobId: seeded.candidate.jobId,
+      expectedVersion: seeded.candidate.expectedVersion,
+    })).rejects.toThrow("Dashboard action is no longer legal");
+    expect(store.getTopicResume(seeded.candidate.jobId)).toBeNull();
+  });
+
+  it("fails closed without hiding Dashboard when persisted resume evidence is malformed", async () => {
+    const seeded = seedExistingTopicResumeCandidate(store);
+    const harness = createHarness(store, directory);
+    harness.options.topicResume = topicResumeOptions(seeded).options;
+    vi.spyOn(store, "getStatusAnchorPlan").mockImplementation((jobId) => {
+      if (jobId === seeded.candidate.jobId) {
+        throw new Error("Malformed Telegram status anchor plan");
+      }
+      return null;
+    });
+    runtime = createTelegramReliabilityRuntime(harness.options);
+
+    const snapshot = await runtime.loadDashboardReliability();
+    const projection = snapshot.jobs.find(({ projection: value }) =>
+      value.jobId === seeded.candidate.jobId)!.projection;
+
+    expect(projection.actions.some(({ kind }) => kind === "resume_existing_topic")).toBe(false);
+    expect(projection.actions).toContainEqual(expect.objectContaining({
+      kind: "retry_delivery",
+      partKey: "status-anchor",
+    }));
+    expect(store.getTopicResume(seeded.candidate.jobId)).toBeNull();
+  });
+
+  it.each([
+    ["resume row", "getTopicResume", "Malformed Telegram topic resume", false],
+    ["source payload", "readSourcePayload", "Malformed Telegram job source payload", true],
+  ] as const)("fails closed without hiding Dashboard for a malformed %s", async (
+    _label,
+    method,
+    message,
+    expectAnchorRetry,
+  ) => {
+    const seeded = seedExistingTopicResumeCandidate(store);
+    const harness = createHarness(store, directory);
+    harness.options.topicResume = topicResumeOptions(seeded).options;
+    const original = store[method].bind(store);
+    vi.spyOn(store, method).mockImplementation((jobId) => {
+      if (jobId === seeded.candidate.jobId) throw new Error(message);
+      return original(jobId) as never;
+    });
+    runtime = createTelegramReliabilityRuntime(harness.options);
+
+    const snapshot = await runtime.loadDashboardReliability();
+    const projection = snapshot.jobs.find(({ projection: value }) =>
+      value.jobId === seeded.candidate.jobId)!.projection;
+
+    expect(projection.actions.some(({ kind }) => kind === "resume_existing_topic")).toBe(false);
+    expect(projection.actions.some(({ kind, partKey }) =>
+      kind === "retry_delivery" && partKey === "status-anchor")).toBe(expectAnchorRetry);
+  });
+
   it("keeps Dashboard available when a recovery candidate source is malformed", async () => {
     const seeded = seedTopicRecoveryCandidate(store);
     const readSourcePayload = store.readSourcePayload.bind(store);
@@ -1879,6 +2004,157 @@ function recoveryOptions(seeded: ReturnType<typeof seedTopicRecoveryCandidate>) 
       scheduleWakeup: vi.fn(),
       reportReason: vi.fn(),
     } satisfies NonNullable<TelegramReliabilityRuntimeOptions["topicRecovery"]>,
+  };
+}
+
+function topicResumeOptions(seeded: ReturnType<typeof seedExistingTopicResumeCandidate>) {
+  const classifyForumTopic = vi.fn(async () => "live" as const);
+  const reopenForumTopic = vi.fn(async () => true as const);
+  const hasThreadTopicBinding = vi.fn((threadId: string, destination: {
+    readonly chatId: number;
+    readonly messageThreadId: number;
+  }) => threadId === seeded.thread.id
+    && destination.chatId === seeded.destination.chatId
+    && destination.messageThreadId === seeded.destination.messageThreadId);
+  return {
+    classifyForumTopic,
+    reopenForumTopic,
+    hasThreadTopicBinding,
+    options: {
+      forumChatId: seeded.destination.chatId,
+      classifyForumTopic,
+      reopenForumTopic,
+      getThread: vi.fn((threadId) => threadId === seeded.thread.id
+        ? structuredClone(seeded.thread) : null),
+      hasThreadTopicBinding,
+      scheduleWakeup: vi.fn(),
+    } satisfies NonNullable<TelegramReliabilityRuntimeOptions["topicResume"]>,
+  };
+}
+
+function failedRecoveryProjectionOptions(
+  seeded: ReturnType<typeof seedExistingTopicResumeCandidate>,
+): NonNullable<TelegramReliabilityRuntimeOptions["topicRecovery"]> {
+  return {
+    forumChatId: seeded.destination.chatId,
+    hasThreadTopicBinding: vi.fn(() => true),
+    probeForumTopic: vi.fn(async () => true),
+    createForumTopic: vi.fn(async () => ({
+      chatId: seeded.destination.chatId,
+      messageThreadId: seeded.destination.messageThreadId + 1,
+    })),
+    getThread: vi.fn(() => structuredClone(seeded.thread)),
+    rebindThreadTopic: vi.fn(),
+    sendWelcome: vi.fn(async () => undefined),
+    scheduleWakeup: vi.fn(),
+    reportReason: vi.fn(),
+  };
+}
+
+function seedExistingTopicResumeCandidate(store: SqliteTelegramJobStore) {
+  const destination = { chatId: -1001, messageThreadId: 7 } as const;
+  const input = source({ updateId: 405, messageId: 405, ...destination });
+  let job: TelegramJob = {
+    schemaVersion: 1, version: 1, id: "resume-existing-topic",
+    source: { botId: input.botId, updateId: input.updateId }, attachments: [],
+    phase: "accepted", health: "healthy", activity: "unknown", attention: { kind: "none" },
+    outcome: null, dispatchId: null, threadId: null, turnId: null,
+    responsePlan: undefined, deliveries: [], acceptedAt: NOW - 100, updatedAt: NOW - 100,
+    terminalAt: null, dismissedAt: null, retainUntil: null,
+  };
+  store.acceptUpdate({ job, sourcePayload: input, eventId: "resume-existing-accepted" });
+  job = store.transition({
+    jobId: job.id, eventId: "resume-existing-queued", expectedVersion: job.version,
+    event: { schemaVersion: 1, type: "job.queued", eventAt: NOW - 99 },
+  });
+  job = store.transition({
+    jobId: job.id, eventId: "resume-existing-dispatched", expectedVersion: job.version,
+    event: { schemaVersion: 1, type: "dispatch.started", eventAt: NOW - 98, dispatch: {
+      id: "resume-existing-dispatch", threadId: THREAD, previousTurnId: null, attempt: 1,
+      startedAt: NOW - 98, transportWriteState: "written", nextAttemptAt: null,
+    } },
+  });
+  job = store.transition({
+    jobId: job.id, eventId: "resume-existing-started", expectedVersion: job.version,
+    event: { schemaVersion: 1, type: "turn.started", eventAt: NOW - 97,
+      identifiers: { turnId: "resume-existing-turn" }, codexEventAt: NOW - 97 },
+  });
+  job = store.transition({
+    jobId: job.id, eventId: "resume-existing-completed", expectedVersion: job.version,
+    event: { schemaVersion: 1, type: "turn.completed", eventAt: NOW - 96,
+      codexEventAt: NOW - 96, turnResult: { schemaVersion: 1, content: [] } },
+  });
+  const anchor = { operation: "send_text" as const, ...destination, text: "Response follows." };
+  const final = {
+    operation: "send_rich" as const, ...destination, markdown: "# Result", media: [],
+    fallbackParts: [{
+      partKey: "final:0000:fallback:0000", kind: "final" as const,
+      payload: { operation: "send_text" as const, ...destination, text: "Result" },
+    }],
+  };
+  const notice = { operation: "send_text" as const, ...destination, text: "Notice" };
+  job = store.installDeliveryPlan({
+    jobId: job.id, expectedVersion: job.version, eventId: "resume-existing-plan", eventAt: NOW - 95,
+    responsePlan: [
+      { partId: "final:0000", kind: "final" },
+      { partId: "notice:0001", kind: "notice" },
+    ],
+    parts: [
+      plannedResumePart(job.id, "status-anchor", 0, "status-anchor", anchor, NOW - 95),
+      plannedResumePart(job.id, "final:0000", 0, "final", final, NOW - 95),
+      plannedResumePart(job.id, "notice:0001", 1, "notice", notice, NOW - 95),
+    ],
+  });
+  let changed = store.transitionDeliveryAndProject({
+    jobId: job.id, partKey: "status-anchor", expectedJobVersion: job.version,
+    expectedState: "pending", expectedAttemptCount: 0, state: "sending", attemptCount: 0,
+    eventId: "resume-existing-anchor-sending", updatedAt: NOW - 94,
+  });
+  changed = store.transitionDeliveryAndProject({
+    jobId: job.id, partKey: "status-anchor", expectedJobVersion: changed.job.version,
+    expectedState: "sending", expectedAttemptCount: 0, state: "failed", attemptCount: 1,
+    lastErrorCode: "telegram_permanent", eventId: "resume-existing-anchor-failed", updatedAt: NOW - 93,
+    attention: { kind: "required", code: "telegram_delivery_failed", actions: ["inspect", "retry"] },
+  });
+  job = changed.job;
+  const thread: CodexThreadRecord = {
+    id: THREAD, title: "Resume topic", cwd: "/work/telecodex", model: null, modelProvider: null,
+    createdAt: new Date(0), updatedAt: new Date(0), firstUserMessage: "resume",
+  };
+  const anchorPlan = { payload: anchor, contentHash: hashTelegramDeliveryPayload(anchor) };
+  const recoveryCandidate = planTelegramTopicRecovery({
+    job, source: input, deliveries: store.listDeliveries(job.id), anchorPlan, thread,
+  });
+  if (!recoveryCandidate) throw new Error("Expected missing-topic candidate before failed history");
+  const reserved = store.reserveTopicRecovery({
+    candidate: recoveryCandidate, eventId: "resume-existing-recovery-reserved",
+    actionToken: "d".repeat(64), eventAt: NOW - 92,
+  });
+  store.failTopicRecovery({
+    jobId: job.id, expectedVersion: reserved.job.version, actionToken: reserved.recovery.actionToken,
+    reasonCode: "TOPIC_RECOVERY_FAILED", updatedAt: NOW - 91,
+  });
+  job = store.get(job.id)!;
+  const candidate = planTelegramTopicResume({
+    job, source: input, deliveries: store.listDeliveries(job.id), anchorPlan, thread,
+    recovery: store.getTopicRecovery(job.id), hasExistingAttempt: false,
+    forumChatId: destination.chatId, hasThreadTopicBinding: true, quarantined: false,
+  });
+  if (!candidate) throw new Error("Expected existing-topic resume candidate");
+  return { destination, input, job, thread, anchorPlan, candidate };
+}
+
+function plannedResumePart(
+  jobId: string,
+  partKey: string,
+  ordinal: number,
+  kind: string,
+  payload: unknown,
+  updatedAt: number,
+) {
+  return {
+    jobId, partKey, ordinal, kind, state: "pending" as const, payload,
+    contentHash: hashTelegramDeliveryPayload(payload), updatedAt,
   };
 }
 

@@ -156,6 +156,34 @@ describe("grammY canonical Telegram transports", () => {
     }), expect.any(AbortSignal));
   });
 
+  it("encodes the existing-topic resume action within Telegram callback limits", async () => {
+    const sendMessage = vi.fn(async () => ({ message_id: 51 }));
+    const transport = createTelegramStatusTransport({
+      sendMessage,
+      editMessageText: vi.fn(),
+    } as never);
+    const action = {
+      kind: "resume_existing_topic" as const,
+      jobId: "11111111-1111-4111-8111-111111111111",
+      expectedVersion: 541,
+    };
+
+    const callbackData = telegramStatusActionCallbackData(action);
+    expect(callbackData).toBe("tcj:u:11111111-1111-4111-8111-111111111111:541");
+    expect(Buffer.byteLength(callbackData!)).toBeLessThanOrEqual(64);
+    await transport.send({
+      chatId: -1001, messageThreadId: 7, html: "Resume", plain: "Resume",
+      priority: "urgent", projection: {} as never, actions: [action],
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith(-1001, "Resume", expect.objectContaining({
+      reply_markup: { inline_keyboard: [[{
+        text: "Resume topic",
+        callback_data: callbackData,
+      }]] },
+    }), expect.any(AbortSignal));
+  });
+
   it("bounds hung status sends and edits so acceptance and startup can continue", async () => {
     vi.useFakeTimers();
     const signals: AbortSignal[] = [];

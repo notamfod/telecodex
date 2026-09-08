@@ -1,6 +1,8 @@
 import type { GuardianThreadInspection } from "./session-guardian-ipc-client.js";
 import type { DeliveryPart } from "./telegram-job-store.js";
 import type { TelegramTopicRecoveryCandidate } from "./telegram-topic-recovery.js";
+import type { TelegramTopicResumeCandidate } from "./telegram-topic-resume.js";
+import type { TelegramTopicResumeState } from "./telegram-topic-resume-ledger.js";
 import {
   TELEGRAM_STATUS_ANCHOR_PART_KEY,
   type DeliveryState,
@@ -22,9 +24,11 @@ export type TelegramStatusActionKind =
   | "guardian_restore"
   | "retry_delivery"
   | "recover_missing_topic"
+  | "resume_existing_topic"
   | "send_again_warning";
 
 export type TelegramTopicRecoveryActionState = "in_flight" | "retry_wait" | "unknown";
+export type TelegramTopicResumeActionState = Exclude<TelegramTopicResumeState, "complete" | "failed">;
 
 export type TelegramJobStatusState =
   | "accepted"
@@ -151,6 +155,33 @@ export function enrichTopicRecoveryAction(
     ...projection,
     actions: [{
       kind: "recover_missing_topic",
+      jobId: projection.jobId,
+      expectedVersion: projection.expectedVersion,
+    }, ...actions],
+  };
+}
+
+export function enrichTopicResumeAction(
+  projection: TelegramJobStatusProjection,
+  candidate: TelegramTopicResumeCandidate | null,
+  attemptState?: TelegramTopicResumeActionState,
+): TelegramJobStatusProjection {
+  const actions = attemptState === undefined
+    ? projection.actions
+    : projection.actions.filter((action) => !(
+        action.kind === "retry_delivery" && action.partKey === TELEGRAM_STATUS_ANCHOR_PART_KEY
+      ));
+  if (candidate === null || attemptState !== undefined) {
+    return actions === projection.actions ? projection : { ...projection, actions };
+  }
+  if (candidate.jobId !== projection.jobId
+    || candidate.expectedVersion !== projection.expectedVersion) {
+    throw new Error("Topic resume candidate does not match status projection");
+  }
+  return {
+    ...projection,
+    actions: [{
+      kind: "resume_existing_topic",
       jobId: projection.jobId,
       expectedVersion: projection.expectedVersion,
     }, ...actions],

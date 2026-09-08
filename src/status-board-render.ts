@@ -287,6 +287,7 @@ function actionLabel(kind: TelegramStatusActionKind): string {
     abort: "Abort", refresh: "Refresh", details: "Details", inspect: "Inspect",
     retry_new_turn: "Retry as new turn", guardian_restore: "Guardian Restore",
     retry_delivery: "Retry delivery", recover_missing_topic: "Recover topic",
+    resume_existing_topic: "Resume topic",
     send_again_warning: "Send again with warning",
   };
   return labels[kind];

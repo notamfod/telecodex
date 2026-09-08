@@ -41,8 +41,10 @@ import type { TelegramExactTurnReader } from "./telegram-exact-turn-inspector.js
 import type { TelegramGuardianInspector } from "./telegram-guardian-reconciliation.js";
 import {
   enrichTopicRecoveryAction,
+  enrichTopicResumeAction,
   type TelegramStatusAction,
   type TelegramTopicRecoveryActionState,
+  type TelegramTopicResumeActionState,
 } from "./telegram-status-projection.js";
 import {
   planTelegramTopicRecovery,
@@ -57,6 +59,10 @@ import {
   type TelegramTopicResumeRuntime,
   type TelegramTopicResumeRuntimeOptions,
 } from "./telegram-topic-resume-runtime.js";
+import {
+  planTelegramTopicResume,
+  type TelegramTopicResumeCandidate,
+} from "./telegram-topic-resume.js";
 import type { TelegramTurnResult } from "./telegram-turn-result.js";
 
 const DASHBOARD_JOB_LIMIT = 200;
@@ -706,11 +712,14 @@ export function createTelegramReliabilityRuntime(
       const aggregates = store.getDashboardAggregates(now());
       const [jobs, appServer, guardian, telegramAvailable] = await Promise.all([
         Promise.all(candidates.map(async (job) => {
-          const projection = await status.readProjection(job.id);
+          const rawProjection = await status.readProjection(job.id);
+          const recoveryProjection = topicRecovery
+            ? enrichTopicRecoveryProjection(store, options.topicRecovery!, rawProjection)
+            : rawProjection;
           return {
-            projection: topicRecovery
-              ? enrichTopicRecoveryProjection(store, options.topicRecovery!, projection)
-              : projection,
+            projection: topicResume
+              ? enrichTopicResumeProjection(store, options.topicResume!, recoveryProjection)
+              : recoveryProjection,
             events: store.listEventSummaries(job.id).slice(-50).map((event) => ({
               timestamp: event.eventAt,
               code: event.type,
@@ -757,9 +766,12 @@ export function createTelegramReliabilityRuntime(
         }
       }
       const rawProjection = await status.readProjection(action.jobId);
-      const projection = topicRecovery
+      const recoveryProjection = topicRecovery
         ? enrichTopicRecoveryProjection(store, options.topicRecovery!, rawProjection)
         : rawProjection;
+      const projection = topicResume
+        ? enrichTopicResumeProjection(store, options.topicResume!, recoveryProjection)
+        : recoveryProjection;
       const effectiveAction = action.kind === "guardian_restore" && !action.alertId
         ? projection.actions.find((candidate) => candidate.kind === "guardian_restore"
             && candidate.jobId === action.jobId
@@ -772,6 +784,11 @@ export function createTelegramReliabilityRuntime(
       if (action.kind === "recover_missing_topic") {
         if (!topicRecovery) throw new Error("Dashboard action is no longer legal");
         await topicRecovery.recover(action);
+        return;
+      }
+      if (action.kind === "resume_existing_topic") {
+        if (!topicResume) throw new Error("Dashboard action is no longer legal");
+        await topicResume.resume(action);
         return;
       }
       if (action.kind === "details" || action.kind === "inspect") return;
@@ -858,6 +875,89 @@ function enrichTopicRecoveryProjection(
     ? currentTopicRecoveryCandidate(store, options, projection.jobId)
     : null;
   return enrichTopicRecoveryAction(projection, candidate, activeState);
+}
+
+function enrichTopicResumeProjection(
+  store: SqliteTelegramJobStore,
+  options: NonNullable<TelegramReliabilityRuntimeOptions["topicResume"]>,
+  projection: Awaited<ReturnType<TelegramDurableStatusService["readProjection"]>>,
+) {
+  try {
+    const resume = store.getTopicResume(projection.jobId);
+    const activeState = resume !== null && isActiveTopicResumeState(resume.state)
+      ? resume.state
+      : undefined;
+    const candidate = resume === null
+      ? currentTopicResumeCandidate(store, options, projection.jobId)
+      : null;
+    return enrichTopicResumeAction(projection, candidate, activeState);
+  } catch (error) {
+    if (error instanceof Error && error.message === "Malformed Telegram topic resume") {
+      return enrichTopicResumeAction(projection, null, "reopen_unknown");
+    }
+    if (isMalformedTopicResumeProjectionEvidence(error)) return projection;
+    throw error;
+  }
+}
+
+function currentTopicResumeCandidate(
+  store: SqliteTelegramJobStore,
+  options: NonNullable<TelegramReliabilityRuntimeOptions["topicResume"]>,
+  jobId: string,
+): TelegramTopicResumeCandidate | null {
+  const job = store.get(jobId);
+  if (!job?.threadId) return null;
+  const thread = options.getThread(job.threadId);
+  if (!thread) return null;
+  const rawSource = store.readSourcePayload(job.id);
+  if (!record(rawSource)) return null;
+  const source = rawSource as unknown as TelegramWorkSource;
+  const rawDestination = record(source.targetContext) ? source.targetContext : source;
+  if (!Number.isSafeInteger(rawDestination.chatId) || rawDestination.chatId === 0
+    || !Number.isSafeInteger(rawDestination.messageThreadId)
+    || rawDestination.messageThreadId === null || rawDestination.messageThreadId < 1) return null;
+  const destination = {
+    chatId: rawDestination.chatId,
+    messageThreadId: rawDestination.messageThreadId,
+  };
+  let deliveries: ReturnType<SqliteTelegramJobStore["listDeliveries"]>;
+  let anchorPlan: ReturnType<SqliteTelegramJobStore["getStatusAnchorPlan"]>;
+  let recovery: ReturnType<SqliteTelegramJobStore["getTopicRecovery"]>;
+  try {
+    deliveries = store.listDeliveries(job.id);
+    anchorPlan = store.getStatusAnchorPlan(job.id);
+    recovery = store.getTopicRecovery(job.id);
+  } catch (error) {
+    if (isMalformedTopicResumeProjectionEvidence(error)) return null;
+    throw error;
+  }
+  return planTelegramTopicResume({
+    job,
+    source,
+    deliveries,
+    anchorPlan,
+    thread,
+    recovery,
+    hasExistingAttempt: store.getTopicResume(job.id) !== null,
+    forumChatId: options.forumChatId,
+    hasThreadTopicBinding: options.hasThreadTopicBinding(job.threadId, destination),
+    quarantined: store.hasJobQuarantine(job.id),
+  });
+}
+
+function isActiveTopicResumeState(value: string): value is TelegramTopicResumeActionState {
+  return value === "probe_in_flight" || value === "probe_retry_wait"
+    || value === "reopen_in_flight" || value === "reopen_retry_wait"
+    || value === "reopen_unknown" || value === "delivery_handoff";
+}
+
+function isMalformedTopicResumeProjectionEvidence(error: unknown): boolean {
+  return error instanceof Error && (
+    error.message === "Malformed Telegram delivery part"
+    || error.message === "Malformed Telegram job source payload"
+    || error.message === "Malformed Telegram status anchor plan"
+    || error.message === "Malformed Telegram topic recovery"
+  );
 }
 
 function currentTopicRecoveryCandidate(

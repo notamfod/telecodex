@@ -254,6 +254,57 @@ describe("Mini App HTTP server", () => {
     expect(tampered.status).toBe(400);
   });
 
+  it("accepts existing-topic resume only as an authenticated version-only DTO", async () => {
+    const { server, runJobAction } = await start();
+    const jobId = "11111111-1111-4111-8111-111111111111";
+    const url = `${server.url}/api/dashboard/jobs/${jobId}/actions/resume_existing_topic`;
+    const headers = {
+      "content-type": "application/json",
+      "x-telegram-init-data": signedInitData(),
+    };
+
+    const unauthorized = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expectedVersion: 541 }),
+    });
+    const wrongContentType = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "text/plain",
+        "x-telegram-init-data": signedInitData(),
+      },
+      body: JSON.stringify({ expectedVersion: 541 }),
+    });
+    const unknown = await fetch(
+      `${server.url}/api/dashboard/jobs/${jobId}/actions/resume_some_topic`,
+      { method: "POST", headers, body: JSON.stringify({ expectedVersion: 541 }) },
+    );
+    const accepted = await fetch(url, {
+      method: "POST", headers, body: JSON.stringify({ expectedVersion: 541 }),
+    });
+    const extras = [
+      "chatId", "messageThreadId", "threadId", "partKey", "actionToken", "alertId", "extra",
+    ];
+    const rejected = await Promise.all(extras.map((key) => fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ expectedVersion: 541, [key]: key }),
+    })));
+
+    expect(unauthorized.status).toBe(401);
+    expect(wrongContentType.status).toBe(400);
+    expect(unknown.status).toBe(400);
+    expect(accepted.status).toBe(200);
+    expect(rejected.map(({ status }) => status)).toEqual(extras.map(() => 400));
+    expect(runJobAction).toHaveBeenCalledOnce();
+    expect(runJobAction).toHaveBeenCalledWith({
+      kind: "resume_existing_topic",
+      jobId,
+      expectedVersion: 541,
+    });
+  });
+
   it("rejects malformed thread ids without calling Telegram", async () => {
     const { server, ensureTopic } = await start();
 

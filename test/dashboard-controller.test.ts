@@ -187,6 +187,30 @@ describe("Dashboard controller", () => {
     expect(runJobAction).not.toHaveBeenCalled();
   });
 
+  it("forwards only the exact projected existing-topic resume envelope", async () => {
+    const runJobAction = vi.fn(async () => undefined);
+    const legal: TelegramStatusAction = {
+      kind: "resume_existing_topic",
+      jobId: "11111111-1111-4111-8111-111111111111",
+      expectedVersion: 541,
+    };
+    const controller = createDashboardController({
+      chatId: -1001234567890,
+      collect: async () => emptySnapshot,
+      loadReliability: async () => reliabilityWithAction(legal),
+      runJobAction,
+      getThread: () => undefined,
+      ensureThreadTopic: vi.fn(),
+    });
+
+    await expect(controller.runJobAction({ ...legal, partKey: "status-anchor" }))
+      .rejects.toThrow("Dashboard action is no longer legal");
+    await controller.runJobAction(legal);
+
+    expect(runJobAction).toHaveBeenCalledOnce();
+    expect(runJobAction).toHaveBeenCalledWith(legal);
+  });
+
   it("does not create a topic for a thread unavailable on this host", async () => {
     const controller = createDashboardController({
       chatId: -1001234567890,

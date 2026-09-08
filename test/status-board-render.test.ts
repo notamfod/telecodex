@@ -154,6 +154,21 @@ describe("unified status board rendering", () => {
     });
   });
 
+  it("renders the bounded existing-topic resume action", () => {
+    const value = projection({ actions: [{
+      kind: "resume_existing_topic",
+      jobId: "job-123456789",
+      expectedVersion: 541,
+    }], expectedVersion: 541 });
+
+    expect(renderStatusBoard(snapshot([{
+      projection: value, label: "Existing topic", workspace: "/srv/telecodex",
+    }]), CHAT_ID).buttons[0]).toEqual({
+      text: "Resume topic",
+      callbackData: "tcj:u:job-123456789:541",
+    });
+  });
+
   it("counts only projected running or delivering work against Telegram slots", () => {
     expect(buildProjected([
       projection({ phase: "accepted", state: "accepted" }),

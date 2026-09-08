@@ -350,6 +350,7 @@ export function telegramStatusActionCallbackData(action: TelegramStatusAction): 
     inspect: "i",
     retry_delivery: "y",
     recover_missing_topic: "o",
+    resume_existing_topic: "u",
     send_again_warning: "s",
     guardian_restore: "g",
   };
@@ -364,6 +365,7 @@ function actionLabel(action: TelegramStatusAction): string {
     abort: "Stop", refresh: "Refresh", details: "Details", inspect: "Inspect",
     retry_new_turn: "Retry", guardian_restore: "Restore", retry_delivery: "Retry delivery",
     recover_missing_topic: "Recover topic",
+    resume_existing_topic: "Resume topic",
     send_again_warning: "Send again",
   };
   return labels[action.kind];

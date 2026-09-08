@@ -1,4 +1,5 @@
 import {
+  enrichTopicResumeAction,
   enrichTopicRecoveryAction,
   projectTelegramJobStatus,
   type TelegramJobStatusProjection,
@@ -6,6 +7,7 @@ import {
   type TelegramStatusGuardianEvidence,
 } from "../src/telegram-status-projection.js";
 import type { TelegramTopicRecoveryCandidate } from "../src/telegram-topic-recovery.js";
+import type { TelegramTopicResumeCandidate } from "../src/telegram-topic-resume.js";
 import type { DeliveryPart } from "../src/telegram-job-store.js";
 import type { GuardianThreadInspection } from "../src/session-guardian-ipc-client.js";
 import type { TelegramJob, TelegramJobEvent } from "../src/telegram-job-types.js";
@@ -233,6 +235,52 @@ describe("projectTelegramJobStatus", () => {
       ]);
     },
   );
+
+  it("enriches only a matching server-proven existing-topic resume candidate", () => {
+    const projection = project({
+      job: job({ phase: "delivering", version: 541 }),
+      deliveries: [delivery("status-anchor", "status-anchor", "failed")],
+    });
+    const original = structuredClone(projection);
+
+    expect(enrichTopicResumeAction(projection, resumeCandidate()).actions[0]).toEqual({
+      kind: "resume_existing_topic",
+      jobId: projection.jobId,
+      expectedVersion: projection.expectedVersion,
+    });
+    expect(enrichTopicResumeAction(projection, null)).toBe(projection);
+    expect(projection).toEqual(original);
+    expect(() => enrichTopicResumeAction(projection, resumeCandidate({ expectedVersion: 542 })))
+      .toThrow("Topic resume candidate does not match status projection");
+  });
+
+  it.each([
+    "probe_in_flight",
+    "probe_retry_wait",
+    "reopen_in_flight",
+    "reopen_retry_wait",
+    "reopen_unknown",
+    "delivery_handoff",
+  ] as const)("suppresses only the affected anchor retry while resume is %s", (resumeState) => {
+    const projection = project({
+      job: job({ phase: "delivering", version: 541, responsePlan: [
+        { partId: "final:0000", kind: "final" },
+      ] }),
+      deliveries: [
+        delivery("status-anchor", "status-anchor", "failed"),
+        delivery("final:0000", "final", "failed"),
+      ],
+    });
+
+    expect(enrichTopicResumeAction(projection, null, resumeState).actions).toEqual([
+      action("retry_delivery", 541, { partKey: "final:0000" }),
+      action("details", 541),
+    ]);
+    expect(enrichTopicResumeAction(projection, resumeCandidate(), resumeState).actions).toEqual([
+      action("retry_delivery", 541, { partKey: "final:0000" }),
+      action("details", 541),
+    ]);
+  });
 
   it("never renders completed as Done until the anchor identity and all planned parts are delivered", () => {
     const incomplete = project({
@@ -463,6 +511,20 @@ function recoveryCandidate(
       },
       contentHash: "a".repeat(64),
     },
+    ...overrides,
+  };
+}
+
+function resumeCandidate(
+  overrides: Partial<TelegramTopicResumeCandidate> = {},
+): TelegramTopicResumeCandidate {
+  return {
+    jobId: "job-123456789",
+    expectedVersion: 541,
+    threadId: THREAD_ID,
+    destination: { chatId: -1001, messageThreadId: 7 },
+    anchorPartKey: "status-anchor",
+    anchorAttemptCount: 1,
     ...overrides,
   };
 }

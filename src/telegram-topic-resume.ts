@@ -18,6 +18,7 @@ import { encodeCanonicalTopicRecoverySource } from "./telegram-topic-recovery-so
 import type { TelegramTopicDestination } from "./telegram-topic-recovery.js";
 
 export interface TelegramTopicResumeCandidate {
+  readonly mode: TelegramTopicResumeMode;
   readonly jobId: string;
   readonly expectedVersion: number;
   readonly threadId: string;
@@ -53,25 +54,41 @@ export interface TelegramTopicResumeContinuationInput extends TelegramTopicResum
 export function planTelegramTopicResume(
   input: TelegramTopicResumeEligibilityInput,
 ): TelegramTopicResumeCandidate | null {
-  return planTelegramTopicResumeWithContract(input, {
-    allowExistingAttempt: false,
-    expectedAnchorAttemptCount: 1,
-    expectedRecoveryJobVersion: input.job.version,
-  });
+  try {
+    const baseline = input.deliveries.find((row) => row.partKey === "status-anchor")?.attemptCount;
+    if (baseline === undefined || !Number.isSafeInteger(baseline) || baseline < 1) return null;
+    const mode = baseline === 1 ? "standard" : "warning_replay";
+    const recoveryVersion = mode === "standard" ? input.job.version : input.recovery?.currentJobVersion;
+    if (recoveryVersion === undefined || !Number.isSafeInteger(recoveryVersion)
+      || recoveryVersion > input.job.version) return null;
+    return planTelegramTopicResumeWithContract(input, {
+      mode,
+      allowExistingAttempt: false,
+      expectedAnchorAttemptCount: baseline,
+      expectedRecoveryJobVersion: recoveryVersion,
+    });
+  } catch {
+    return null;
+  }
 }
 
 export function isTelegramTopicResumeContinuationValid(
   input: TelegramTopicResumeContinuationInput,
 ): boolean {
   try {
-    if (input.mode !== "standard" || !input.hasExistingAttempt
-      || input.anchorAttemptBaseline !== 1
-      || input.recoveryJobVersionBaseline !== input.reservedJobVersion
+    if (!input.hasExistingAttempt
+      || (input.mode !== "standard" && input.mode !== "warning_replay")
+      || !Number.isSafeInteger(input.anchorAttemptBaseline)
+      || (input.mode === "standard" ? input.anchorAttemptBaseline !== 1
+        || input.recoveryJobVersionBaseline !== input.reservedJobVersion
+        : input.anchorAttemptBaseline < 2
+          || input.recoveryJobVersionBaseline > input.reservedJobVersion)
       || input.currentJobVersion !== input.job.version
       || !Number.isSafeInteger(input.reservedJobVersion) || input.reservedJobVersion < 1
       || input.reservedJobVersion >= input.currentJobVersion
       || !/^[0-9a-f]{64}$/.test(input.deliveryTopologyHash)) return false;
     const candidate = planTelegramTopicResumeWithContract(input, {
+      mode: input.mode,
       allowExistingAttempt: true,
       expectedAnchorAttemptCount: input.anchorAttemptBaseline,
       expectedRecoveryJobVersion: input.recoveryJobVersionBaseline,
@@ -126,6 +143,7 @@ export function hashTelegramTopicResumeTopology(
 function planTelegramTopicResumeWithContract(
   input: TelegramTopicResumeEligibilityInput,
   contract: {
+    readonly mode: TelegramTopicResumeMode;
     readonly allowExistingAttempt: boolean;
     readonly expectedAnchorAttemptCount: number;
     readonly expectedRecoveryJobVersion: number;
@@ -145,7 +163,7 @@ function planTelegramTopicResumeWithContract(
     const anchors = deliveries.filter((part) => part.partKey === "status-anchor");
     const followers = deliveries.filter((part) => part.partKey !== "status-anchor");
     const anchor = anchors[0];
-    if (job.responsePlan!.length !== 2 || followers.length !== 2 || anchors.length !== 1
+    if ((!contract.allowExistingAttempt && job.responsePlan!.length !== 2) || anchors.length !== 1
       || followers.length !== job.responsePlan!.length
       || deliveries.length !== job.responsePlan!.length + 1
       || !validAnchor(anchor, job.id, destination, anchorPlan,
@@ -172,6 +190,7 @@ function planTelegramTopicResumeWithContract(
     if (!isDeepStrictEqual(job.deliveries, projection)) return null;
 
     return {
+      mode: contract.mode,
       jobId: job.id,
       expectedVersion: job.version,
       threadId: input.thread!.id,
@@ -255,6 +274,7 @@ function validAnchor(
     && row.attemptCount === expectedAttemptCount
     && row.nextAttemptAt === null && row.lastErrorCode === "telegram_permanent"
     && canonicalPayload(row.payload, row.contentHash)
+    && (expectedAttemptCount === 1 || normalizeTelegramDeliveryPayload(row.payload).operation === "send_text")
     && isDeepStrictEqual(row.payload, plan.payload) && row.contentHash === plan.contentHash
     && payloadMatchesDestination(row.payload, destination);
 }

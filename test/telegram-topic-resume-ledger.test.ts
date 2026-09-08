@@ -130,6 +130,33 @@ describe("Telegram existing topic resume ledger", () => {
     expect(result.resume.recoveryJobVersionBaseline).toBe(result.resume.reservedJobVersion);
   });
 
+  it("atomically reserves warning mode with the exact baseline and trailing recovery", () => {
+    const fixture = resumable(open());
+    raw(databasePath, (db) => db.prepare(`UPDATE deliveries SET attempt_count = 4
+      WHERE job_id = ? AND part_key = 'status-anchor'`).run(fixture.job.id));
+    const original = reserveInput(fixture, 1);
+    const result = fixture.store.reserveTopicResume({
+      ...original, allowedModes: new Set(["warning_replay"]),
+      candidate: { ...original.candidate, mode: "warning_replay", anchorAttemptCount: 4 },
+    });
+    expect(result.resume).toMatchObject({
+      mode: "warning_replay", anchorAttemptBaseline: 4,
+      recoveryJobVersionBaseline: fixture.job.version,
+      currentJobVersion: result.job.version,
+    });
+    expect(() => fixture.store.reserveTopicResume(original)).toThrow();
+  });
+
+  it.each([undefined, new Set(), new Set(["warning_replay"] as const)])(
+    "rejects standard reservation without exact allowed-mode authority", (allowedModes) => {
+      const fixture = resumable(open());
+      const before = snapshot(databasePath, fixture.job.id);
+      expect(() => fixture.store.reserveTopicResume({ ...reserveInput(fixture, 1), allowedModes }))
+        .toThrow("Telegram topic resume conflict");
+      expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
+    },
+  );
+
   it("allows exactly the prescribed state transitions", () => {
     const legal: Readonly<Record<TelegramTopicResumeState, readonly TelegramTopicResumeState[]>> = {
       probe_in_flight: ["probe_retry_wait", "reopen_in_flight", "delivery_handoff", "failed"],
@@ -440,12 +467,12 @@ describe("Telegram existing topic resume ledger", () => {
       });
       const before = snapshot(databasePath, fixture.job.id);
 
-      expect(fixture.store.settleTopicResumeDelivery({
+      expect(() => fixture.store.settleTopicResumeDelivery({
         jobId: fixture.job.id,
         expectedVersion: advanced.version,
         actionToken: handoff.resume.actionToken,
         updatedAt: NOW + 32,
-      })).toEqual(handoff.resume);
+      })).toThrow("Telegram topic resume conflict");
       expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
     },
   );
@@ -459,12 +486,12 @@ describe("Telegram existing topic resume ledger", () => {
       fixture.job.id, fixture.reserved.job.version, fixture.reserved.resume.actionToken,
       "probe_in_flight", "delivery_handoff",
     ));
-    const sending = fixture.store.transitionDeliveryAndProject({
+    const sending = guardedDeliveryTransition(fixture.store, {
       jobId: fixture.job.id, partKey: "status-anchor", expectedJobVersion: handoff.job.version,
       expectedState: "failed", expectedAttemptCount: 1, state: "sending", attemptCount: 1,
       allowFailedRetry: true, eventId: `anchor-retry-${state}`, updatedAt: NOW + 31,
     });
-    const terminal = fixture.store.transitionDeliveryAndProject({
+    const terminal = guardedDeliveryTransition(fixture.store, {
       jobId: fixture.job.id, partKey: "status-anchor", expectedJobVersion: sending.job.version,
       expectedState: "sending", expectedAttemptCount: 1, state, attemptCount: 2,
       lastErrorCode: "telegram_permanent", eventId: `anchor-${state}`, updatedAt: NOW + 31,
@@ -484,12 +511,12 @@ describe("Telegram existing topic resume ledger", () => {
       fixture.job.id, fixture.reserved.job.version, fixture.reserved.resume.actionToken,
       "probe_in_flight", "delivery_handoff",
     ));
-    const sending = fixture.store.transitionDeliveryAndProject({
+    const sending = guardedDeliveryTransition(fixture.store, {
       jobId: fixture.job.id, partKey: "status-anchor", expectedJobVersion: handoff.job.version,
       expectedState: "failed", expectedAttemptCount: 1, state: "sending", attemptCount: 1,
       allowFailedRetry: true, eventId: "anchor-jump-sending", updatedAt: NOW + 31,
     });
-    const failed = fixture.store.transitionDeliveryAndProject({
+    const failed = guardedDeliveryTransition(fixture.store, {
       jobId: fixture.job.id, partKey: "status-anchor", expectedJobVersion: sending.job.version,
       expectedState: "sending", expectedAttemptCount: 1, state: "failed", attemptCount: 3,
       lastErrorCode: "telegram_permanent", eventId: "anchor-jump-failed", updatedAt: NOW + 32,
@@ -499,7 +526,7 @@ describe("Telegram existing topic resume ledger", () => {
     expect(fixture.store.settleTopicResumeDelivery({
       jobId: fixture.job.id, expectedVersion: failed.job.version,
       actionToken: handoff.resume.actionToken, updatedAt: NOW + 33,
-    })).toEqual(handoff.resume);
+    })).toMatchObject({ state: "delivery_handoff", currentJobVersion: failed.job.version });
     expect(snapshot(databasePath, fixture.job.id)).toEqual(before);
   });
 
@@ -513,22 +540,22 @@ describe("Telegram existing topic resume ledger", () => {
       fixture.job.id, fixture.reserved.job.version, fixture.reserved.resume.actionToken,
       "probe_in_flight", "delivery_handoff",
     ));
-    const anchorSending = fixture.store.transitionDeliveryAndProject({
+    const anchorSending = guardedDeliveryTransition(fixture.store, {
       jobId: fixture.job.id, partKey: "status-anchor", expectedJobVersion: handoff.job.version,
       expectedState: "failed", expectedAttemptCount: 1, state: "sending", attemptCount: 1,
       allowFailedRetry: true, eventId: `follower-${state}-anchor-sending`, updatedAt: NOW + 31,
     });
-    const anchorDelivered = fixture.store.transitionDeliveryAndProject({
+    const anchorDelivered = guardedDeliveryTransition(fixture.store, {
       jobId: fixture.job.id, partKey: "status-anchor", expectedJobVersion: anchorSending.job.version,
       expectedState: "sending", expectedAttemptCount: 1, state: "delivered", attemptCount: 2,
       telegramMessageId: 71, eventId: `follower-${state}-anchor-delivered`, updatedAt: NOW + 32,
     });
-    const followerSending = fixture.store.transitionDeliveryAndProject({
+    const followerSending = guardedDeliveryTransition(fixture.store, {
       jobId: fixture.job.id, partKey: "final:0000", expectedJobVersion: anchorDelivered.job.version,
       expectedState: "pending", expectedAttemptCount: 0, state: "sending", attemptCount: 0,
       eventId: `follower-${state}-sending`, updatedAt: NOW + 33,
     });
-    const followerTerminal = fixture.store.transitionDeliveryAndProject({
+    const followerTerminal = guardedDeliveryTransition(fixture.store, {
       jobId: fixture.job.id, partKey: "final:0000", expectedJobVersion: followerSending.job.version,
       expectedState: "sending", expectedAttemptCount: 0, state, attemptCount,
       lastErrorCode: state === "failed" ? "telegram_permanent" : "telegram_send_uncertain",
@@ -689,6 +716,7 @@ function reserveInput(
 ) {
   return {
     candidate: fixture.candidate,
+    allowedModes: new Set(["standard"] as const),
     externalEligibilitySnapshot: {
       thread: fixture.thread,
       forumChatId: DESTINATION.chatId,
@@ -851,13 +879,13 @@ function deliverAllAndFinalize(store: SqliteTelegramJobStore, initial: TelegramJ
   let updatedAt = NOW + 32;
   for (const partKey of ["status-anchor", "final:0000", "notice:0001"]) {
     const part = store.listDeliveries(job.id).find((candidate) => candidate.partKey === partKey)!;
-    const sending = store.transitionDeliveryAndProject({
+    const sending = guardedDeliveryTransition(store, {
       jobId: job.id, partKey, expectedJobVersion: job.version,
       expectedState: part.state, expectedAttemptCount: part.attemptCount,
       state: "sending", attemptCount: part.attemptCount,
       allowFailedRetry: part.state === "failed", eventId: `${partKey}:sending`, updatedAt: updatedAt++,
     });
-    const delivered = store.transitionDeliveryAndProject({
+    const delivered = guardedDeliveryTransition(store, {
       jobId: job.id, partKey, expectedJobVersion: sending.job.version,
       expectedState: "sending", expectedAttemptCount: part.attemptCount,
       state: "delivered", attemptCount: part.attemptCount + 1, telegramMessageId: updatedAt,
@@ -879,6 +907,20 @@ function rewriteSourceDestination(databasePath: string, jobId: string): void {
     source.messageThreadId += 1;
     database.prepare("UPDATE inbox_updates SET source_json = ? WHERE job_id = ?")
       .run(JSON.stringify(source), jobId);
+  });
+}
+
+function guardedDeliveryTransition(store: SqliteTelegramJobStore,
+  input: Parameters<SqliteTelegramJobStore["transitionDeliveryAndProject"]>[0]) {
+  const job = store.get(input.jobId)!;
+  const part = store.listDeliveries(job.id).find((row) => row.partKey === input.partKey)!;
+  const authorization = input.state === "sending"
+    ? store.authorizeTopicResumeDelivery(job, part, input.updatedAt, externalSnapshot()) : null;
+  return store.transitionDeliveryAndProject({ ...input,
+    nextAttemptAt: input.state === "sending" ? input.updatedAt + 1_000 : null,
+    lastErrorCode: input.state === "sending" || input.state === "delivered" ? null : input.lastErrorCode,
+    expectedContentHash: part.contentHash,
+    ...(authorization ? { topicResumeAuthorization: authorization } : {}),
   });
 }
 

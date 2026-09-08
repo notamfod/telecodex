@@ -34,7 +34,7 @@ const PROBE_REASON_CODES = new Set([
 ]);
 const ACTION_KINDS = new Set<TelegramStatusActionKind>([
   "abort", "refresh", "details", "inspect", "retry_new_turn", "guardian_restore",
-  "retry_delivery", "recover_missing_topic", "resume_existing_topic", "send_again_warning",
+  "retry_delivery", "recover_missing_topic", "resume_existing_topic", "resume_existing_topic_warning", "send_again_warning",
 ]);
 
 export interface MiniAppProbeResult {
@@ -226,7 +226,8 @@ async function handleRequest(
   if (actionMatch && request.method === "POST" && JOB_ID_PATTERN.test(actionMatch[1])) {
     authenticate(request, options);
     if (!options.runJobAction) throw httpError(503, "Dashboard job actions are unavailable");
-    if (actionMatch[2] === "resume_existing_topic" && !hasJsonContentType(request)) {
+    if ((actionMatch[2] === "resume_existing_topic" || actionMatch[2] === "resume_existing_topic_warning")
+      && !hasJsonContentType(request)) {
       throw httpError(400, "Invalid dashboard action");
     }
     const body = await readJsonObject(request);
@@ -376,7 +377,7 @@ function parseJobAction(
   if (!ACTION_KINDS.has(rawKind as TelegramStatusActionKind)) {
     throw httpError(400, "Invalid dashboard action");
   }
-  const allowedKeys = rawKind === "resume_existing_topic"
+  const allowedKeys = rawKind === "resume_existing_topic" || rawKind === "resume_existing_topic_warning"
     ? new Set(["expectedVersion"])
     : new Set(["expectedVersion", "alertId", "partKey"]);
   if (Object.keys(body).some((key) => !allowedKeys.has(key))) {

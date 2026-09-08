@@ -229,6 +229,8 @@ export class TelegramTopicRecoveryLedger {
     }
     const placeholders = states.map(() => "?").join(", ");
     return (this.host.statement(`SELECT * FROM topic_recoveries WHERE state IN (${placeholders})
+      AND NOT EXISTS (SELECT 1 FROM topic_resume_attempts WHERE topic_resume_attempts.job_id = topic_recoveries.job_id)
+      AND NOT EXISTS (SELECT 1 FROM job_quarantine WHERE job_quarantine.job_id = topic_recoveries.job_id)
       ORDER BY updated_at_ms, job_id LIMIT ?`).all(...states, limit) as Record<string, unknown>[])
       .map(decodeRecovery);
   }

@@ -963,6 +963,8 @@ describe("TelegramDurableStatusService", () => {
       listEventSummaries: store.listEventSummaries.bind(store),
       getDispatchableQueuePosition: store.getDispatchableQueuePosition.bind(store),
       listDeliveries: store.listDeliveries.bind(store),
+      readStatusDeliveryEvidence: store.readStatusDeliveryEvidence.bind(store),
+      hasTopicResume: store.hasTopicResume.bind(store),
       readSourcePayload: store.readSourcePayload.bind(store),
       prepareStatusAnchorRevision: store.prepareStatusAnchorRevision.bind(store),
       finishStatusAnchorRevision: store.finishStatusAnchorRevision.bind(store),

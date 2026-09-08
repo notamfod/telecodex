@@ -25,6 +25,7 @@ export type TelegramStatusActionKind =
   | "retry_delivery"
   | "recover_missing_topic"
   | "resume_existing_topic"
+  | "resume_existing_topic_warning"
   | "send_again_warning";
 
 export type TelegramTopicRecoveryActionState = "in_flight" | "retry_wait" | "unknown";
@@ -164,12 +165,12 @@ export function enrichTopicRecoveryAction(
 export function enrichTopicResumeAction(
   projection: TelegramJobStatusProjection,
   candidate: TelegramTopicResumeCandidate | null,
-  attemptState?: TelegramTopicResumeActionState,
+  attemptState?: TelegramTopicResumeState,
 ): TelegramJobStatusProjection {
   const actions = attemptState === undefined
     ? projection.actions
     : projection.actions.filter((action) => !(
-        action.kind === "retry_delivery" && action.partKey === TELEGRAM_STATUS_ANCHOR_PART_KEY
+        action.kind === "retry_delivery" || action.kind === "send_again_warning"
       ));
   if (candidate === null || attemptState !== undefined) {
     return actions === projection.actions ? projection : { ...projection, actions };
@@ -181,7 +182,7 @@ export function enrichTopicResumeAction(
   return {
     ...projection,
     actions: [{
-      kind: "resume_existing_topic",
+      kind: candidate.mode === "warning_replay" ? "resume_existing_topic_warning" : "resume_existing_topic",
       jobId: projection.jobId,
       expectedVersion: projection.expectedVersion,
     }, ...actions],

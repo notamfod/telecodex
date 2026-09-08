@@ -297,17 +297,20 @@ describe("canonical Telegram control routing", () => {
     ]);
   });
 
-  it("routes existing-topic resume only through the exact Dashboard action envelope", async () => {
+  it.each([
+    ["resume_existing_topic", "u", "Topic resume started"],
+    ["resume_existing_topic_warning", "w", "Warning replay started"],
+  ] as const)("routes %s through the exact Dashboard action envelope", async (kind, code, label) => {
     const subject = harness({ telegramForumChatId: -1001 });
     vi.spyOn(subject.bot.statusBoard!, "isDashboardMessage").mockReturnValue(true);
 
-    await subject.bot.handleUpdate(callbackUpdate(563, "tcj:u:job-exact:541"));
+    await subject.bot.handleUpdate(callbackUpdate(563, `tcj:${code}:job-exact:541`));
 
     expect(subject.reliability.runDashboardAction).toHaveBeenCalledWith({
-      kind: "resume_existing_topic", jobId: "job-exact", expectedVersion: 541,
+      kind, jobId: "job-exact", expectedVersion: 541,
     }, undefined);
     expect(subject.apiCalls.at(-1)).toEqual([
-      "answerCallbackQuery", expect.objectContaining({ text: "Topic resume started" }),
+      "answerCallbackQuery", expect.objectContaining({ text: label }),
     ]);
   });
 

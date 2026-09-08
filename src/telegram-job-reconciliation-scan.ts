@@ -14,7 +14,7 @@ const JOB_WITH_INBOX = `SELECT jobs.*, inbox_updates.bot_id AS inbox_bot_id, inb
 
 export interface TelegramJobQuarantine {
   readonly jobId: string;
-  readonly reasonCode: "malformed_persisted_job";
+  readonly reasonCode: "malformed_persisted_job" | "malformed_topic_resume_evidence";
   readonly fingerprint: string;
   readonly quarantinedAt: number;
 }
@@ -45,6 +45,7 @@ export function scanTelegramReconciliationCandidates(
   const rows = host.statement(`${JOB_WITH_INBOX}
     LEFT JOIN job_quarantine ON job_quarantine.job_id = jobs.id
     WHERE job_quarantine.job_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM topic_resume_attempts WHERE topic_resume_attempts.job_id = jobs.id)
       AND (? IS NULL OR inbox_updates.accepted_at_ms > ?
         OR (inbox_updates.accepted_at_ms = ? AND jobs.id > ?))
     ORDER BY inbox_updates.accepted_at_ms ASC, jobs.id ASC LIMIT ?`).all(
@@ -103,7 +104,7 @@ export function listTelegramJobQuarantine(
   return host.statement(`SELECT job_id, reason_code, fingerprint, quarantined_at_ms
     FROM job_quarantine ORDER BY quarantined_at_ms ASC, job_id ASC LIMIT ?`).all(limit).map((value) => {
     const row = value as Record<string, unknown>;
-    if (row.reason_code !== "malformed_persisted_job") malformed();
+    if (row.reason_code !== "malformed_persisted_job" && row.reason_code !== "malformed_topic_resume_evidence") malformed();
     return {
       jobId: bounded(row.job_id, "jobId"), reasonCode: row.reason_code,
       fingerprint: fingerprint(row.fingerprint),

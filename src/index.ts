@@ -171,7 +171,7 @@ try {
         console.warn(`Telegram topic recovery: ${reasonCode}`);
       },
     });
-    const topicResume = config.telegramTopicResumeEnabled
+    const topicResume = config.telegramForumChatId !== undefined
       ? createTelegramTopicResumeAdapter({
           token: config.telegramBotToken,
           forumChatId: config.telegramForumChatId ?? 0,
@@ -219,6 +219,10 @@ try {
       ...(topicResume ? {
         topicResume: {
           ...topicResume,
+          allowedModes: new Set([
+            ...(config.telegramTopicResumeEnabled ? ["standard" as const] : []),
+            ...(config.telegramTopicWarningReplayEnabled ? ["warning_replay" as const] : []),
+          ]),
           operationTimeoutMs: config.reliabilityTimeouts.telegramDeliveryMs,
         },
       } : {}),

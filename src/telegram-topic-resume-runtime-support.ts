@@ -3,9 +3,10 @@ import { createHash } from "node:crypto";
 import type { TelegramWorkSource } from "./telegram-job-ingress.js";
 import type { SqliteTelegramJobStore } from "./telegram-job-store.js";
 import type { TelegramJob } from "./telegram-job-types.js";
-import { telegramRetryAfterMs } from "./telegram-rate-limit.js";
 import type { TelegramTopicResumeRecord } from "./telegram-topic-resume-ledger.js";
 import type { TelegramTopicDestination } from "./telegram-topic-recovery.js";
+
+export { definitiveTelegramRetryAfterMs as immediateTelegramRetryAfterMs } from "./telegram-rate-limit.js";
 
 const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
 const MAX_OPERATION_TIMEOUT_MS = 300_000;
@@ -61,10 +62,6 @@ export function isDefinitiveTelegram4xx(error: unknown): boolean {
   const code = record(error)?.error_code;
   return typeof code === "number" && Number.isFinite(code)
     && code >= 400 && code < 500 && code !== 429;
-}
-
-export function immediateTelegramRetryAfterMs(error: unknown): number | undefined {
-  return record(error)?.error_code === 429 ? telegramRetryAfterMs(error) : undefined;
 }
 
 function record(value: unknown): Record<string, unknown> | null {

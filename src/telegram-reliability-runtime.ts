@@ -44,7 +44,6 @@ import {
   enrichTopicResumeAction,
   type TelegramStatusAction,
   type TelegramTopicRecoveryActionState,
-  type TelegramTopicResumeActionState,
 } from "./telegram-status-projection.js";
 import {
   planTelegramTopicRecovery,
@@ -173,6 +172,10 @@ export interface TelegramReliabilityRuntime {
 export function createTelegramReliabilityRuntime(
   options: TelegramReliabilityRuntimeOptions,
 ): TelegramReliabilityRuntime {
+  if (options.topicResume) options = {
+    ...options, topicResume: { ...options.topicResume,
+      allowedModes: new Set(options.topicResume.allowedModes ?? []) },
+  };
   const now = options.now ?? Date.now;
   const createId = options.createId ?? randomUUID;
   const store = options.store;
@@ -278,6 +281,14 @@ export function createTelegramReliabilityRuntime(
       const destination = responseDestination(store, requireJob(store, jobId));
       return { chatId: destination.chatId, messageThreadId: destination.messageThreadId };
     },
+    ...(options.topicResume ? { topicResumeExternalSnapshot: (jobId: string) => {
+      const job = store.get(jobId);
+      const resume = store.getTopicResume(jobId);
+      const thread = job?.threadId ? options.topicResume!.getThread(job.threadId) : null;
+      return { thread, forumChatId: options.topicResume!.forumChatId,
+        hasThreadTopicBinding: !!thread && !!resume
+          && options.topicResume!.hasThreadTopicBinding(thread.id, resume.destination) };
+    } } : {}),
   });
   const trackTopicRecoveryEffect = (effect: Promise<void>): void => {
     const drain = effect.catch(() => undefined);
@@ -323,12 +334,10 @@ export function createTelegramReliabilityRuntime(
   topicResume = options.topicResume
     ? createTelegramTopicResumeRuntime({
         ...options.topicResume,
+        now: options.topicResume.now ?? now,
+        createId: options.topicResume.createId ?? createId,
         store,
-        outboxRetryFailed: (jobId, partKey, expectedJobVersion) => outbox.retryFailed(
-          jobId,
-          partKey,
-          { expectedJobVersion },
-        ),
+        outboxRetryFailed: () => outbox.pump(),
         outboxPump: () => outbox.pump(),
         trackEffect: trackTopicResumeEffect,
       })
@@ -556,7 +565,7 @@ export function createTelegramReliabilityRuntime(
 
   const reconcileTargetProvisions = async (): Promise<void> => {
     for (const job of store.listUnfinished(1_000)) {
-      if (job.phase !== "accepted") continue;
+      if (store.hasTopicResume(job.id) || job.phase !== "accepted") continue;
       const source = durableSource(store, job);
       if (!source.targetProvision || source.targetContext) continue;
       try { await ensureTarget(job.id); }
@@ -588,6 +597,7 @@ export function createTelegramReliabilityRuntime(
   };
   const releaseAmbiguousRetryParent = (childSource: TelegramWorkSource): void => {
     if (childSource.kind !== "retry" || childSource.retryOfJobId === null) return;
+    if (store.hasTopicResume(childSource.retryOfJobId)) return;
     const parent = store.get(childSource.retryOfJobId);
     if (!parent) return;
     const targetProvisionUnknown = parent.phase === "accepted"
@@ -612,6 +622,7 @@ export function createTelegramReliabilityRuntime(
   };
   const releasePersistedRetryParents = (): void => {
     for (const child of store.listUnfinished(1_000)) {
+      if (store.hasTopicResume(child.id)) continue;
       const source = normalizeWorkSource(store.readSourcePayload(child.id));
       releaseAmbiguousRetryParent(source);
     }
@@ -786,7 +797,7 @@ export function createTelegramReliabilityRuntime(
         await topicRecovery.recover(action);
         return;
       }
-      if (action.kind === "resume_existing_topic") {
+      if (action.kind === "resume_existing_topic" || action.kind === "resume_existing_topic_warning") {
         if (!topicResume) throw new Error("Dashboard action is no longer legal");
         await topicResume.resume(action);
         return;
@@ -867,7 +878,13 @@ function enrichTopicRecoveryProjection(
   options: NonNullable<TelegramReliabilityRuntimeOptions["topicRecovery"]>,
   projection: Awaited<ReturnType<TelegramDurableStatusService["readProjection"]>>,
 ) {
-  const recovery = store.getTopicRecovery(projection.jobId);
+  if (store.hasTopicResume(projection.jobId)) return projection;
+  let recovery: ReturnType<SqliteTelegramJobStore["getTopicRecovery"]>;
+  try { recovery = store.getTopicRecovery(projection.jobId); }
+  catch (error) {
+    if (error instanceof Error && error.message === "Malformed Telegram topic recovery") return projection;
+    throw error;
+  }
   const activeState = recovery !== null && isActiveTopicRecoveryState(recovery.state)
     ? recovery.state
     : undefined;
@@ -884,13 +901,12 @@ function enrichTopicResumeProjection(
 ) {
   try {
     const resume = store.getTopicResume(projection.jobId);
-    const activeState = resume !== null && isActiveTopicResumeState(resume.state)
-      ? resume.state
-      : undefined;
+    const activeState = resume?.state;
     const candidate = resume === null
       ? currentTopicResumeCandidate(store, options, projection.jobId)
       : null;
-    return enrichTopicResumeAction(projection, candidate, activeState);
+    return enrichTopicResumeAction(projection,
+      candidate && options.allowedModes?.has(candidate.mode) ? candidate : null, activeState);
   } catch (error) {
     if (error instanceof Error && error.message === "Malformed Telegram topic resume") {
       return enrichTopicResumeAction(projection, null, "reopen_unknown");
@@ -943,12 +959,6 @@ function currentTopicResumeCandidate(
     hasThreadTopicBinding: options.hasThreadTopicBinding(job.threadId, destination),
     quarantined: store.hasJobQuarantine(job.id),
   });
-}
-
-function isActiveTopicResumeState(value: string): value is TelegramTopicResumeActionState {
-  return value === "probe_in_flight" || value === "probe_retry_wait"
-    || value === "reopen_in_flight" || value === "reopen_retry_wait"
-    || value === "reopen_unknown" || value === "delivery_handoff";
 }
 
 function isMalformedTopicResumeProjectionEvidence(error: unknown): boolean {

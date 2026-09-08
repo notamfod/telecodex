@@ -154,9 +154,12 @@ describe("unified status board rendering", () => {
     });
   });
 
-  it("renders the bounded existing-topic resume action", () => {
+  it.each([
+    ["resume_existing_topic", "u", "Resume topic"],
+    ["resume_existing_topic_warning", "w", "Resume topic (may resend status)"],
+  ] as const)("renders the bounded %s action", (kind, code, label) => {
     const value = projection({ actions: [{
-      kind: "resume_existing_topic",
+      kind,
       jobId: "job-123456789",
       expectedVersion: 541,
     }], expectedVersion: 541 });
@@ -164,8 +167,8 @@ describe("unified status board rendering", () => {
     expect(renderStatusBoard(snapshot([{
       projection: value, label: "Existing topic", workspace: "/srv/telecodex",
     }]), CHAT_ID).buttons[0]).toEqual({
-      text: "Resume topic",
-      callbackData: "tcj:u:job-123456789:541",
+      text: label,
+      callbackData: `tcj:${code}:job-123456789:541`,
     });
   });
 

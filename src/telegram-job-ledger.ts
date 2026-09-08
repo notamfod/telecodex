@@ -40,6 +40,8 @@ import type {
   TelegramTopicRecoveryState, TopicRecoveryOutcomeInput,
 } from "./telegram-topic-recovery-ledger.js";
 import { TelegramTopicResumeLedger } from "./telegram-topic-resume-ledger.js";
+import { TelegramTopicResumeDeliveryGuard } from "./telegram-topic-resume-delivery-guard.js";
+import type { TelegramTopicResumeExternalEligibilitySnapshot } from "./telegram-topic-resume-ledger.js";
 import type {
   ReserveTopicResumeInput, SettleTopicResumeDeliveryInput, TelegramTopicResumeRecord,
   TelegramTopicResumeResult, TelegramTopicResumeState, TransitionTopicResumeInput,
@@ -156,6 +158,7 @@ export class SqliteTelegramJobStore {
   private readonly deliveryLedger: TelegramDeliveryLedger;
   private readonly topicRecoveryLedger: TelegramTopicRecoveryLedger;
   private readonly topicResumeLedger: TelegramTopicResumeLedger;
+  private readonly topicResumeDeliveryGuard: TelegramTopicResumeDeliveryGuard;
   private closed = false;
 
   constructor(private readonly databasePath: string, options: SqliteTelegramJobStoreOptions = {}) {
@@ -187,6 +190,10 @@ export class SqliteTelegramJobStore {
       listDeliveries: (jobId) => this.listDeliveries(jobId),
       getTopicRecovery: (jobId) => this.topicRecoveryLedger.get(jobId),
       applyTransition: (input) => this.applyTransition(input),
+    });
+    this.topicResumeDeliveryGuard = new TelegramTopicResumeDeliveryGuard({
+      database: this.database, statement: (sql) => this.statement(sql),
+      getJob: (jobId) => this.get(jobId), resume: this.topicResumeLedger,
     });
     try {
       this.database.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
@@ -301,14 +308,22 @@ export class SqliteTelegramJobStore {
     if (Object.hasOwn(input.event, "expectedVersion")) throw new Error("Telegram job event must not include expectedVersion");
     if (input.event.type === "delivery.replanned") throw new Error("Unsupported Telegram job event");
     const transition = this.database.transaction(() => {
+      let resume: TelegramTopicResumeRecord | null = null;
       if (input.event.type === "job.terminal" && input.event.outcome === "completed") {
+        const ownership = this.topicResumeDeliveryGuard.beforeFinalization(input.jobId, input.event.eventAt);
+        if (ownership === false) return null;
+        resume = ownership;
         const current = this.get(input.jobId);
         if (!current) throw new Error("Unknown Telegram job");
         this.deliveryLedger.assertCompletion(current, input.event.responsePlan, input.event.deliveries);
       }
-      return this.applyTransition(input);
+      const result = this.applyTransition(input);
+      this.topicResumeDeliveryGuard.advance(resume, result);
+      return result;
     });
-    return transition.immediate();
+    const result = transition.immediate();
+    if (!result) throw new Error("Telegram topic resume delivery denied");
+    return result;
   }
 
   /** Trusted compatibility seam for synthetic legacy imports only. */
@@ -664,7 +679,14 @@ export class SqliteTelegramJobStore {
   }
 
   finalizeDeliveredPlan(input: FinalizeDeliveredPlanInput): TelegramJob | null {
-    this.assertOpen(); return this.deliveryLedger.finalizeDeliveredPlan(input);
+    this.assertOpen();
+    return this.database.transaction(() => {
+      const resume = this.topicResumeDeliveryGuard.beforeFinalization(input.jobId, input.eventAt);
+      if (resume === false) return null;
+      const result = this.deliveryLedger.finalizeDeliveredPlan(input);
+      if (result) this.topicResumeDeliveryGuard.advance(resume, result);
+      return result;
+    }).immediate();
   }
 
   scanDeliveryCompletionCandidates(input: DeliveryCompletionScanInput): DeliveryCompletionScanResult {
@@ -672,11 +694,68 @@ export class SqliteTelegramJobStore {
   }
 
   transitionDeliveryAndProject(input: ProjectedDeliveryTransitionInput): ProjectedDeliveryTransitionResult {
-    this.assertOpen(); return this.deliveryLedger.transitionAndProject(input);
+    this.assertOpen();
+    let outcomeError: unknown;
+    const result = this.database.transaction(() => {
+      const resume = this.topicResumeDeliveryGuard.beforeTransition(input);
+      if (resume === false) return null;
+      if (input.topicResumeFence && this.hasJobQuarantine(input.jobId)) {
+        const recorded = this.topicResumeDeliveryGuard.recordOutcomeAfterCorruption(input);
+        if (recorded) return recorded;
+      }
+      let changed: ProjectedDeliveryTransitionResult;
+      try { changed = this.deliveryLedger.transitionAndProject(input); }
+      catch (error) {
+        const recorded = this.topicResumeDeliveryGuard.recordOutcomeAfterCorruption(input);
+        if (recorded) return recorded;
+        if (input.topicResumeFence) {
+          outcomeError = error;
+          return null;
+        }
+        throw error;
+      }
+      this.topicResumeDeliveryGuard.advance(resume, changed.job, changed.delivery);
+      return { ...changed, ...(resume && input.state === "sending" ? { topicResumeFence: {
+        actionToken: resume.actionToken, jobVersion: changed.job.version, part: changed.delivery, job: changed.job,
+      } } : {}) };
+    }).immediate();
+    if (!result) throw outcomeError ?? new Error("Telegram topic resume delivery denied");
+    return result;
+  }
+
+  hasTopicResume(jobId: string): boolean {
+    this.assertOpen(); return this.topicResumeDeliveryGuard.hasResume(jobId);
+  }
+
+  containTopicResumeDeliveries(now: number,
+    readExternal?: (jobId: string) => TelegramTopicResumeExternalEligibilitySnapshot): void {
+    this.assertOpen(); this.topicResumeDeliveryGuard.contain(now, readExternal);
+  }
+
+  authorizeTopicResumeDelivery(job: TelegramJob, part: DeliveryPart, now: number,
+    external?: TelegramTopicResumeExternalEligibilitySnapshot) {
+    this.assertOpen(); return this.topicResumeDeliveryGuard.authorize(job, part, now, external);
   }
 
   replaceRejectedRichDelivery(input: ReplanRichDeliveryInput): ReplanRichDeliveryResult {
-    this.assertOpen(); return this.deliveryLedger.replaceRejectedRichDelivery(input);
+    this.assertOpen();
+    const result = this.database.transaction(() => {
+      const resume = this.topicResumeDeliveryGuard.beforeReplan(input);
+      if (resume === false) return null;
+      if (!resume) return this.deliveryLedger.replaceRejectedRichDelivery(input);
+      try {
+        return this.database.transaction(() => {
+          const replaced = this.deliveryLedger.replaceRejectedRichDelivery(input);
+          this.topicResumeDeliveryGuard.advanceReplan(resume, replaced);
+          return replaced;
+        }).immediate();
+      } catch {
+        this.topicResumeDeliveryGuard.rejectReplan(resume, input.eventAt);
+        return null;
+      }
+    }).immediate();
+    if (!result) throw new Error("Telegram topic resume delivery denied");
+    return result;
   }
 
   listDueDeliveries(now: number, limit: number): readonly DeliveryPart[] {
@@ -693,6 +772,10 @@ export class SqliteTelegramJobStore {
 
   listDeliveries(jobId: string): readonly DeliveryPart[] {
     this.assertOpen(); return this.deliveryLedger.list(jobId);
+  }
+
+  readStatusDeliveryEvidence(jobId: string) {
+    this.assertOpen(); return this.deliveryLedger.readStatusEvidence(jobId);
   }
 
   getDeliverySummary(jobId: string): TelegramDeliverySummary {

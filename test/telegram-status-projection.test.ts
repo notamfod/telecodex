@@ -254,6 +254,14 @@ describe("projectTelegramJobStatus", () => {
       .toThrow("Topic resume candidate does not match status projection");
   });
 
+  it("projects the distinct warning action only for warning evidence", () => {
+    const projection = project({ job: job({ phase: "delivering", version: 541 }) });
+    expect(enrichTopicResumeAction(projection,
+      resumeCandidate({ mode: "warning_replay", anchorAttemptCount: 4 })).actions[0]).toEqual({
+      kind: "resume_existing_topic_warning", jobId: projection.jobId, expectedVersion: 541,
+    });
+  });
+
   it.each([
     "probe_in_flight",
     "probe_retry_wait",
@@ -261,7 +269,9 @@ describe("projectTelegramJobStatus", () => {
     "reopen_retry_wait",
     "reopen_unknown",
     "delivery_handoff",
-  ] as const)("suppresses only the affected anchor retry while resume is %s", (resumeState) => {
+    "complete",
+    "failed",
+  ] as const)("suppresses every owned retry while resume is %s", (resumeState) => {
     const projection = project({
       job: job({ phase: "delivering", version: 541, responsePlan: [
         { partId: "final:0000", kind: "final" },
@@ -273,11 +283,9 @@ describe("projectTelegramJobStatus", () => {
     });
 
     expect(enrichTopicResumeAction(projection, null, resumeState).actions).toEqual([
-      action("retry_delivery", 541, { partKey: "final:0000" }),
       action("details", 541),
     ]);
     expect(enrichTopicResumeAction(projection, resumeCandidate(), resumeState).actions).toEqual([
-      action("retry_delivery", 541, { partKey: "final:0000" }),
       action("details", 541),
     ]);
   });
@@ -519,6 +527,7 @@ function resumeCandidate(
   overrides: Partial<TelegramTopicResumeCandidate> = {},
 ): TelegramTopicResumeCandidate {
   return {
+    mode: "standard",
     jobId: "job-123456789",
     expectedVersion: 541,
     threadId: THREAD_ID,

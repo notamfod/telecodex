@@ -227,7 +227,7 @@ export const DISABLED_MODEL_SELECTION_CALLBACK_PATTERN =
   /^(?:jobmodel:|startmodel:|model_)/;
 
 export const CANONICAL_STATUS_ACTION_PATTERN =
-  /^tcj:([arfdigysou]):([A-Za-z0-9_-]{1,40}):([1-9]\d{0,15})(?::([A-Za-z0-9_.:-]{1,24}))?$/;
+  /^tcj:([arfdigysouw]):([A-Za-z0-9_-]{1,40}):([1-9]\d{0,15})(?::([A-Za-z0-9_.:-]{1,24}))?$/;
 
 const IMPLEMENTATION_VERB = "(?:приступай|делай|сделай|начинай|реализуй|исправляй|исправь|implement)";
 const IMPLEMENTATION_TICKET = "(?:NO-TICKET|[A-Z][A-Z0-9]{1,15}-\\d+)";
@@ -3060,6 +3060,7 @@ export function createBot(
         f: "refresh", d: "details", i: "inspect", g: "guardian_restore",
         y: "retry_delivery", s: "send_again_warning", o: "recover_missing_topic",
         u: "resume_existing_topic",
+        w: "resume_existing_topic_warning",
       } as const;
       try {
         if (code === "a") {
@@ -3110,6 +3111,7 @@ export function createBot(
               : kind === "send_again_warning" ? "Send again queued"
                 : kind === "recover_missing_topic" ? "Topic recovery started"
                   : kind === "resume_existing_topic" ? "Topic resume started"
+                  : kind === "resume_existing_topic_warning" ? "Warning replay started"
                 : "Open Dashboard for full details",
         });
       } catch (error) {

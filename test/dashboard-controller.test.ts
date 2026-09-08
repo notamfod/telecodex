@@ -187,10 +187,11 @@ describe("Dashboard controller", () => {
     expect(runJobAction).not.toHaveBeenCalled();
   });
 
-  it("forwards only the exact projected existing-topic resume envelope", async () => {
+  it.each(["resume_existing_topic", "resume_existing_topic_warning"] as const)(
+    "forwards only the exact projected %s envelope", async (kind) => {
     const runJobAction = vi.fn(async () => undefined);
     const legal: TelegramStatusAction = {
-      kind: "resume_existing_topic",
+      kind,
       jobId: "11111111-1111-4111-8111-111111111111",
       expectedVersion: 541,
     };

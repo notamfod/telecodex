@@ -4,10 +4,9 @@ import type { CodexThreadRecord } from "./codex-state.js";
 import type { TelegramWorkSource } from "./telegram-job-ingress.js";
 import type { SqliteTelegramJobStore } from "./telegram-job-store.js";
 import type { TelegramJob } from "./telegram-job-types.js";
-import { telegramRetryAfterMs } from "./telegram-rate-limit.js";
 import type { TelegramStatusAction } from "./telegram-status-projection.js";
 import type { ForumTopicLiveness } from "./telegram-topic-liveness.js";
-import { planTelegramTopicResume, type TelegramTopicResumeCandidate }
+import { planTelegramTopicResume, type TelegramTopicResumeCandidate, type TelegramTopicResumeMode }
   from "./telegram-topic-resume.js";
 import type {
   TelegramTopicResumeExternalEligibilitySnapshot,
@@ -34,7 +33,7 @@ export type TopicResumeStore = Pick<
   | "get" | "readSourcePayload" | "listDeliveries" | "getTopicRecovery"
   | "getStatusAnchorPlan" | "hasJobQuarantine" | "reserveTopicResume"
   | "transitionTopicResume" | "settleTopicResumeDelivery" | "getTopicResume"
-  | "listTopicResumes"
+  | "listTopicResumes" | "containTopicResumeDeliveries"
 >;
 
 export interface TelegramTopicResumeRuntime {
@@ -44,6 +43,7 @@ export interface TelegramTopicResumeRuntime {
 }
 
 export interface TelegramTopicResumeRuntimeOptions {
+  readonly allowedModes?: ReadonlySet<TelegramTopicResumeMode>;
   readonly store: TopicResumeStore;
   readonly forumChatId: number;
   readonly classifyForumTopic: (destination: TelegramTopicDestination, signal: AbortSignal) =>
@@ -70,6 +70,7 @@ export function createTelegramTopicResumeRuntime(
   const now = options.now ?? Date.now;
   const createId = options.createId ?? randomUUID;
   const operationTimeoutMs = boundedOperationTimeout(options.operationTimeoutMs);
+  const allowedModes = new Set(options.allowedModes ?? []);
   if (!Number.isSafeInteger(options.forumChatId) || options.forumChatId === 0) {
     throw new Error("Invalid Telegram topic resume forum");
   }
@@ -120,6 +121,8 @@ export function createTelegramTopicResumeRuntime(
   };
 
   const settle = (resume: TelegramTopicResumeRecord): void => {
+    const current = options.store.getTopicResume(resume.jobId);
+    if (current?.state !== "delivery_handoff" || current.actionToken !== resume.actionToken) return;
     const job = requireJob(options.store, resume.jobId);
     options.store.settleTopicResumeDelivery({
       jobId: resume.jobId,
@@ -129,7 +132,17 @@ export function createTelegramTopicResumeRuntime(
     });
   };
 
+  const containDeliveryEvidence = (): void => {
+    options.store.containTopicResumeDeliveries(now(), (jobId) => {
+      const resume = options.store.getTopicResume(jobId);
+      if (!resume) throw new Error("Unknown Telegram topic resume");
+      return readExternalEligibilitySnapshot(options, resume);
+    });
+  };
+
   const handoff = async (resume: TelegramTopicResumeRecord): Promise<void> => {
+    containDeliveryEvidence();
+    if (options.store.hasJobQuarantine(resume.jobId)) return;
     const current = options.store.getTopicResume(resume.jobId);
     if (!current || current.actionToken !== resume.actionToken
       || current.state !== "delivery_handoff") return;
@@ -145,7 +158,7 @@ export function createTelegramTopicResumeRuntime(
     try {
       if (anchorCanStart) {
         await options.outboxRetryFailed(current.jobId, "status-anchor", current.currentJobVersion);
-      } else if (job.version > current.currentJobVersion) {
+      } else {
         await options.outboxPump();
       }
     } finally {
@@ -171,6 +184,7 @@ export function createTelegramTopicResumeRuntime(
       if (disposed || scheduled.get(resume.jobId) !== at) return;
       scheduled.delete(resume.jobId);
       return enqueue(resume.jobId, async () => {
+        containDeliveryEvidence();
         const current = options.store.getTopicResume(resume.jobId);
         if (!current || current.actionToken !== resume.actionToken
           || current.nextAttemptAt === null || current.nextAttemptAt > now()) return;
@@ -181,6 +195,7 @@ export function createTelegramTopicResumeRuntime(
           const reopening = transition(current, "reopen_in_flight");
           await reopen(reopening);
         } else if (current.state === "reopen_unknown") {
+          probedUnknownAttempts.add(current.actionToken);
           await probe({ job: requireJob(options.store, current.jobId), resume: current }, "unknown");
         }
       });
@@ -263,6 +278,9 @@ export function createTelegramTopicResumeRuntime(
 
   const reopen = async (result: TelegramTopicResumeResult): Promise<void> => {
     const resume = result.resume;
+    containDeliveryEvidence();
+    if (options.store.hasJobQuarantine(resume.jobId)
+      || options.store.getTopicResume(resume.jobId)?.state !== resume.state) return;
     if (!externalStateIsCurrent(options, resume)) {
       transition(resume, "failed", "TOPIC_RESUME_REOPEN_FAILED");
       return;
@@ -301,7 +319,14 @@ export function createTelegramTopicResumeRuntime(
 
   const probe = async (result: TelegramTopicResumeResult,
     mode: "initial" | "unknown"): Promise<void> => {
-    const resume = result.resume;
+    let resume = result.resume;
+    containDeliveryEvidence();
+    if (options.store.hasJobQuarantine(resume.jobId)
+      || options.store.getTopicResume(resume.jobId)?.state !== resume.state) return;
+    if (mode === "unknown" && resume.nextAttemptAt !== null) {
+      if (resume.nextAttemptAt > now()) return;
+      resume = transition(resume, "reopen_unknown", "TOPIC_RESUME_REOPEN_UNKNOWN").resume;
+    }
     let liveness: ForumTopicLiveness;
     try {
       liveness = await runOwnedOperation(
@@ -309,7 +334,7 @@ export function createTelegramTopicResumeRuntime(
       );
     } catch (error) {
       if (error === OPERATION_CANCELLED) return;
-      const retryAfterMs = telegramRetryAfterMs(error);
+      const retryAfterMs = immediateTelegramRetryAfterMs(error);
       if (retryAfterMs !== undefined) {
         deferProbe(resume, retryAfterMs);
       } else if (mode === "initial") {
@@ -334,6 +359,10 @@ export function createTelegramTopicResumeRuntime(
 
   const resume = (action: TelegramStatusAction): Promise<void> => {
     assertRunning(disposed);
+    const keys = Reflect.ownKeys(action);
+    if (keys.length !== 3 || keys.some((key) => key !== "kind" && key !== "jobId" && key !== "expectedVersion")) {
+      return Promise.reject(new Error("Telegram topic resume is no longer eligible"));
+    }
     return enqueue(action.jobId, async () => {
       if (options.store.getTopicResume(action.jobId)) return;
       const job = options.store.get(action.jobId);
@@ -350,11 +379,16 @@ export function createTelegramTopicResumeRuntime(
           && options.hasThreadTopicBinding(thread.id, destination),
       };
       const candidate = currentCandidate(options, job, source, snapshot);
-      if (!candidate || candidate.expectedVersion !== action.expectedVersion) {
+      if (!candidate || candidate.expectedVersion !== action.expectedVersion
+        || !allowedModes.has(candidate.mode)
+        || action.kind !== (candidate.mode === "warning_replay"
+          ? "resume_existing_topic_warning" : "resume_existing_topic")
+        || action.partKey !== undefined || action.alertId !== undefined) {
         throw new Error("Telegram topic resume is no longer eligible");
       }
       const reserved = options.store.reserveTopicResume({
         candidate,
+        allowedModes,
         externalEligibilitySnapshot: snapshot,
         eventId: eventId(createId, "reserve"),
         actionToken: createHash("sha256").update(createId()).digest("hex"),
@@ -368,6 +402,7 @@ export function createTelegramTopicResumeRuntime(
     resume,
     async reconcile() {
       assertRunning(disposed);
+      containDeliveryEvidence();
       const inheritedReopens = options.store.listTopicResumes(["reopen_in_flight"]);
       const inheritedProbes = options.store.listTopicResumes(["probe_in_flight"]);
       const inheritedWaiting = options.store.listTopicResumes([
@@ -388,7 +423,11 @@ export function createTelegramTopicResumeRuntime(
         await enqueue(inherited.jobId, async () => {
           const current = options.store.getTopicResume(inherited.jobId);
           if (current?.state === "probe_in_flight" && current.actionToken === inherited.actionToken) {
-            await probe({ job: requireJob(options.store, current.jobId), resume: current }, "initial");
+            const unknown = transition(current, "reopen_unknown", "TOPIC_RESUME_REOPEN_UNKNOWN");
+            if (!probedUnknownAttempts.has(unknown.resume.actionToken)) {
+              probedUnknownAttempts.add(unknown.resume.actionToken);
+              await probe(unknown, "unknown");
+            }
           }
         });
       }

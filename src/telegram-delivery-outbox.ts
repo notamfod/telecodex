@@ -14,6 +14,8 @@ import type {
   SqliteTelegramJobStore,
 } from "./telegram-job-store.js";
 import type { JobAttention, TelegramJob } from "./telegram-job-types.js";
+import type { TelegramTopicResumeExternalEligibilitySnapshot } from "./telegram-topic-resume-ledger.js";
+import type { TelegramTopicResumeDeliveryFence } from "./telegram-topic-resume-delivery-guard.js";
 import { exactRichFallbackInstalled } from "./telegram-delivery-outbox-rich.js";
 import { TelegramDeliveryApiError, TelegramDeliveryLocalError } from "./telegram-delivery-error.js";
 import {
@@ -36,7 +38,8 @@ type OutboxStore = Pick<SqliteTelegramJobStore,
   "get" | "installDeliveryPlan" | "installLiveCommentary" | "listDeliveries"
   | "listDueDeliveries" | "listSendingDeliveries"
   | "nextDeliveryWakeupAt" | "transitionDeliveryAndProject" | "scanDeliveryCompletionCandidates"
-  | "finalizeDeliveredPlan" | "replaceMissingStatusAnchorEdit" | "replaceRejectedRichDelivery">;
+  | "finalizeDeliveredPlan" | "replaceMissingStatusAnchorEdit" | "replaceRejectedRichDelivery"
+  | "hasTopicResume" | "containTopicResumeDeliveries" | "authorizeTopicResumeDelivery" | "hasJobQuarantine">;
 
 export interface TelegramDeliveryAdapter {
   deliver(payload: TelegramDeliveryPayload, signal: AbortSignal): Promise<{ readonly messageId: number }>;
@@ -55,6 +58,7 @@ export interface TelegramDeliveryOutboxOptions {
     readonly chatId: number;
     readonly messageThreadId: number | null;
   };
+  readonly topicResumeExternalSnapshot?: (jobId: string) => TelegramTopicResumeExternalEligibilitySnapshot;
 }
 
 export interface TelegramFailedDeliveryRetryOptions {
@@ -70,6 +74,7 @@ export class TelegramDeliveryOutbox {
   private pumpAgain = false;
   private richUnavailable = false;
   private completionReconciliationAt: number | null = null;
+  private readonly resumeFences = new Map<string, TelegramTopicResumeDeliveryFence>();
 
   constructor(private readonly options: TelegramDeliveryOutboxOptions) {
     this.now = options.now ?? Date.now;
@@ -165,6 +170,7 @@ export class TelegramDeliveryOutbox {
   }
 
   async sendAgainWithWarning(jobId: string, partKey: string): Promise<void> {
+    this.assertGenericRetryAllowed(jobId);
     const row = this.options.store.listDeliveries(boundedId(jobId)).find((part) => part.partKey === boundedId(partKey));
     if (!row || row.state !== "uncertain") throw new Error("Delivery is not uncertain");
     const job = this.requireJob(row.jobId);
@@ -183,6 +189,7 @@ export class TelegramDeliveryOutbox {
     partKey: string,
     retryOptions: TelegramFailedDeliveryRetryOptions = {},
   ): Promise<void> {
+    this.assertGenericRetryAllowed(jobId);
     const job = this.requireJob(boundedId(jobId));
     const expectedJobVersion = retryOptions.expectedJobVersion;
     if (expectedJobVersion !== undefined
@@ -220,9 +227,11 @@ export class TelegramDeliveryOutbox {
   }
 
   private async performPump(): Promise<void> {
+    this.options.store.containTopicResumeDeliveries(timestamp(this.now()), this.options.topicResumeExternalSnapshot);
     this.recoverSending();
     try {
       while (true) {
+        this.options.store.containTopicResumeDeliveries(timestamp(this.now()), this.options.topicResumeExternalSnapshot);
         this.reconcileCompletedPlans();
         const due = this.options.store.listDueDeliveries(timestamp(this.now()), 1_000);
         if (due.length === 0) return;
@@ -260,6 +269,7 @@ export class TelegramDeliveryOutbox {
             }
             const sending = this.change(part, "sending", part.attemptCount, {
               nextAttemptAt: boundedAdd(timestamp(this.now()), this.timeoutMs),
+              ...(part.state === "failed" ? { allowFailedRetry: true } : {}),
             }, job.version);
             if (await this.deliver(sending.delivery, payload)) progressed = true;
           } catch (error) {
@@ -346,6 +356,7 @@ export class TelegramDeliveryOutbox {
   }
 
   private shouldRetryCompletion(jobId: string): boolean {
+    if (this.options.store.hasTopicResume(jobId) || this.options.store.hasJobQuarantine(jobId)) return false;
     const job = this.options.store.get(jobId);
     if (!job || job.phase !== "delivering" || job.responsePlan === undefined
       || (job.attention.kind === "required" && job.attention.code === "delivery_plan_recovery_unsafe")) {
@@ -428,6 +439,9 @@ export class TelegramDeliveryOutbox {
         return false;
       }
       if (error instanceof TelegramDeliveryApiError && error.code === "retry_after") {
+        if (this.resumeOwnedAttempt(part) && error.confirmedRetryAfter !== true) {
+          return this.afterAmbiguousFailure(part, payload);
+        }
         const nextAttemptAt = boundedAdd(timestamp(this.now()), error.retryAfterMs!);
         this.change(part, "pending", part.attemptCount, { nextAttemptAt, lastErrorCode: "telegram_retry_after" });
         return false;
@@ -482,22 +496,48 @@ export class TelegramDeliveryOutbox {
     reasonCode: "rich_format_rejected" | "rich_method_unavailable",
     apiAttempted: boolean,
   ): boolean {
-    const job = this.requireJob(part.jobId);
+    let job: TelegramJob;
+    try { job = this.requireJob(part.jobId); }
+    catch (error) {
+      if (!this.resumeOwnedAttempt(part)) throw error;
+      return this.containOwnedRichRejection(part, apiAttempted);
+    }
     if (part.state !== "pending" && part.state !== "sending") {
       this.failRichFallback(part, payload, job, apiAttempted);
       return false;
     }
     try {
+      const owned = this.resumeOwnedAttempt(part);
+      const external = owned ? this.options.topicResumeExternalSnapshot?.(part.jobId) : undefined;
+      if (owned && !external) {
+        return this.containOwnedRichRejection(part, apiAttempted);
+      }
       this.options.store.replaceRejectedRichDelivery({
         jobId: part.jobId, partKey: part.partKey, expectedJobVersion: job.version,
         expectedState: part.state, expectedAttemptCount: part.attemptCount,
         expectedContentHash: part.contentHash, eventId: boundedId(this.createId()),
         eventAt: monotonicNow(this.now, Math.max(job.updatedAt, part.updatedAt)), reasonCode,
+        ...(external ? { topicResumeReplan: { external,
+          quarantined: this.options.store.hasJobQuarantine(part.jobId),
+          ...(apiAttempted ? { fence: this.resumeFences.get(`${part.jobId}:${part.partKey}`) } : {}),
+        } } : {}),
       });
+      this.resumeFences.delete(`${part.jobId}:${part.partKey}`);
       return true;
     } catch {
+      if (this.resumeOwnedAttempt(part)) {
+        return this.containOwnedRichRejection(part, apiAttempted);
+      }
       return this.failRichFallback(part, payload, job, apiAttempted);
     }
+  }
+
+  private containOwnedRichRejection(part: DeliveryPart, apiAttempted: boolean): false {
+    this.options.store.containTopicResumeDeliveries(timestamp(this.now()), this.options.topicResumeExternalSnapshot);
+    if (apiAttempted) this.change(part, "failed", part.attemptCount + 1, {
+      nextAttemptAt: null, lastErrorCode: "telegram_rich_fallback_failed",
+    });
+    return false;
   }
 
   private failRichFallback(
@@ -549,16 +589,46 @@ export class TelegramDeliveryOutbox {
     expectedJobVersion?: number,
     expectedJobSnapshot?: TelegramJob,
   ) {
-    const job = expectedJobSnapshot ?? this.requireJob(part.jobId);
+    const key = `${part.jobId}:${part.partKey}`;
+    const outcomeFence = state !== "sending" ? this.resumeFences.get(key) : undefined;
+    let job: TelegramJob;
+    try { job = expectedJobSnapshot ?? this.requireJob(part.jobId); }
+    catch (error) {
+      if (!outcomeFence) throw error;
+      job = outcomeFence.job;
+    }
     const jobVersion = expectedJobVersion ?? job.version;
-    return this.options.store.transitionDeliveryAndProject({
+    let topicResumeAuthorization;
+    if (state === "sending" && this.options.store.hasTopicResume(part.jobId)) {
+      let external: TelegramTopicResumeExternalEligibilitySnapshot | undefined;
+      try { external = this.options.topicResumeExternalSnapshot?.(part.jobId); }
+      catch { /* Missing or malformed external evidence denies the effect. */ }
+      topicResumeAuthorization = this.options.store.authorizeTopicResumeDelivery(job, part, timestamp(this.now()), external);
+      if (!topicResumeAuthorization) throw new Error("Telegram topic resume delivery denied");
+    }
+    const result = this.options.store.transitionDeliveryAndProject({
       jobId: part.jobId, partKey: part.partKey, state, attemptCount,
       expectedState: part.state, expectedAttemptCount: part.attemptCount,
       expectedContentHash: part.contentHash,
       expectedJobVersion: jobVersion, eventId: boundedId(this.createId()),
       updatedAt: monotonicNow(this.now, job.updatedAt),
       ...changes,
+      ...(state === "sending" ? { lastErrorCode: null } : {}),
+      ...(topicResumeAuthorization ? { topicResumeAuthorization } : {}),
+      ...(state !== "sending" && this.resumeFences.has(key) ? { topicResumeFence: this.resumeFences.get(key)! } : {}),
     });
+    if (result.topicResumeFence) this.resumeFences.set(key, result.topicResumeFence);
+    else if (state !== "sending") this.resumeFences.delete(key);
+    return result;
+  }
+
+  private assertGenericRetryAllowed(jobId: string): void {
+    if (this.options.store.hasTopicResume(boundedId(jobId))) throw new Error("Telegram topic resume owns delivery");
+    if (this.options.store.hasJobQuarantine(jobId)) throw new Error("Telegram delivery is quarantined");
+  }
+
+  private resumeOwnedAttempt(part: DeliveryPart): boolean {
+    return this.resumeFences.has(`${part.jobId}:${part.partKey}`) || this.options.store.hasTopicResume(part.jobId);
   }
 
   private requireJob(jobId: string): TelegramJob {
@@ -632,5 +702,6 @@ function boundedAdd(left: number, right: number): number {
   return value;
 }
 function isConflict(error: unknown): boolean {
-  return error instanceof Error && (error.message === "Telegram delivery conflict" || error.message === "Telegram job version conflict");
+  return error instanceof Error && (error.message === "Telegram delivery conflict"
+    || error.message === "Telegram job version conflict" || error.message === "Telegram topic resume delivery denied");
 }

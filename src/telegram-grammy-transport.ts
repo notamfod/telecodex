@@ -26,7 +26,7 @@ import type {
   TelegramDurableStatusOptions,
 } from "./telegram-durable-status.js";
 import type { TelegramStatusAction } from "./telegram-status-projection.js";
-import { telegramRetryAfterMs } from "./telegram-rate-limit.js";
+import { definitiveTelegramRetryAfterMs, telegramRetryAfterMs } from "./telegram-rate-limit.js";
 import type { TurnProgressTransportClassification } from "./turn-progress.js";
 
 const DOWNLOAD_TIMEOUT_MS = 30_000;
@@ -242,7 +242,8 @@ export function classifyTelegramDeliveryError(
   operation?: TelegramDeliveryPayload["operation"],
 ): TelegramDeliveryApiError | null {
   const retryAfterMs = telegramRetryAfterMs(error);
-  if (retryAfterMs !== undefined) return new TelegramDeliveryApiError("retry_after", retryAfterMs);
+  if (retryAfterMs !== undefined) return new TelegramDeliveryApiError("retry_after", retryAfterMs, undefined,
+    definitiveTelegramRetryAfterMs(error) === retryAfterMs);
   const code = telegramErrorCode(error);
   if (code === 400 && operation === "edit_text" && isMessageToEditMissing(error)) {
     return new TelegramDeliveryApiError("message_missing");
@@ -351,6 +352,7 @@ export function telegramStatusActionCallbackData(action: TelegramStatusAction): 
     retry_delivery: "y",
     recover_missing_topic: "o",
     resume_existing_topic: "u",
+    resume_existing_topic_warning: "w",
     send_again_warning: "s",
     guardian_restore: "g",
   };
@@ -366,6 +368,7 @@ function actionLabel(action: TelegramStatusAction): string {
     retry_new_turn: "Retry", guardian_restore: "Restore", retry_delivery: "Retry delivery",
     recover_missing_topic: "Recover topic",
     resume_existing_topic: "Resume topic",
+    resume_existing_topic_warning: "Resume; status may duplicate",
     send_again_warning: "Send again",
   };
   return labels[action.kind];

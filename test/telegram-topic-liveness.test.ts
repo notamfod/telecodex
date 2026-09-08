@@ -54,6 +54,19 @@ describe("forum topic liveness", () => {
     })(destination)).resolves.toBe("closed");
   });
 
+  it.each([new Error("TOPIC_CLOSED"), { error_code: 500, description: "TOPIC_CLOSED" }])(
+    "requires a typed definitive response when classifying a resume probe", async (failure) => {
+      await expect(createForumTopicLivenessClassifier({ requireDefinitiveErrors: true,
+        sendChatAction: vi.fn().mockRejectedValue(failure) })(destination)).rejects.toBe(failure);
+    },
+  );
+
+  it("uses the typed definitive description for resume topic classification", async () => {
+    await expect(createForumTopicLivenessClassifier({ requireDefinitiveErrors: true,
+      sendChatAction: vi.fn().mockRejectedValue({ error_code: 400, description: "TOPIC_CLOSED" }),
+    })(destination)).resolves.toBe("closed");
+  });
+
   it("classifies a deleted topic as missing", async () => {
     await expect(createForumTopicLivenessClassifier({
       sendChatAction: vi.fn().mockRejectedValue(new Error("TOPIC_DELETED")),

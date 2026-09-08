@@ -8,6 +8,27 @@ import { createHarness, DESTINATION, NOW }
 describe("TelegramTopicResumeRuntime", () => {
   afterEach(() => vi.useRealTimers());
 
+  it.each(["retry_delivery", "resume_existing_topic_warning"] as const)(
+    "rejects the mismatched %s action before reserving", async (kind) => {
+      const harness = createHarness();
+      const runtime = createTelegramTopicResumeRuntime(harness.options);
+      await expect(runtime.resume({ ...harness.action, kind })).rejects.toThrow(/eligible/);
+      expect(harness.store.reserveTopicResume).not.toHaveBeenCalled();
+      expect(harness.classifyForumTopic).not.toHaveBeenCalled();
+      runtime.dispose();
+    },
+  );
+
+  it("copies its allowed modes and denies new reservations while dormant", async () => {
+    const harness = createHarness();
+    const allowedModes = new Set<"standard" | "warning_replay">();
+    const runtime = createTelegramTopicResumeRuntime({ ...harness.options, allowedModes });
+    allowedModes.add("standard");
+    await expect(runtime.resume(harness.action)).rejects.toThrow(/eligible/);
+    expect(harness.store.reserveTopicResume).not.toHaveBeenCalled();
+    runtime.dispose();
+  });
+
   it("reserves before probing and hands a live topic to the failed anchor retry", async () => {
     const harness = createHarness({ liveness: "live" });
     const runtime = createTelegramTopicResumeRuntime(harness.options);
@@ -278,6 +299,29 @@ describe("TelegramTopicResumeRuntime", () => {
     expect(harness.reopenForumTopic).not.toHaveBeenCalled();
   });
 
+  it.each([
+    new Error("429 Too Many Requests, retry after 5"),
+    { error: { error_code: 429, parameters: { retry_after: 5 } } },
+    { error_code: 500, error: { error_code: 429, parameters: { retry_after: 5 } } },
+    { error_code: 429 },
+    { error_code: 429, parameters: { retry_after: 0 } },
+    { error_code: 429, parameters: { retry_after: 3601 } },
+    { error_code: 429, parameters: { retry_after: "5" } },
+  ])("never schedules an inherited probe retry from ambiguous or unbounded 429 evidence", async (failure) => {
+    for (const initialState of ["probe_in_flight", "reopen_unknown"] as const) {
+      const harness = createHarness({ initialState, classifyResults: [failure] });
+      const runtime = createTelegramTopicResumeRuntime(harness.options);
+      await runtime.reconcile();
+      expect(harness.resume()).toMatchObject({ state: "reopen_unknown", nextAttemptAt: null,
+        reasonCode: "TOPIC_RESUME_REOPEN_UNKNOWN" });
+      expect(harness.scheduled).toHaveLength(0);
+      await runtime.reconcile();
+      expect(harness.classifyForumTopic).toHaveBeenCalledOnce();
+      expect(harness.reopenForumTopic).not.toHaveBeenCalled();
+      runtime.dispose();
+    }
+  });
+
   it("retries an inherited handoff only at its exact handoff version", async () => {
     const harness = createHarness({ initialState: "delivery_handoff", outboxOutcome: "pending" });
     const runtime = createTelegramTopicResumeRuntime(harness.options);
@@ -299,7 +343,7 @@ describe("TelegramTopicResumeRuntime", () => {
     ["wrong error", { lastErrorCode: "telegram_not_sent" }],
     ["message id", { telegramMessageId: 71 }],
     ["retry deadline", { nextAttemptAt: NOW + 30 }],
-  ] as const)("does not call an outbox after handoff %s drift", async (_name, mutation) => {
+  ] as const)("delegates handoff %s drift to outbox containment", async (_name, mutation) => {
     const harness = createHarness({
       liveness: "live",
       outboxOutcome: "pending",
@@ -310,7 +354,7 @@ describe("TelegramTopicResumeRuntime", () => {
     await runtime.resume(harness.action);
 
     expect(harness.outboxRetryFailed).not.toHaveBeenCalled();
-    expect(harness.outboxPump).not.toHaveBeenCalled();
+    expect(harness.outboxPump).toHaveBeenCalledOnce();
     expect(harness.resume()?.state).toBe("delivery_handoff");
   });
 

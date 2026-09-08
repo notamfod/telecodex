@@ -3,6 +3,8 @@ import { isDeepStrictEqual } from "node:util";
 import type Database from "better-sqlite3";
 
 import type { DeliveryPart } from "./telegram-delivery-ledger.js";
+import type { TelegramTopicResumeDeliveryFence } from "./telegram-topic-resume-delivery-guard.js";
+import type { TelegramTopicResumeExternalEligibilitySnapshot } from "./telegram-topic-resume-ledger.js";
 import type { TransitionEvent } from "./telegram-job-ledger.js";
 import type {
   DeliveryReplanReasonCode,
@@ -28,6 +30,11 @@ const REPLAN_REASONS: readonly DeliveryReplanReasonCode[] = [
 ];
 
 export interface ReplanRichDeliveryInput {
+  readonly topicResumeReplan?: {
+    readonly external: TelegramTopicResumeExternalEligibilitySnapshot;
+    readonly quarantined: boolean;
+    readonly fence?: TelegramTopicResumeDeliveryFence;
+  };
   readonly jobId: string;
   readonly partKey: string;
   readonly expectedJobVersion: number;
@@ -283,6 +290,7 @@ function validateInput(value: ReplanRichDeliveryInput): void {
   exactKeys(raw, [
     "jobId", "partKey", "expectedJobVersion", "expectedState", "expectedAttemptCount",
     "expectedContentHash", "eventId", "eventAt", "reasonCode",
+    ...(Object.hasOwn(raw, "topicResumeReplan") ? ["topicResumeReplan"] : []),
   ]);
   bounded(value.jobId, JOB_ID_MAX_LENGTH);
   bounded(value.partKey, PART_KEY_MAX_LENGTH);

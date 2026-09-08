@@ -12,6 +12,7 @@ import { hashTelegramDeliveryPayload, normalizeTelegramDeliveryPayload } from ".
 import type { TelegramTopicRecoveryRecord } from "./telegram-topic-recovery-ledger.js";
 import { decodeCanonicalTopicRecoverySourceJson } from "./telegram-topic-recovery-source-codec.js";
 import type { TelegramTopicDestination } from "./telegram-topic-recovery.js";
+import { orderedDeliveryEvidence } from "./telegram-topic-resume-delivery-guard.js";
 import {
   hashTelegramTopicResumeTopology,
   isTelegramTopicResumeContinuationValid,
@@ -38,6 +39,7 @@ export type TelegramTopicResumeReasonCode =
   | "TOPIC_RESUME_REOPEN_UNKNOWN"
   | "TOPIC_RESUME_SOURCE_MISSING"
   | "TOPIC_RESUME_REOPEN_FAILED"
+  | "TOPIC_RESUME_EVIDENCE_STALE"
   | "TOPIC_RESUME_DELIVERY_FAILED"
   | "TOPIC_RESUME_DELIVERY_UNCERTAIN"
   | "TOPIC_RESUME_FOLLOWER_FAILED"
@@ -70,6 +72,7 @@ export interface TelegramTopicResumeExternalEligibilitySnapshot {
 }
 
 export interface ReserveTopicResumeInput {
+  readonly allowedModes?: ReadonlySet<TelegramTopicResumeMode>;
   readonly candidate: TelegramTopicResumeCandidate;
   readonly externalEligibilitySnapshot: TelegramTopicResumeExternalEligibilitySnapshot;
   readonly eventId: string;
@@ -111,7 +114,7 @@ interface TelegramTopicResumeLedgerHost {
 }
 
 const LEGAL_TRANSITIONS: Readonly<Record<TelegramTopicResumeState, readonly TelegramTopicResumeState[]>> = {
-  probe_in_flight: ["probe_retry_wait", "reopen_in_flight", "delivery_handoff", "failed"],
+  probe_in_flight: ["probe_retry_wait", "reopen_in_flight", "delivery_handoff", "reopen_unknown", "failed"],
   probe_retry_wait: ["probe_in_flight"],
   reopen_in_flight: ["reopen_retry_wait", "reopen_unknown", "delivery_handoff", "failed"],
   reopen_retry_wait: ["reopen_in_flight"],
@@ -130,9 +133,10 @@ export class TelegramTopicResumeLedger {
       if (this.raw(input.candidate.jobId)) conflict();
       const job = this.host.getJob(input.candidate.jobId);
       if (!job || job.version !== input.candidate.expectedVersion) conflict();
-      const evidence = this.eligibilityInput(job, input.externalEligibilitySnapshot, false);
+      const evidence = this.deliveryEligibilityInput(job, input.externalEligibilitySnapshot, false);
       const candidate = evidence ? planTelegramTopicResume(evidence) : null;
-      if (!candidate || candidate.anchorAttemptCount !== 1 || !same(candidate, input.candidate)) conflict();
+      if (!candidate || !same(candidate, input.candidate)
+        || !input.allowedModes?.has(candidate.mode)) conflict();
       const recoveryJobVersionBaseline = evidence!.recovery!.currentJobVersion;
       const deliveryTopologyHash = hashTelegramTopicResumeTopology(job, evidence!.deliveries);
       const advanced = this.host.applyTransition({
@@ -146,8 +150,8 @@ export class TelegramTopicResumeLedger {
           recovery_job_version_baseline, delivery_topology_hash, chat_id, message_thread_id,
           reserved_job_version, current_job_version, next_attempt_at_ms,
           reason_code, started_at_ms, updated_at_ms)
-        VALUES (?, ?, 'probe_in_flight', 'standard', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`).run(
-        job.id, input.actionToken, candidate.anchorAttemptCount, recoveryJobVersionBaseline,
+        VALUES (?, ?, 'probe_in_flight', ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`).run(
+        job.id, input.actionToken, candidate.mode, candidate.anchorAttemptCount, recoveryJobVersionBaseline,
         deliveryTopologyHash, candidate.destination.chatId, candidate.destination.messageThreadId,
         job.version, advanced.version, input.eventAt, input.eventAt,
       );
@@ -198,8 +202,8 @@ export class TelegramTopicResumeLedger {
     return this.host.database.transaction(() => {
       const resume = this.require(input.jobId);
       const job = this.host.getJob(input.jobId);
-      if (!job || job.version !== input.expectedVersion || resume.state !== "delivery_handoff"
-        || resume.actionToken !== input.actionToken || job.version < resume.currentJobVersion
+      if (!job || job.version !== input.expectedVersion
+        || resume.actionToken !== input.actionToken || job.version !== resume.currentJobVersion
         || input.updatedAt < job.updatedAt || input.updatedAt < resume.updatedAt) conflict();
       const rows = this.host.listDeliveries(input.jobId);
       const anchors = rows.filter((part) => part.partKey === "status-anchor");
@@ -207,15 +211,18 @@ export class TelegramTopicResumeLedger {
       if (hashTelegramTopicResumeTopology(job, rows) !== resume.deliveryTopologyHash
         || !deliveryProjectionMatches(job, rows)) conflict();
       const anchor = anchors[0]!;
-      const anchorIsCausallyLater = job.version > resume.currentJobVersion
-        && anchor.updatedAt >= resume.updatedAt
-        && anchor.attemptCount === resume.anchorAttemptBaseline + 1;
+      if (resume.state === "complete" || resume.state === "failed") return resume;
+      if (resume.state !== "delivery_handoff") conflict();
+      const anchorIsCausallyLater = anchor.updatedAt >= resume.updatedAt
+        && (anchor.attemptCount === resume.anchorAttemptBaseline + 1
+          || (anchor.attemptCount === resume.anchorAttemptBaseline && anchor.lastErrorCode === "delivery_media_unavailable"));
       const followers = rows.filter((part) => part.partKey !== "status-anchor");
       const failedFollower = followers.find((part) => part.state === "failed"
         && part.updatedAt >= resume.updatedAt);
       const uncertainFollower = followers.find((part) => part.state === "uncertain"
         && part.updatedAt >= resume.updatedAt);
-      const followerIsCausallyLater = job.version > resume.currentJobVersion;
+      const followerIsCausallyLater = anchor.state === "delivered"
+        && anchor.attemptCount === resume.anchorAttemptBaseline + 1;
       let state: "complete" | "failed" | null = null;
       let reasonCode: TelegramTopicResumeReasonCode | null = null;
       if (anchor.state === "failed" && anchorIsCausallyLater) {
@@ -230,9 +237,8 @@ export class TelegramTopicResumeLedger {
       } else if (uncertainFollower && followerIsCausallyLater) {
         state = "failed";
         reasonCode = "TOPIC_RESUME_FOLLOWER_UNCERTAIN";
-      } else if (job.version > resume.currentJobVersion
-        && job.phase === "terminal" && job.outcome === "completed" && rows.length === 3
-        && rows.every((part) => part.state === "delivered") && anchor.telegramMessageId !== null) {
+      } else if (job.phase === "terminal" && job.outcome === "completed"
+        && orderedDeliveryEvidence(job, resume, rows) && rows.every((part) => part.state === "delivered")) {
         state = "complete";
       }
       if (state === null) return resume;
@@ -264,6 +270,7 @@ export class TelegramTopicResumeLedger {
     }
     const placeholders = states.map(() => "?").join(", ");
     return (this.host.statement(`SELECT * FROM topic_resume_attempts WHERE state IN (${placeholders})
+      AND NOT EXISTS (SELECT 1 FROM job_quarantine WHERE job_quarantine.job_id = topic_resume_attempts.job_id)
       ORDER BY updated_at_ms, job_id LIMIT ?`).all(...states, limit) as Record<string, unknown>[])
       .map(decodeResume);
   }
@@ -289,7 +296,7 @@ export class TelegramTopicResumeLedger {
     return this.host.statement("SELECT 1 FROM job_quarantine WHERE job_id = ?").get(jobId) !== undefined;
   }
 
-  private eligibilityInput(
+  deliveryEligibilityInput(
     job: TelegramJob,
     external: TelegramTopicResumeExternalEligibilitySnapshot,
     hasExistingAttempt: boolean,
@@ -350,7 +357,7 @@ export class TelegramTopicResumeLedger {
     job: TelegramJob,
     external: TelegramTopicResumeExternalEligibilitySnapshot,
   ): boolean {
-    const evidence = this.eligibilityInput(job, external, true);
+    const evidence = this.deliveryEligibilityInput(job, external, true);
     return evidence !== null && isTelegramTopicResumeContinuationValid({
       ...evidence,
       mode: resume.mode,
@@ -435,6 +442,7 @@ const FAILED_REASONS = new Set<TelegramTopicResumeReasonCode>([
   "TOPIC_RESUME_PROBE_UNKNOWN", "TOPIC_RESUME_SOURCE_MISSING", "TOPIC_RESUME_REOPEN_FAILED",
   "TOPIC_RESUME_DELIVERY_FAILED", "TOPIC_RESUME_DELIVERY_UNCERTAIN",
   "TOPIC_RESUME_FOLLOWER_FAILED", "TOPIC_RESUME_FOLLOWER_UNCERTAIN",
+  "TOPIC_RESUME_EVIDENCE_STALE",
 ]);
 
 function validateReserveInput(input: ReserveTopicResumeInput): void {
@@ -442,7 +450,9 @@ function validateReserveInput(input: ReserveTopicResumeInput): void {
   positiveInteger(input.candidate.expectedVersion, "expectedVersion");
   bounded(input.candidate.threadId, "threadId", JOB_ID_MAX_LENGTH);
   if (input.candidate.anchorPartKey !== "status-anchor"
-    || input.candidate.anchorAttemptCount !== 1) {
+    || !Number.isSafeInteger(input.candidate.anchorAttemptCount)
+    || (input.candidate.mode === "standard" ? input.candidate.anchorAttemptCount !== 1
+      : input.candidate.mode !== "warning_replay" || input.candidate.anchorAttemptCount < 2)) {
     throw new Error("Invalid Telegram topic resume candidate");
   }
   destination(input.candidate.destination);
@@ -482,7 +492,8 @@ function validateTransitionShape(
   } else if (to === "reopen_retry_wait") {
     if (reason !== "TOPIC_RESUME_REOPEN_RATE_LIMITED" || deadline === null || deadline <= updatedAt) conflict();
   } else if (to === "reopen_unknown") {
-    const initial = from === "reopen_in_flight" && reason === "TOPIC_RESUME_REOPEN_UNKNOWN" && deadline === null;
+    const initial = (from === "reopen_in_flight" || from === "probe_in_flight" || from === "reopen_unknown")
+      && reason === "TOPIC_RESUME_REOPEN_UNKNOWN" && deadline === null;
     const safeProbe429 = from === "reopen_unknown" && reason === "TOPIC_RESUME_PROBE_RATE_LIMITED"
       && deadline !== null && deadline > updatedAt;
     if (!initial && !safeProbe429) conflict();
@@ -543,6 +554,7 @@ function isReason(value: unknown): value is TelegramTopicResumeReasonCode {
   return value === "TOPIC_RESUME_PROBE_RATE_LIMITED" || value === "TOPIC_RESUME_PROBE_UNKNOWN"
     || value === "TOPIC_RESUME_REOPEN_RATE_LIMITED" || value === "TOPIC_RESUME_REOPEN_UNKNOWN"
     || value === "TOPIC_RESUME_SOURCE_MISSING" || value === "TOPIC_RESUME_REOPEN_FAILED"
+    || value === "TOPIC_RESUME_EVIDENCE_STALE"
     || value === "TOPIC_RESUME_DELIVERY_FAILED" || value === "TOPIC_RESUME_DELIVERY_UNCERTAIN"
     || value === "TOPIC_RESUME_FOLLOWER_FAILED" || value === "TOPIC_RESUME_FOLLOWER_UNCERTAIN";
 }

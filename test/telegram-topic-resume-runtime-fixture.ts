@@ -146,6 +146,7 @@ export function createHarness(settings: {
     job = { ...job, version: job.version + 1, updatedAt };
   };
   const store = {
+    containTopicResumeDeliveries: vi.fn(),
     get: vi.fn(() => structuredClone(job)),
     readSourcePayload: vi.fn(() => structuredClone(source)),
     listDeliveries: vi.fn(() => structuredClone(deliveries)),
@@ -304,6 +305,7 @@ export function createHarness(settings: {
   const scheduled: Array<{ at: number; wake: () => Promise<void> }> = [];
   let id = 0;
   const options = {
+    allowedModes: new Set(["standard"] as const),
     store,
     forumChatId: DESTINATION.chatId,
     classifyForumTopic,
@@ -321,10 +323,9 @@ export function createHarness(settings: {
     },
   } satisfies TelegramTopicResumeRuntimeOptions;
   const action: TelegramStatusAction = {
-    kind: "retry_delivery",
+    kind: "resume_existing_topic",
     jobId: job.id,
     expectedVersion: job.version,
-    partKey: "status-anchor",
   };
   return {
     options,

@@ -1,9 +1,12 @@
+import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import type Database from "better-sqlite3";
 
 import type { TransitionEvent } from "./telegram-job-ledger.js";
 import { TelegramDeliveryReplan } from "./telegram-delivery-replan.js";
+import type { TelegramTopicResumeDeliveryAuthorization, TelegramTopicResumeDeliveryFence }
+  from "./telegram-topic-resume-delivery-guard.js";
 import type {
   ReplanRichDeliveryInput,
   ReplanRichDeliveryResult,
@@ -74,6 +77,8 @@ export interface DeliveryCompletionScanResult {
   readonly nextCursor: DeliveryCompletionScanCursor | null;
 }
 export interface ProjectedDeliveryTransitionInput extends DeliveryTransitionInput {
+  readonly topicResumeAuthorization?: TelegramTopicResumeDeliveryAuthorization;
+  readonly topicResumeFence?: TelegramTopicResumeDeliveryFence;
   readonly eventId: string; readonly expectedJobVersion: number;
   readonly expectedState: DeliveryState; readonly expectedAttemptCount: number;
   readonly expectedContentHash?: string;
@@ -82,7 +87,10 @@ export interface ProjectedDeliveryTransitionInput extends DeliveryTransitionInpu
   readonly allowFailedRetry?: boolean;
   readonly allowPendingFailure?: boolean;
 }
-export interface ProjectedDeliveryTransitionResult { readonly delivery: DeliveryPart; readonly job: TelegramJob; }
+export interface ProjectedDeliveryTransitionResult {
+  readonly delivery: DeliveryPart; readonly job: TelegramJob;
+  readonly topicResumeFence?: TelegramTopicResumeDeliveryFence;
+}
 export type { FinishStatusAnchorRevisionInput, PrepareStatusAnchorRevisionInput,
   PrepareStatusAnchorRevisionResult, ReplaceMissingStatusAnchorEditInput } from "./telegram-status-anchor-ledger.js";
 export interface TelegramDeliverySummary {
@@ -371,6 +379,8 @@ export class TelegramDeliveryLedger {
         AND NOT EXISTS (SELECT 1 FROM deliveries WHERE deliveries.job_id = jobs.id
           AND deliveries.state != 'delivered')
         AND NOT EXISTS (SELECT 1 FROM job_quarantine WHERE job_quarantine.job_id = jobs.id)
+        AND NOT EXISTS (SELECT 1 FROM topic_resume_attempts WHERE topic_resume_attempts.job_id = jobs.id
+          AND topic_resume_attempts.state != 'delivery_handoff')
         AND (? IS NULL OR inbox_updates.accepted_at_ms > ?
           OR (inbox_updates.accepted_at_ms = ? AND jobs.id > ?))
       ORDER BY inbox_updates.accepted_at_ms, jobs.id LIMIT ?`).all(
@@ -475,7 +485,10 @@ export class TelegramDeliveryLedger {
   listDue(now: number, limit: number): readonly DeliveryPart[] {
     assertNonNegativeInteger(now, "now"); assertPositiveLimit(limit);
     return this.host.statement(`SELECT deliveries.* FROM deliveries JOIN jobs ON jobs.id = deliveries.job_id
-      WHERE deliveries.state = 'pending' AND (deliveries.next_attempt_at_ms IS NULL OR deliveries.next_attempt_at_ms <= ?)
+      WHERE (deliveries.state = 'pending' OR (deliveries.state = 'failed'
+        AND deliveries.part_key = 'status-anchor' AND EXISTS (SELECT 1 FROM topic_resume_attempts
+          WHERE topic_resume_attempts.job_id = jobs.id AND topic_resume_attempts.state = 'delivery_handoff')))
+      AND (deliveries.next_attempt_at_ms IS NULL OR deliveries.next_attempt_at_ms <= ?)
       AND CASE WHEN json_valid(jobs.projection_json) THEN (
         (json_extract(jobs.projection_json, '$.phase') = 'delivering'
           AND json_type(jobs.projection_json, '$.responsePlan') = 'array')
@@ -483,6 +496,8 @@ export class TelegramDeliveryLedger {
           AND json_type(jobs.projection_json, '$.responsePlan') IS NULL
           AND deliveries.kind = 'summary')) ELSE 0 END
       AND NOT EXISTS (SELECT 1 FROM job_quarantine WHERE job_quarantine.job_id = jobs.id)
+      AND NOT EXISTS (SELECT 1 FROM topic_resume_attempts WHERE topic_resume_attempts.job_id = jobs.id
+        AND topic_resume_attempts.state != 'delivery_handoff')
       AND NOT EXISTS (SELECT 1 FROM deliveries AS earlier
         WHERE earlier.job_id = deliveries.job_id AND earlier.state != 'delivered' AND (
           (earlier.part_key = 'status-anchor' AND deliveries.part_key != 'status-anchor') OR
@@ -503,6 +518,8 @@ export class TelegramDeliveryLedger {
           AND json_type(jobs.projection_json, '$.responsePlan') IS NULL
           AND deliveries.kind = 'summary')) ELSE 0 END
       AND NOT EXISTS (SELECT 1 FROM job_quarantine WHERE job_quarantine.job_id = jobs.id)
+      AND NOT EXISTS (SELECT 1 FROM topic_resume_attempts WHERE topic_resume_attempts.job_id = jobs.id
+        AND topic_resume_attempts.state != 'delivery_handoff')
       AND (deliveries.next_attempt_at_ms IS NULL OR deliveries.next_attempt_at_ms <= ?)
       AND NOT EXISTS (SELECT 1 FROM deliveries AS earlier
         WHERE earlier.job_id = deliveries.job_id AND earlier.state != 'delivered' AND (
@@ -522,7 +539,9 @@ export class TelegramDeliveryLedger {
         OR (json_extract(jobs.projection_json, '$.phase') = 'running'
           AND json_type(jobs.projection_json, '$.responsePlan') IS NULL
           AND deliveries.kind = 'summary')) ELSE 0 END
-      AND NOT EXISTS (SELECT 1 FROM job_quarantine WHERE job_quarantine.job_id = jobs.id)`).get() as { next_at?: unknown };
+      AND NOT EXISTS (SELECT 1 FROM job_quarantine WHERE job_quarantine.job_id = jobs.id)
+      AND NOT EXISTS (SELECT 1 FROM topic_resume_attempts WHERE topic_resume_attempts.job_id = jobs.id
+        AND topic_resume_attempts.state != 'delivery_handoff')`).get() as { next_at?: unknown };
     return row.next_at === null ? null : integer(row.next_at, "next delivery wakeup");
   }
 
@@ -555,6 +574,26 @@ export class TelegramDeliveryLedger {
     if (!nonEmpty(jobId)) return [];
     return this.host.statement("SELECT * FROM deliveries WHERE job_id = ? ORDER BY ordinal, part_key").all(jobId)
       .map((row) => decodeDelivery(row));
+  }
+
+  /** Read-only projection fallback: malformed rows never contribute delivery actions. */
+  readStatusEvidence(jobId: string): { readonly deliveries: readonly DeliveryPart[]; readonly malformed: boolean } {
+    const deliveries: DeliveryPart[] = [];
+    let malformed = false;
+    const rows = this.host.statement("SELECT * FROM deliveries WHERE job_id = ? ORDER BY ordinal, part_key").all(jobId);
+    for (const row of rows) {
+      try {
+        const part = decodeDelivery(row);
+        if (isUnsentStatusAnchorPlaceholder(part)) { deliveries.push(part); continue; }
+        const payload = normalizeTelegramDeliveryPayload(part.payload);
+        if (hashTelegramDeliveryPayload(payload) !== part.contentHash
+          || (part.lastErrorCode !== null && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(part.lastErrorCode))) {
+          throw new Error("Malformed Telegram status delivery evidence");
+        }
+        deliveries.push(part);
+      } catch { malformed = true; }
+    }
+    return { deliveries, malformed };
   }
 
   summary(jobId: string): TelegramDeliverySummary {
@@ -716,6 +755,18 @@ function decodeDelivery(value: unknown): DeliveryPart {
     validateDelivery(delivery);
     return structuredClone(delivery);
   } catch { throw new Error("Malformed Telegram delivery part"); }
+}
+
+function isUnsentStatusAnchorPlaceholder(part: DeliveryPart): boolean {
+  if (part.partKey !== "status-anchor" || part.kind !== "status-anchor" || part.ordinal !== 0
+    || part.state !== "pending" || part.attemptCount !== 0 || part.telegramMessageId !== null
+    || part.nextAttemptAt !== null || part.lastErrorCode !== null) return false;
+  const payload = record(part.payload);
+  return payload !== null && Object.keys(payload).length === 3
+    && Number.isSafeInteger(payload.chatId) && payload.chatId !== 0
+    && (payload.messageThreadId === null || (Number.isSafeInteger(payload.messageThreadId) && (payload.messageThreadId as number) > 0))
+    && Number.isSafeInteger(payload.sourceMessageId) && (payload.sourceMessageId as number) > 0
+    && createHash("sha256").update(JSON.stringify(payload)).digest("hex") === part.contentHash;
 }
 
 function validateDeliveryTransition(value: DeliveryTransitionInput): void {

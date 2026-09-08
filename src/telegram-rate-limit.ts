@@ -2,6 +2,14 @@ const DEFAULT_RETRY_AFTER_MS = 30_000;
 const MAX_RETRY_AFTER_SECONDS = 3_600;
 const MAX_WRAPPER_DEPTH = 4;
 
+export function definitiveTelegramRetryAfterMs(error: unknown): number | undefined {
+  const response = record(error);
+  if (!response || !Object.hasOwn(response, "error_code") || response.error_code !== 429) return undefined;
+  const seconds = record(response.parameters)?.retry_after;
+  return typeof seconds === "number" && Number.isSafeInteger(seconds)
+    && seconds >= 1 && seconds <= MAX_RETRY_AFTER_SECONDS ? seconds * 1000 : undefined;
+}
+
 export function telegramRetryAfterMs(error: unknown): number | undefined {
   const candidates = telegramErrorCandidates(error);
   const explicitErrorCandidates = candidates.filter((candidate) =>

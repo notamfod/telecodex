@@ -40,6 +40,7 @@ describe("loadConfig", () => {
     delete process.env.TELEGRAM_PROGRESS_HEARTBEAT_SECONDS;
     delete process.env.TELEGRAM_TOPIC_RECOVERY_ENABLED;
     delete process.env.TELEGRAM_TOPIC_RESUME_ENABLED;
+    delete process.env.TELEGRAM_TOPIC_WARNING_REPLAY_ENABLED;
     delete process.env.STATUS_BOARD_INTERVAL_SECONDS;
     delete process.env.TELEGRAM_JOB_STORE_MODE;
     delete process.env.TELEGRAM_JOB_DB_PATH;
@@ -155,6 +156,7 @@ describe("loadConfig", () => {
       enableTelegramReactions: false,
       telegramTopicRecoveryEnabled: false,
       telegramTopicResumeEnabled: false,
+      telegramTopicWarningReplayEnabled: false,
       telegramForumChatId: -1001234567890,
       topicSyncIntervalMs: 15_000,
       topicSyncEnabled: true,
@@ -670,6 +672,31 @@ describe("loadConfig", () => {
     process.env.TELEGRAM_TOPIC_RESUME_ENABLED = "false";
     expect(loadConfig().telegramTopicResumeEnabled).toBe(false);
   });
+
+  it("keeps warning replay independently disabled by default", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    expect(loadConfig().telegramTopicWarningReplayEnabled).toBe(false);
+    process.env.TELEGRAM_TOPIC_WARNING_REPLAY_ENABLED = "true";
+    expect(loadConfig().telegramTopicWarningReplayEnabled).toBe(true);
+    expect(loadConfig().telegramTopicResumeEnabled).toBe(false);
+    process.env.TELEGRAM_TOPIC_WARNING_REPLAY_ENABLED = "false";
+    process.env.TELEGRAM_TOPIC_RESUME_ENABLED = "true";
+    expect(loadConfig().telegramTopicWarningReplayEnabled).toBe(false);
+  });
+
+  it.each(["", " ", " true", "true ", " false ", "1", "yes", "TRUE", "False"])(
+    "rejects noncanonical warning replay flag %s", (value) => {
+      process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+      process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+      process.env.TELEGRAM_TOPIC_WARNING_REPLAY_ENABLED = value;
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      expect(loadConfig().telegramTopicWarningReplayEnabled).toBe(false);
+      expect(warning).toHaveBeenCalledWith(
+        "Invalid boolean env value: TELEGRAM_TOPIC_WARNING_REPLAY_ENABLED. Falling back to false.",
+      );
+    },
+  );
 
   it.each(["", " ", " true", "true ", " false ", "1", "yes", "TRUE", "False", "TRUE-ish", "x".repeat(256)])(
     "fails closed for invalid TELEGRAM_TOPIC_RESUME_ENABLED=%s",

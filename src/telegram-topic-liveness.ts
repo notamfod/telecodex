@@ -13,6 +13,7 @@ export interface ForumTopicLivenessOptions {
   readonly now?: () => number;
   readonly timeoutMs?: number;
   readonly cacheTtlMs?: number;
+  readonly requireDefinitiveErrors?: boolean;
 }
 
 export type ForumTopicLiveness = "live" | "closed" | "missing";
@@ -70,6 +71,7 @@ export function createForumTopicLivenessClassifier(
         cacheTtlMs,
         now,
         inFlight,
+        options.requireDefinitiveErrors ?? false,
       );
     }
     return subscribe(request, callerSignal);
@@ -108,6 +110,7 @@ function createSharedRequest(
   cacheTtlMs: number,
   now: () => number,
   inFlight: Map<string, SharedRequest>,
+  requireDefinitiveErrors: boolean,
 ): SharedRequest {
   const controller = new AbortController();
   let resolveRequest!: (value: ForumTopicLiveness) => void;
@@ -150,8 +153,9 @@ function createSharedRequest(
         );
         return "live" as const;
       } catch (error) {
-        if (isClosedForumTopicError(error)) return "closed" as const;
-        if (isMissingForumTopicError(error)) return "missing" as const;
+        const description = requireDefinitiveErrors ? definitiveDescription(error) : error;
+        if (description !== undefined && isClosedForumTopicError(description)) return "closed" as const;
+        if (description !== undefined && isMissingForumTopicError(description)) return "missing" as const;
         throw error;
       }
     })();
@@ -223,4 +227,10 @@ function positiveInteger(value: number, name: string): number {
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function definitiveDescription(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || Array.isArray(error)) return undefined;
+  const response = error as { error_code?: unknown; description?: unknown };
+  return response.error_code === 400 && typeof response.description === "string" ? response.description : undefined;
 }

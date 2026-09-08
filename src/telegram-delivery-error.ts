@@ -6,6 +6,7 @@ export class TelegramDeliveryApiError extends Error {
     readonly code: "not_sent" | "retry_after" | "message_missing" | "message_not_modified" | "rich_rejected" | "permanent",
     readonly retryAfterMs?: number,
     readonly richReason?: "format" | "method_unavailable",
+    readonly confirmedRetryAfter = false,
   ) {
     super("Telegram delivery failed");
     if (code === "retry_after") {

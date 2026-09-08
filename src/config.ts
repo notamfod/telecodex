@@ -85,6 +85,7 @@ export interface TeleCodexConfig {
   enableTelegramReactions: boolean;
   telegramTopicRecoveryEnabled: boolean;
   telegramTopicResumeEnabled: boolean;
+  telegramTopicWarningReplayEnabled: boolean;
   telegramForumChatId?: number;
   statusBoardIntervalMs: number;
   miniApp?: MiniAppConfig;
@@ -174,6 +175,11 @@ export function loadConfig(): TeleCodexConfig {
   const telegramForumChatId = parseTelegramForumChatId(
     optionalString(process.env.TELEGRAM_FORUM_CHAT_ID),
   );
+  const telegramTopicWarningReplayEnabled = parseBooleanEnv(
+    process.env.TELEGRAM_TOPIC_WARNING_REPLAY_ENABLED,
+    false,
+    { strict: true, name: "TELEGRAM_TOPIC_WARNING_REPLAY_ENABLED" },
+  );
   const gitlabUrl = optionalString(process.env.GITLAB_URL);
   const gitlabToken = optionalString(process.env.GITLAB_TOKEN);
   const gitlabGroupId = optionalString(process.env.GITLAB_GROUP_ID);
@@ -254,6 +260,7 @@ export function loadConfig(): TeleCodexConfig {
     enableTelegramReactions,
     telegramTopicRecoveryEnabled,
     telegramTopicResumeEnabled,
+    telegramTopicWarningReplayEnabled,
     telegramForumChatId,
     statusBoardIntervalMs,
     miniApp,

@@ -254,10 +254,11 @@ describe("Mini App HTTP server", () => {
     expect(tampered.status).toBe(400);
   });
 
-  it("accepts existing-topic resume only as an authenticated version-only DTO", async () => {
+  it.each(["resume_existing_topic", "resume_existing_topic_warning"] as const)(
+    "accepts %s only as an authenticated version-only DTO", async (kind) => {
     const { server, runJobAction } = await start();
     const jobId = "11111111-1111-4111-8111-111111111111";
-    const url = `${server.url}/api/dashboard/jobs/${jobId}/actions/resume_existing_topic`;
+    const url = `${server.url}/api/dashboard/jobs/${jobId}/actions/${kind}`;
     const headers = {
       "content-type": "application/json",
       "x-telegram-init-data": signedInitData(),
@@ -299,7 +300,7 @@ describe("Mini App HTTP server", () => {
     expect(rejected.map(({ status }) => status)).toEqual(extras.map(() => 400));
     expect(runJobAction).toHaveBeenCalledOnce();
     expect(runJobAction).toHaveBeenCalledWith({
-      kind: "resume_existing_topic",
+      kind,
       jobId,
       expectedVersion: 541,
     });

@@ -7,6 +7,7 @@ import type {
   SqliteTelegramJobStore,
 } from "./telegram-job-store.js";
 import {
+  enrichTopicResumeAction,
   projectTelegramJobStatus,
   type TelegramJobStatusProjection,
   type TelegramStatusAction,
@@ -27,7 +28,8 @@ const STATUS_ANCHOR_KEY = "status-anchor";
 
 type DurableStatusStore = Pick<SqliteTelegramJobStore,
   "get" | "listEventSummaries" | "getDispatchableQueuePosition" | "listDeliveries" | "readSourcePayload"
-  | "prepareStatusAnchorRevision" | "finishStatusAnchorRevision" | "replaceMissingStatusAnchorEdit">;
+  | "prepareStatusAnchorRevision" | "finishStatusAnchorRevision" | "replaceMissingStatusAnchorEdit" | "hasTopicResume"
+  | "readStatusDeliveryEvidence">;
 
 export type TelegramStatusRefreshPriority = "ordinary" | "urgent";
 
@@ -104,14 +106,24 @@ export class TelegramDurableStatusService {
     const events = this.options.store.listEventSummaries(jobId);
     const position = current.phase === "queued"
       ? this.options.store.getDispatchableQueuePosition(current.id) : null;
-    return projectTelegramJobStatus({
+    const resumeOwned = this.options.store.hasTopicResume(jobId);
+    const { deliveries, malformed } = this.options.store.readStatusDeliveryEvidence(jobId);
+    let projection = projectTelegramJobStatus({
       job: current,
       latestEvent: events.at(-1) ?? null,
-      deliveries: this.options.store.listDeliveries(jobId),
+      deliveries,
       guardian,
       queue: position === null ? null : { position },
       now: this.now(),
     });
+    if (malformed) projection = { ...projection, isDone: false,
+      state: current.phase === "terminal" && current.outcome === "completed" ? "terminal_incomplete" : projection.state,
+      delivery: { ...projection.delivery, complete: false },
+      reasonCodes: [...projection.reasonCodes, "DELIVERY_EVIDENCE_MALFORMED"],
+      actions: projection.actions.some((action) => action.kind === "inspect") ? projection.actions
+        : [{ kind: "inspect", jobId, expectedVersion: current.version }, ...projection.actions],
+    };
+    return resumeOwned ? enrichTopicResumeAction(projection, null, "failed") : projection;
   }
 
   refresh(

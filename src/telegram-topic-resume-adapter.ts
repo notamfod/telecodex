@@ -32,6 +32,7 @@ export function createTelegramTopicResumeAdapter(
   const api = createTelegramTopicResumeApi(options.token, options.clientOptions);
   const createClassifier = () => createForumTopicLivenessClassifier({
     sendChatAction: api.sendChatAction,
+    requireDefinitiveErrors: true,
   });
   let classifyForumTopic = createClassifier();
   return {

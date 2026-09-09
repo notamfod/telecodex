@@ -1384,6 +1384,53 @@ describe("Telegram reliability runtime", () => {
     expect(store.getTopicResume(seeded.candidate.jobId)).toMatchObject({ state: "complete" });
   });
 
+  it("keeps Dashboard available when warning eligibility advances during projection", async () => {
+    const seeded = seedExistingTopicResumeCandidate(store, 4);
+    const harness = createHarness(store, directory);
+    const topicResume = topicResumeOptions(seeded);
+    harness.options.topicRecovery = failedRecoveryProjectionOptions(seeded);
+    harness.options.topicResume = {
+      ...topicResume.options,
+      allowedModes: new Set(["warning_replay"]),
+    };
+    const inspectThread = harness.options.guardian.inspectThread;
+    let advanced = false;
+    harness.options.guardian.inspectThread = vi.fn(async (threadId) => {
+      if (!advanced) {
+        advanced = true;
+        const current = store.get(seeded.job.id)!;
+        store.transition({
+          jobId: current.id,
+          eventId: "warning-projection-race",
+          expectedVersion: current.version,
+          event: {
+            schemaVersion: 1,
+            type: "activity.observed",
+            eventAt: NOW,
+            health: "healthy",
+          },
+        });
+      }
+      return inspectThread(threadId);
+    });
+    runtime = createTelegramReliabilityRuntime(harness.options);
+
+    const raced = await runtime.loadDashboardReliability();
+    const racedProjection = raced.jobs.find(({ projection }) =>
+      projection.jobId === seeded.candidate.jobId)!.projection;
+    expect(racedProjection.actions.some(({ kind }) =>
+      kind === "resume_existing_topic_warning")).toBe(false);
+    expect(store.getTopicResume(seeded.candidate.jobId)).toBeNull();
+
+    const stable = await runtime.loadDashboardReliability();
+    const stableProjection = stable.jobs.find(({ projection }) =>
+      projection.jobId === seeded.candidate.jobId)!.projection;
+    expect(stableProjection.actions).toContainEqual(expect.objectContaining({
+      kind: "resume_existing_topic_warning",
+      expectedVersion: store.get(seeded.candidate.jobId)!.version,
+    }));
+  });
+
   it.each([
     [1, []], [4, []], [1, ["warning_replay"]], [4, ["standard"]],
   ] as const)("does not expose or execute a mode outside the allowed set (%s, %s)", async (baseline, modes) => {

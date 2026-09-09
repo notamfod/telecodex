@@ -905,6 +905,8 @@ function enrichTopicResumeProjection(
     const candidate = resume === null
       ? currentTopicResumeCandidate(store, options, projection.jobId)
       : null;
+    if (candidate && (candidate.jobId !== projection.jobId
+      || candidate.expectedVersion !== projection.expectedVersion)) return projection;
     return enrichTopicResumeAction(projection,
       candidate && options.allowedModes?.has(candidate.mode) ? candidate : null, activeState);
   } catch (error) {

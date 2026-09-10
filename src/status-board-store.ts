@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
+import { formatTelegramErrorLog } from "./telegram-error-log.js";
+
 export interface StatusBoardLocation {
   messageThreadId?: number;
   messageId?: number;
@@ -38,10 +40,7 @@ export function createStatusBoardStore(filePath: string): StatusBoardStore {
             // Nothing useful to do if the temporary file was never created.
           }
         }
-        console.warn(
-          "Failed to persist Dashboard status:",
-          error instanceof Error ? error.message : String(error),
-        );
+        console.warn(formatTelegramErrorLog("dashboard_store", error));
       }
     },
   };
@@ -65,10 +64,7 @@ function readLocation(filePath: string): StatusBoardLocation {
         : {}),
     };
   } catch (error) {
-    console.warn(
-      "Failed to load Dashboard status:",
-      error instanceof Error ? error.message : String(error),
-    );
+    console.warn(formatTelegramErrorLog("dashboard_store", error));
     return {};
   }
 }

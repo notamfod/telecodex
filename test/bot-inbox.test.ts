@@ -2,6 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { registerInboxHandlers } from "../src/bot-inbox.js";
 
+const SYNTHETIC_TOKEN = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
+const PRIVATE_PATH = "/private/telecodex/inbox.json";
+const PRIVATE_ERROR = new Error(
+  `https://api.telegram.org/bot${SYNTHETIC_TOKEN}/createForumTopic ${PRIVATE_PATH} message=77 payload=PRIVATE`,
+);
+
 describe("registerInboxHandlers", () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -225,6 +231,69 @@ describe("registerInboxHandlers", () => {
       String(text).includes("активного рабочего топика у него нет")
     )).toBe(false);
     expect(createForumTopic).not.toHaveBeenCalled();
-    expect(error).toHaveBeenCalledWith("Inbox burst failed:", expect.any(String));
+    expect(error).toHaveBeenCalledOnce();
+    expect(error.mock.calls[0]).toHaveLength(1);
+    expect(error.mock.calls[0]![0]).toMatch(/^telegram event=inbox category=/);
+  });
+
+  it("sanitizes Inbox topic creation failures as one console argument", async () => {
+    vi.useFakeTimers();
+    let messageHandler!: (ctx: any, next: () => Promise<void>) => Promise<void>;
+    const createForumTopic = vi.fn().mockRejectedValueOnce(PRIVATE_ERROR);
+    const removeUnattachedTicket = vi.fn();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const pending = {
+      id: 12,
+      inboxContextKey: "-1001:7",
+      workTopicId: 0,
+      workspace: "/work",
+      prompt: "Investigate",
+      source: "telegram",
+      createdAt: 1,
+    };
+    const bot = {
+      command: vi.fn(),
+      callbackQuery: vi.fn(),
+      on: (event: string, handler: typeof messageHandler) => {
+        if (event === "message") messageHandler = handler;
+      },
+      api: { createForumTopic },
+    };
+
+    registerInboxHandlers({
+      bot: bot as never,
+      config: { workspace: "/work", defaultLaunchProfileId: "default" } as never,
+      registry: {} as never,
+      inbox: {
+        get: vi.fn(() => ({ workspace: "/work", template: "{message}" })),
+        createTicket: vi.fn(() => pending),
+        removeUnattachedTicket,
+      } as never,
+      topicActivity: { rememberIdleIcon: vi.fn() },
+      getContextSession: vi.fn(),
+      isBusy: vi.fn(),
+      handleTicketPrompt: vi.fn(),
+      topicIsAlive: vi.fn(),
+      sendText: vi.fn(),
+      safeReply: vi.fn(),
+    });
+
+    await messageHandler({
+      chat: { id: -1001 },
+      message: {
+        message_id: 77,
+        message_thread_id: 7,
+        text: "Create a ticket",
+      },
+    }, vi.fn(async () => undefined));
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(removeUnattachedTicket).toHaveBeenCalledWith(12);
+    expect(logged).toHaveBeenCalledOnce();
+    expect(logged.mock.calls[0]).toHaveLength(1);
+    expect(logged.mock.calls[0]![0]).toMatch(/^telegram event=inbox category=/);
+    expect(String(logged.mock.calls[0]![0])).not.toMatch(
+      /123456789:|\/private\/telecodex|message=77|PRIVATE/,
+    );
   });
 });

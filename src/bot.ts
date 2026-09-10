@@ -88,6 +88,7 @@ import {
 } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, splitTelegramMarkdown } from "./format.js";
+import { formatTelegramErrorLog, isTelegramTopicNotModified } from "./telegram-error-log.js";
 import { createForumTopicLivenessProbe } from "./telegram-topic-liveness.js";
 import { createTelegramTopicLivenessApi, type TelegramTopicLivenessApi }
   from "./telegram-topic-liveness-api.js";
@@ -633,7 +634,7 @@ export function createBot(
   try {
     usageStore.compact();
   } catch (error) {
-    console.warn("Failed to compact token usage ledger:", friendlyErrorText(error));
+    console.warn(formatTelegramErrorLog("bot_handler", error));
   }
   const topicActivity = new TopicActivityIndicator({
     filePath: path.join(config.workspace, ".telecodex", "topic-icons.json"),
@@ -753,10 +754,10 @@ export function createBot(
         });
         inbox.setTopicTitle(current.id, extracted.title);
       } catch (error) {
-        if (/TOPIC_NOT_MODIFIED/i.test(formatError(error))) {
+        if (isTelegramTopicNotModified(error)) {
           inbox.setTopicTitle(current.id, extracted.title);
         } else {
-          console.warn(`Failed to rename ticket topic ${current.id}:`, formatError(error));
+          console.warn(formatTelegramErrorLog("topic", error));
         }
       }
       return extracted.text;
@@ -806,8 +807,8 @@ export function createBot(
         await bot.api.editForumTopic(chatId, messageThreadId, { name });
         return true;
       } catch (error) {
-        if (/TOPIC_NOT_MODIFIED/i.test(formatError(error))) return true;
-        console.warn("Inbox completion topic rename failed: TELEGRAM_TOPIC_RENAME_FAILED");
+        if (isTelegramTopicNotModified(error)) return true;
+        console.warn(formatTelegramErrorLog("topic", error));
         return false;
       }
     },
@@ -904,7 +905,7 @@ export function createBot(
         await bot.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: keyboard });
       } catch (error) {
         if (!isMessageNotModifiedError(error)) {
-          console.error(`Failed to update ${prefix} keyboard page`, error);
+          console.error(formatTelegramErrorLog("keyboard_edit", error));
         }
       }
     });
@@ -1141,7 +1142,7 @@ export function createBot(
         legacyJobStore().markPartSent(persistentJob.id, partKey);
         return true;
       } catch (error) {
-        console.error("Failed to send the answer as a document:", formatError(error));
+        console.error(formatTelegramErrorLog("delivery_send", error));
         return false;
       }
     };
@@ -1176,7 +1177,7 @@ export function createBot(
         try {
           await options.afterFinalResponse(transformedText, persistentJob);
         } catch (error) {
-          console.warn("Ticket post-processing failed:", friendlyErrorText(error));
+          console.warn(formatTelegramErrorLog("bot_handler", error));
         }
       }
     };
@@ -1206,7 +1207,8 @@ export function createBot(
             });
             legacyJobStore().markPartSent(persistentJob.id, partKey);
           } catch (documentError) {
-            console.error("Failed to send generated image", { photoError, documentError });
+            console.error(formatTelegramErrorLog("delivery_send", photoError));
+            console.error(formatTelegramErrorLog("delivery_send", documentError));
           }
         } finally {
           if (temporary) await unlink(imagePath).catch(() => {});
@@ -1224,7 +1226,7 @@ export function createBot(
           fallbackText: text,
           messageThreadId,
         }).catch((error) => {
-          console.error("Failed to send queue status", error);
+          console.error(formatTelegramErrorLog("delivery_send", error));
         });
       },
       onStarted: (turnId) => {
@@ -1283,7 +1285,7 @@ export function createBot(
             });
           }
         })().catch((error) => {
-          console.error(`Failed to send tool start message for ${toolName}`, error);
+          console.error(formatTelegramErrorLog("delivery_send", error));
         });
       },
       onToolUpdate: (toolCallId: string, partialResult: string) => {
@@ -1319,7 +1321,7 @@ export function createBot(
             fallbackText: state.finalStatus.fallbackText,
             messageThreadId,
           }).catch((error) => {
-            console.error(`Failed to send tool error message for ${state.toolName}`, error);
+            console.error(formatTelegramErrorLog("delivery_send", error));
           });
           return;
         }
@@ -1332,12 +1334,12 @@ export function createBot(
           parseMode: state.finalStatus.parseMode,
           fallbackText: state.finalStatus.fallbackText,
         }).catch((error) => {
-          console.error(`Failed to update tool message for ${state.toolName}`, error);
+          console.error(formatTelegramErrorLog("delivery_send", error));
         });
       },
       onTodoUpdate: (items) => {
         void progress.updatePlan(items).catch((error) => {
-          console.error("Failed to update progress checkpoint", error);
+          console.error(formatTelegramErrorLog("status_edit", error));
         });
       },
       onTurnComplete: (usage) => {
@@ -1352,7 +1354,7 @@ export function createBot(
             ...usage,
           });
         } catch (error) {
-          console.warn("Failed to record token usage:", friendlyErrorText(error));
+          console.warn(formatTelegramErrorLog("bot_handler", error));
         }
       },
       onGeneratedImage: (image) => {
@@ -1424,7 +1426,7 @@ export function createBot(
         deliverImages: deliverGeneratedImages,
         completeProgress: () => progress.complete(),
         onProgressError: (progressError) => {
-          console.error("Failed to mark progress checkpoint as completed", progressError);
+          console.error(formatTelegramErrorLog("status_edit", progressError));
         },
       });
       legacyJobStore().update(persistentJob.id, { state: "completed" });
@@ -1437,7 +1439,7 @@ export function createBot(
       await deliverPromptError({
         deliverResponse: async () => {
           if (finalized) {
-            console.error("Codex prompt error after finalization:", formatError(error));
+            console.error(formatTelegramErrorLog("bot_handler", error));
             return;
           }
           finalized = true;
@@ -1447,10 +1449,10 @@ export function createBot(
         },
         failProgress: () => progress.fail(friendlyErrorText(error)),
         onDeliveryError: (telegramError) => {
-          console.error("Failed to send error message to Telegram:", telegramError);
+          console.error(formatTelegramErrorLog("delivery_send", telegramError));
         },
         onProgressError: (progressError) => {
-          console.error("Failed to mark progress checkpoint as failed", progressError);
+          console.error(formatTelegramErrorLog("status_edit", progressError));
         },
       });
     } finally {
@@ -1515,7 +1517,7 @@ export function createBot(
               await deliverArtifacts(ctx, chatId, outDir, parsed.messageThreadId);
             }
           } catch (artifactError) {
-            console.error("Failed to deliver artifacts:", artifactError);
+            console.error(formatTelegramErrorLog("artifact_send", artifactError));
           }
           const finishedJob = legacyJobStore().get(persistentJob.id);
           if (
@@ -1563,7 +1565,7 @@ export function createBot(
         });
       } catch (error) {
         failedCount += 1;
-        console.error(`Failed to send artifact ${artifact.name}:`, error);
+        console.error(formatTelegramErrorLog("artifact_send", error));
       }
     }
 
@@ -3792,7 +3794,7 @@ export function createBot(
             await safeReply(ctx, escapeHTML(text), { fallbackText: text });
           },
           onNotificationError: (error) => {
-            console.warn("Failed to send implementation handoff notification:", friendlyErrorText(error));
+            console.warn(formatTelegramErrorLog("delivery_send", error));
           },
         });
         if (!prepared) {
@@ -4100,7 +4102,7 @@ export function createBot(
       legacyJobStore().update(job.id, { state: "failed" });
       if (!loggedDeadContexts.has(job.contextKey)) {
         loggedDeadContexts.add(job.contextKey);
-        console.warn(`Dropping Telegram model picker for missing topic: ${job.contextKey}`);
+        console.warn("Dropping Telegram model picker for missing topic");
       }
     }
     for (const job of awaitingModel) {
@@ -4149,7 +4151,7 @@ export function createBot(
     const results = await Promise.allSettled(recoveries);
     for (const result of results) {
       if (result.status === "rejected") {
-        console.error("Failed to recover Telegram job:", formatError(result.reason));
+        console.error(formatTelegramErrorLog("delivery_send", result.reason));
       }
     }
   };
@@ -4191,7 +4193,7 @@ export function createBot(
         try {
           await bot.api.reopenForumTopic(boardChatId, messageThreadId);
         } catch (error) {
-          if (!/TOPIC_NOT_MODIFIED/i.test(formatError(error))) throw error;
+          if (!isTelegramTopicNotModified(error)) throw error;
         }
       },
       remove: async (messageId, backgroundWrite) => {
@@ -4366,8 +4368,7 @@ export function createBot(
   }
 
   bot.catch((error) => {
-    const message = error.error instanceof Error ? error.error.message : String(error.error);
-    console.error("Telegram bot error:", message);
+    console.error(formatTelegramErrorLog("bot_handler", error.error));
   });
 
   return bot;
@@ -4831,7 +4832,7 @@ async function reopenThread(
     await runReopenCommand(reopen, threadId);
     return true;
   } catch (error) {
-    console.error("Failed to reopen thread after a blocking hook:", formatError(error));
+    console.error(formatTelegramErrorLog("bot_handler", error));
     return false;
   }
 }
@@ -4839,8 +4840,4 @@ async function reopenThread(
 function renderPromptFailure(accumulatedText: string, error: unknown): string {
   const message = friendlyErrorText(error);
   return accumulatedText.trim() ? `${accumulatedText.trim()}\n\n⚠️ ${message}` : `⚠️ ${message}`;
-}
-
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

@@ -42,6 +42,7 @@ import {
 import { isSafeProjectContext, loadDofboxRealmContext } from "./project-context.js";
 import { topicUrl } from "./projects.js";
 import type { SessionRegistry } from "./session-registry.js";
+import { formatTelegramErrorLog, isTelegramTopicNotModified } from "./telegram-error-log.js";
 import { extractTopicRename, renamedTicketTopic } from "./topic-naming.js";
 
 const INBOX_QUIET_MS = 2_000;
@@ -116,19 +117,19 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
         const realmContext = loadDofboxRealmContext(settings.realm);
         if (realmContext) parts.push(realmContext);
       } catch (error) {
-        console.warn(`Failed to load dofbox realm ${settings.realm}:`, friendlyErrorText(error));
+        console.warn(formatTelegramErrorLog("inbox", error));
       }
     }
     return parts.length ? parts.join("\n\n") : undefined;
   };
   const ticketTextOf = (group: InboxItem[]): string => group.map((item) => item.text).filter(Boolean).join("\n\n").trim();
-  const forwardAttachments = async (group: InboxItem[], threadId: number, ticketId: number): Promise<void> => {
+  const forwardAttachments = async (group: InboxItem[], threadId: number): Promise<void> => {
     const first = group[0]!;
     for (const item of group.filter((entry) => entry.hasAttachment)) {
       try {
         await bot.api.forwardMessage(first.chatId, first.chatId, item.messageId, { message_thread_id: threadId });
       } catch (error) {
-        console.warn(`Failed to forward message ${item.messageId} into ticket #${ticketId}:`, friendlyErrorText(error));
+        console.warn(formatTelegramErrorLog("inbox", error));
       }
     }
   };
@@ -136,7 +137,7 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
     const first = group[0]!;
     const card = [`➕ <b>Дополнение к ${escapeHTML(ticketHeading(ticket))}</b>`, `Источник: ${escapeHTML(source)}`, "", escapeHTML(text || "(без текста, см. пересланные сообщения ниже)")].join("\n");
     await deps.sendText(first.chatId, card, { messageThreadId: ticket.workTopicId, fallbackText: `Дополнение к ${ticketHeading(ticket)}. Источник: ${source}` });
-    await forwardAttachments(group, ticket.workTopicId, ticket.id);
+    await forwardAttachments(group, ticket.workTopicId);
     const url = topicUrl(first.chatId, ticket.workTopicId);
     await deps.sendText(first.chatId, `Уже заведён <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a> — добавил туда.`, {
       messageThreadId: parseContextKey(first.contextKey).messageThreadId,
@@ -217,7 +218,7 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
       escapeHTML(text || "(без текста, см. пересланные сообщения ниже)"),
     ].filter((line): line is string => line !== undefined).join("\n");
     await deps.sendText(first.chatId, card, { messageThreadId: topic.message_thread_id, fallbackText: `${ticketHeading(ticket)}. Источник: ${source}`, replyMarkup: ticketKeyboard(ticket) });
-    await forwardAttachments(group, topic.message_thread_id, ticket.id);
+    await forwardAttachments(group, topic.message_thread_id);
     const url = topicUrl(first.chatId, topic.message_thread_id);
     await deps.sendText(first.chatId, `${continued ? "Тикет продолжен" : "Заведён тикет"} <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a>.`, {
       messageThreadId: parseContextKey(first.contextKey).messageThreadId,
@@ -227,7 +228,7 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
   const createTicketsSequentially = async (groups: InboxItem[][]): Promise<void> => {
     for (const [index, group] of groups.entries()) {
       if (index > 0) await new Promise((resolve) => setTimeout(resolve, INBOX_TOPIC_PAUSE_MS));
-      try { await createTicket(group); } catch (error) { console.error("Failed to create ticket:", friendlyErrorText(error)); }
+      try { await createTicket(group); } catch (error) { console.error(formatTelegramErrorLog("inbox", error)); }
     }
   };
   const askHowToSplit = async (groups: InboxItem[][]): Promise<void> => {
@@ -241,7 +242,7 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
   };
   const inboxBuffer = new BurstBuffer<InboxItem>(INBOX_QUIET_MS, (items) => {
     const groups = groupBurst(items);
-    void (groups.length === 1 ? createTicket(groups[0]) : askHowToSplit(groups)).catch((error) => console.error("Inbox burst failed:", friendlyErrorText(error)));
+    void (groups.length === 1 ? createTicket(groups[0]) : askHowToSplit(groups)).catch((error) => console.error(formatTelegramErrorLog("inbox", error)));
   });
 
   registerInboxCommands(deps);
@@ -428,8 +429,8 @@ function registerInboxCommands(deps: RegisterInboxHandlersDeps): void {
       try {
         const contextFile = (await readFile(path.join(workspace, ".telecodex", "context.md"), "utf8")).trim();
         if (contextFile && isSafeProjectContext(contextFile)) projectContext = contextFile;
-        else if (contextFile) console.warn(`Skipped secret-bearing project context for ${workspace}`);
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.warn(`Failed to load project context for ${workspace}:`, friendlyErrorText(error)); }
+        else if (contextFile) console.warn("Skipped secret-bearing project context");
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.warn(formatTelegramErrorLog("inbox", error)); }
       inbox.enable(contextKey, { workspace, launchProfileId: config.defaultLaunchProfileId, template: settings?.template ?? DEFAULT_TICKET_TEMPLATE, iconCustomEmojiId: settings?.iconCustomEmojiId, projectContext, realm: settings?.realm });
       const html = ["<b>Инбокс включён.</b>", `Проект: <code>${escapeHTML(workspace)}</code>`, `Профиль запуска тикетов: <code>${escapeHTML(config.defaultLaunchProfileId)}</code>`, "", "Пересылай сюда обращения — на каждое заведу отдельный топик."].join("\n");
       await deps.safeReply(ctx, html, { fallbackText: "Инбокс включён." }); return;
@@ -466,7 +467,7 @@ function registerInboxCommands(deps: RegisterInboxHandlersDeps): void {
     if (!extracted) { await deps.safeReply(ctx, escapeHTML("Укажи безопасное непустое название: /title <текст>")); return; }
     const topicName = renamedTicketTopic(ticket, extracted.title);
     try { await bot.api.editForumTopic(chatId, threadId, { name: topicName }); }
-    catch (error) { if (!/TOPIC_NOT_MODIFIED/i.test(friendlyErrorText(error))) throw error; }
+    catch (error) { if (!isTelegramTopicNotModified(error)) throw error; }
     inbox.setTopicTitle(ticket.id, extracted.title);
     const text = `Топик переименован: ${topicName}`;
     await deps.safeReply(ctx, escapeHTML(text), { fallbackText: text });

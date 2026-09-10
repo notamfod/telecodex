@@ -22,7 +22,11 @@ import { restartPollingAfterDelay } from "./polling-lifecycle.js";
 import { SessionGuardianIpcClient } from "./session-guardian-ipc-client.js";
 import { SessionRegistry } from "./session-registry.js";
 import { TelegramBackgroundWriteGate } from "./telegram-background-write-gate.js";
-import { telegramRetryAfterMs } from "./telegram-rate-limit.js";
+import {
+  formatTelegramErrorLog,
+  isTelegramPollingConflict,
+  type TelegramLogOperation,
+} from "./telegram-error-log.js";
 import {
   classifyTelegramStatusError,
   createTelegramAttachmentDownloader,
@@ -39,6 +43,7 @@ import {
   boundedReliabilityProbeTimeoutMs,
   createTelegramReliabilityRuntime,
   type TelegramReliabilityRuntime,
+  type TelegramReliabilityRuntimeOperation,
 } from "./telegram-reliability-runtime.js";
 import { createTelegramTopicRecoveryAdapter } from "./telegram-topic-recovery-adapter.js";
 import { createTelegramTopicResumeAdapter } from "./telegram-topic-resume-adapter.js";
@@ -52,6 +57,13 @@ import {
 import { TopicSynchronizer } from "./topic-sync.js";
 import { transcribeAudio } from "./voice.js";
 import type { RunnerHandle } from "@grammyjs/runner";
+
+const RUNTIME_LOG_OPERATION = {
+  status_refresh: "status_edit",
+  delivery: "reliability",
+  coordinator: "reliability",
+  reconciliation: "reliability",
+} satisfies Record<TelegramReliabilityRuntimeOperation, TelegramLogOperation>;
 
 let registry: SessionRegistry | undefined;
 let bot: ReturnType<typeof createBot> | undefined;
@@ -86,15 +98,14 @@ const lifecycle = createTeleCodexLifecycle({
     registry,
   }),
   onCleanupError: (step, error) => {
-    const detail = error instanceof Error ? error.message : String(error);
     if (step === "mini-app") {
-      console.warn(`Failed to stop Mini App server: ${detail}`);
+      console.warn(formatTelegramErrorLog("cleanup", error));
     } else if (step === "retention-runtime") {
       console.warn("Failed to stop Telegram retention runtime cleanly");
     } else if (step === "reliability-runtime") {
       console.warn("Failed to stop Telegram reliability runtime cleanly");
     } else {
-      console.warn(`Failed during TeleCodex cleanup (${step}): ${boundedErrorText(error)}`);
+      console.warn(formatTelegramErrorLog("cleanup", error));
     }
   },
   onRunnerStopIncomplete: () => {
@@ -230,17 +241,8 @@ try {
         if (!completionProcessor) throw new Error("Telegram completion processor is unavailable");
         return completionProcessor(input);
       },
-      onRuntimeError: ({ jobId, operation, error }) => {
-        const telegramCode = telegramErrorCodeForLog(error);
-        const retryAfterMs = telegramRetryAfterMsForLog(error);
-        console.error([
-          "Telegram reliability background error",
-          `operation=${operation}`,
-          `job=${jobId ?? "none"}`,
-          ...(telegramCode === undefined ? [] : [`telegramCode=${telegramCode}`]),
-          ...(retryAfterMs === undefined ? [] : [`retryAfterMs=${retryAfterMs}`]),
-          `detail=${boundedErrorText(error)}`,
-        ].join(" "));
+      onRuntimeError: ({ operation, error }) => {
+        console.error(formatTelegramErrorLog(RUNTIME_LOG_OPERATION[operation], error));
       },
     });
     retentionRuntime = new TelegramJobRetentionRuntime({
@@ -363,8 +365,7 @@ try {
   }
 
 } catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`Failed to start TeleCodex: ${message}`);
+  console.error(formatTelegramErrorLog("startup", error));
   await lifecycle.terminate({ exitCode: 1, runner: "inactive" });
 }
 
@@ -376,7 +377,7 @@ const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
 };
 
 const reportShutdownFailure = (error: unknown): void => {
-  console.error(`TeleCodex shutdown failed: ${boundedErrorText(error)}`);
+  console.error(formatTelegramErrorLog("cleanup", error));
 };
 process.once("SIGINT", () => {
   runTeleCodexShutdownSafely(() => shutdown("SIGINT"), reportShutdownFailure);
@@ -422,12 +423,9 @@ async function startPolling(): Promise<void> {
       return;
     }
 
-    const message = error instanceof Error ? error.message : String(error);
-    const is409 = message.includes("409") || message.includes("Conflict");
-
-    if (is409 && restartAttempts < MAX_RESTART_ATTEMPTS) {
+    if (isTelegramPollingConflict(error) && restartAttempts < MAX_RESTART_ATTEMPTS) {
       restartAttempts += 1;
-      console.warn(`Polling error (attempt ${restartAttempts}/${MAX_RESTART_ATTEMPTS}): ${message}`);
+      console.warn(formatTelegramErrorLog("polling", error));
       console.warn(`Restarting polling in ${RESTART_DELAY_MS / 1000}s...`);
       return restartPollingAfterDelay({
         delayMs: RESTART_DELAY_MS,
@@ -436,7 +434,7 @@ async function startPolling(): Promise<void> {
       });
     }
 
-    console.error(`Fatal polling error: ${message}`);
+    console.error(formatTelegramErrorLog("polling", error));
     await lifecycle.terminate({ exitCode: 1, runner: "inactive" });
   }
 }
@@ -451,49 +449,4 @@ function requireReliabilityRuntime(): TelegramReliabilityRuntime {
 function requireSqliteJobStore(): SqliteTelegramJobStore {
   if (!sqliteJobStore) throw new Error("Telegram SQLite job store is not initialized");
   return sqliteJobStore;
-}
-
-function boundedErrorText(error: unknown): string {
-  try {
-    const text = error instanceof Error
-      ? `${error.name}: ${error.message}`
-      : String(error);
-    return text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ").slice(0, 512);
-  } catch {
-    return "Unknown error";
-  }
-}
-
-function telegramErrorCodeForLog(error: unknown): number | undefined {
-  try {
-    const seen = new Set<object>();
-    let current = errorRecord(error);
-    for (let depth = 0; current && !seen.has(current) && depth < 4; depth += 1) {
-      seen.add(current);
-      const errorCode = current.error_code;
-      if (typeof errorCode === "number" && Number.isSafeInteger(errorCode)) return errorCode;
-      current = errorRecord(current.error);
-    }
-  } catch {
-    return undefined;
-  }
-  return undefined;
-}
-
-function errorRecord(value: unknown): Record<string, unknown> | null {
-  try {
-    return typeof value === "object" && value !== null && !Array.isArray(value)
-      ? value as Record<string, unknown>
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function telegramRetryAfterMsForLog(error: unknown): number | undefined {
-  try {
-    return telegramRetryAfterMs(error);
-  } catch {
-    return undefined;
-  }
 }

@@ -38,6 +38,7 @@ export interface TeleCodexReleasePreflightStore {
   probeReleaseReadable(limit?: number): void;
   listUnfinished(limit?: number): readonly TelegramJob[];
   listStatusCandidates(limit?: number): readonly TelegramJob[];
+  listDueDeliveries(now: number, limit: number): readonly DeliveryPart[];
   listDeliveries(jobId: string): readonly DeliveryPart[];
 }
 
@@ -78,17 +79,21 @@ export async function inspectTeleCodexReleasePreflight(
     dependencies.store.probeReleaseReadable(MAX_UNFINISHED_JOBS);
     const unfinished = dependencies.store.listUnfinished(MAX_UNFINISHED_JOBS + 1);
     const statusCandidates = dependencies.store.listStatusCandidates(MAX_UNFINISHED_JOBS + 1);
-    if (unfinished.length > MAX_UNFINISHED_JOBS || statusCandidates.length > MAX_UNFINISHED_JOBS) {
+    const dueDeliveries = dependencies.store.listDueDeliveries(checkedAt, MAX_UNFINISHED_JOBS + 1);
+    if (unfinished.length > MAX_UNFINISHED_JOBS || statusCandidates.length > MAX_UNFINISHED_JOBS
+      || dueDeliveries.length > MAX_UNFINISHED_JOBS) {
       throw new Error("Release preflight job limit exceeded");
     }
+    if (dueDeliveries.length > 0) reasons.add("DELIVERY_PENDING");
     const candidates = new Map(unfinished.map((job) => [job.id, job]));
     for (const job of statusCandidates) candidates.set(job.id, job);
     for (const job of candidates.values()) {
       countJob(job, jobs, reasons);
       for (const part of dependencies.store.listDeliveries(job.id)) {
-        countDelivery(job, part, checkedAt, deliveries, reasons);
+        countDelivery(job, part, deliveries);
       }
     }
+    if (deliveries.sending > 0) reasons.add("DELIVERY_SENDING");
   } catch {
     jobs = emptyJobCounts();
     deliveries = emptyDeliveryCounts();
@@ -128,21 +133,12 @@ function countJob(
 function countDelivery(
   job: TelegramJob,
   part: DeliveryPart,
-  checkedAt: number,
   counts: MutableDeliveryCounts,
-  reasons: Set<TeleCodexReleasePreflightReason>,
 ): void {
   if (part.jobId !== job.id) throw new Error("Release preflight delivery mismatch");
-  if (part.state === "pending") {
-    counts.pending += 1;
-    if ((job.phase === "terminal" || job.phase === "delivering")
-      && (part.nextAttemptAt === null || part.nextAttemptAt <= checkedAt)) {
-      reasons.add("DELIVERY_PENDING");
-    }
-  } else if (part.state === "sending") {
-    counts.sending += 1;
-    reasons.add("DELIVERY_SENDING");
-  } else if (part.state === "uncertain") counts.uncertain += 1;
+  if (part.state === "pending") counts.pending += 1;
+  else if (part.state === "sending") counts.sending += 1;
+  else if (part.state === "uncertain") counts.uncertain += 1;
   else if (part.state === "failed") counts.failed += 1;
 }
 

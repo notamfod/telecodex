@@ -208,6 +208,7 @@ function unavailableStore(): TeleCodexReleasePreflightStore {
     probeReleaseReadable: unavailable,
     listUnfinished: unavailable,
     listStatusCandidates: unavailable,
+    listDueDeliveries: unavailable,
     listDeliveries: unavailable,
   };
 }

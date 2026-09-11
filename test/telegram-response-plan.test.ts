@@ -120,6 +120,24 @@ describe("buildTelegramResponsePlan", () => {
     });
   });
 
+  it("keeps positioned image planning byte-identical", () => {
+    const plan = buildTelegramResponsePlan({
+      result: result([
+        { kind: "text", text: "before" },
+        { kind: "attachment", attachment: { kind: "image", path: "outputs/chart.png" } },
+        { kind: "text", text: "after" },
+      ]),
+      destination,
+    });
+
+    expect(plan.parts).toHaveLength(1);
+    expect(plan.parts[0]).toMatchObject({
+      partKey: "final:0000",
+      payload: { operation: "send_rich" },
+      contentHash: "edb5ddce182732363bbbb181fe60ab16630e4e18da2babf2aab0766525350529",
+    });
+  });
+
   it("does not confuse a user-authored marker with a generated image marker", () => {
     const authored = "![](tg://photo?id=generated_0001)";
     const plan = buildTelegramResponsePlan({
@@ -268,16 +286,30 @@ describe("buildTelegramResponsePlan", () => {
     expect(plan.parts).toEqual([]);
   });
 
-  it("rebuilds byte-for-byte identical keys, payloads, and hashes", () => {
+  it("keeps positioned image and file order byte-for-byte deterministic", () => {
     const input = {
       result: result([
-        { kind: "text" as const, text: "hello" },
-        { kind: "attachment" as const, attachment: { kind: "file" as const, path: "outputs/a.txt" } },
+        { kind: "text" as const, text: "before" },
+        { kind: "attachment" as const,
+          attachment: { kind: "image" as const, path: "outputs/chart.png" } },
+        { kind: "text" as const, text: "after" },
+        { kind: "attachment" as const,
+          attachment: { kind: "file" as const, path: "outputs/report.pdf" } },
       ]),
       destination,
-      failure: { code: "turn_failed", publicDetail: "Safe detail." },
     };
-    expect(JSON.stringify(buildTelegramResponsePlan(input))).toBe(JSON.stringify(buildTelegramResponsePlan(structuredClone(input))));
+    const plan = buildTelegramResponsePlan(input);
+    expect(plan.parts.map((part) => [part.partKey, part.ordinal, part.payload.operation])).toEqual([
+      ["final:0000", 0, "send_rich"],
+      ["attachment:0000", 1, "send_media"],
+    ]);
+    expect(plan.parts.map((part) => part.payload.operation === "send_media" ? part.payload.path
+      : part.payload.operation === "send_rich" ? part.payload.media.map(({ path }) => path) : []).flat())
+      .toEqual(["outputs/chart.png", "outputs/report.pdf"]);
+    const richPayload = plan.parts[0]!.payload;
+    if (richPayload.operation !== "send_rich") throw new Error("expected rich response part");
+    expect(JSON.stringify(richPayload.fallbackParts)).not.toContain("tg://photo");
+    expect(JSON.stringify(plan)).toBe(JSON.stringify(buildTelegramResponsePlan(structuredClone(input))));
   });
 
   it("atomically appends a strict Jira confirmation part after the response", () => {
@@ -376,7 +408,7 @@ describe("buildTelegramResponsePlan", () => {
     })]);
   });
 
-  it("keeps stable rich and document ordering across multiple formatter segments", () => {
+  it("keeps compact text around a separate file in exact order", () => {
     const plan = buildTelegramResponsePlan({
       result: result([
         { kind: "text", text: "before" },
@@ -388,9 +420,58 @@ describe("buildTelegramResponsePlan", () => {
 
     expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text: "Response follows." });
     expect(plan.parts.map((part) => [part.partKey, part.payload.operation])).toEqual([
-      ["final:0000", "send_rich"],
+      ["final:0000", "send_text"],
       ["attachment:0000", "send_media"],
-      ["final:0001", "send_rich"],
+      ["final:0001", "send_text"],
+    ]);
+    expect(plan.parts.map((part) => part.ordinal)).toEqual([0, 1, 2]);
+  });
+
+  it("uses rich only for the advanced segment in a mixed result", () => {
+    const content: TelegramTurnResult["content"] = [
+      { kind: "text", text: "ordinary before" },
+      { kind: "attachment", attachment: { kind: "file", path: "outputs/report.pdf" } },
+      { kind: "text", text: "| A | B |\n|---|---|\n| 1 | 2 |" },
+    ];
+    const plan = buildTelegramResponsePlan({
+      result: result(content),
+      destination,
+    });
+
+    expect(plan.parts.map((part) => [part.partKey, part.ordinal, part.payload.operation])).toEqual([
+      ["final:0000", 0, "send_text"],
+      ["attachment:0000", 1, "send_media"],
+      ["final:0001", 2, "send_rich"],
+    ]);
+    const richPayload = plan.parts[2]!.payload;
+    if (richPayload.operation !== "send_rich") throw new Error("expected rich response part");
+    expect(richPayload.fallbackParts.map(({ partKey }) => partKey))
+      .toEqual(["final:0001:fallback:0000"]);
+    expect(() => buildTelegramResponsePlan({
+      result: result(content),
+      destination,
+      supplementalParts: [{
+        partKey: "final:0001:fallback:0000",
+        kind: "notice",
+        payload: {
+          operation: "send_text", chatId: -1001, messageThreadId: 77, text: "collision",
+        },
+      }],
+    })).toThrow("Invalid supplemental Telegram response part");
+  });
+
+  it("keeps an external Markdown image rich before an ordered file", () => {
+    const plan = buildTelegramResponsePlan({
+      result: result([
+        { kind: "text", text: "![chart](https://example.test/chart.png)" },
+        { kind: "attachment", attachment: { kind: "file", path: "outputs/report.pdf" } },
+      ]),
+      destination,
+    });
+
+    expect(plan.parts.map((part) => [part.partKey, part.ordinal, part.payload.operation])).toEqual([
+      ["final:0000", 0, "send_rich"],
+      ["attachment:0000", 1, "send_media"],
     ]);
   });
 

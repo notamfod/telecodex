@@ -15,7 +15,10 @@ import {
   isTelegramRichMediaId,
   type TelegramFormattedRichPart,
 } from "./telegram-rich-message.js";
-import { selectTelegramTurnRepresentation } from "./telegram-representation-selector.js";
+import {
+  selectTelegramTextRepresentation,
+  selectTelegramTurnRepresentation,
+} from "./telegram-representation-selector.js";
 import { normalizeTelegramTurnResult, type TelegramTurnResult } from "./telegram-turn-result.js";
 
 export {
@@ -296,6 +299,13 @@ function buildRichContentParts(
   const parts: TelegramPlannedResponsePart[] = [];
   let finalIndex = 0;
   let attachmentIndex = 0;
+  const appendLegacy = (source: string): void => {
+    const legacy = buildLegacyContentParts(textResult(source), destination);
+    for (const legacyPart of legacy) {
+      parts.push({ ...legacyPart, partKey: `final:${pad(finalIndex++)}` });
+      assertPartBudget(parts.length);
+    }
+  };
   for (const formattedPart of formatted) {
     if (formattedPart.kind === "file") {
       parts.push(mediaPart(formattedPart.attachment, undefined, attachmentIndex++, destination));
@@ -303,11 +313,14 @@ function buildRichContentParts(
       continue;
     }
     if (formattedPart.kind === "legacy") {
-      const legacy = buildLegacyContentParts(textResult(formattedPart.source), destination);
-      for (const legacyPart of legacy) {
-        parts.push({ ...legacyPart, partKey: `final:${pad(finalIndex++)}` });
-        assertPartBudget(parts.length);
-      }
+      appendLegacy(formattedPart.source);
+      continue;
+    }
+    if (selectTelegramTextRepresentation({
+      source: formattedPart.source,
+      positionedImageCount: formattedPart.media.length,
+    }) === "compact_html") {
+      appendLegacy(formattedPart.source);
       continue;
     }
     const primaryIndex = finalIndex++;

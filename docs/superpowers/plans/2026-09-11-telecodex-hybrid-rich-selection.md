@@ -705,8 +705,9 @@ After separate live approval, rebuild the exact commit, require a safe preflight
 **Files:**
 - Modify: `src/telegram-response-plan.ts:258-297`
 - Modify: `test/telegram-response-plan.test.ts:75-201,368-383`
+- Modify: `docs/superpowers/plans/2026-09-11-telecodex-hybrid-rich-selection.md` (checkpoint progress)
 
-- [ ] **Step 1: Write failing mixed-content expectations**
+- [x] **Step 1: Write failing mixed-content expectations**
 
 Ordinary text separated by a file must use compact text rows around the existing media row:
 
@@ -746,7 +747,7 @@ it("uses rich only for the advanced segment in a mixed result", () => {
 });
 ```
 
-- [ ] **Step 2: Run the response-plan test and verify RED**
+- [x] **Step 2: Run the response-plan test and verify RED**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run test/telegram-response-plan.test.ts
@@ -754,7 +755,7 @@ TMPDIR=/var/tmp npx vitest run test/telegram-response-plan.test.ts
 
 Expected: FAIL because ordinary formatter segments in mixed results still use `send_rich`.
 
-- [ ] **Step 3: Pin positioned-image compatibility before changing the loop**
+- [x] **Step 3: Pin positioned-image compatibility before changing the loop**
 
 Retain the current positioned-image payload and hash exactly:
 
@@ -777,7 +778,7 @@ it("keeps positioned image planning byte-identical", () => {
 });
 ```
 
-- [ ] **Step 4: Downgrade only ordinary formatted segments**
+- [x] **Step 4: Downgrade only ordinary formatted segments**
 
 Extract the existing legacy append block so both formatter-local legacy segments and selector-approved compact segments use the same part-key allocation:
 
@@ -809,7 +810,7 @@ if (selectTelegramTextRepresentation({
 
 Do not alter the native rich payload, media IDs, fallback parts, or `primaryIndex` allocation that follows this branch.
 
-- [ ] **Step 5: Add ordering and determinism regressions**
+- [x] **Step 5: Add ordering and determinism regressions**
 
 Cover these exact sequences:
 
@@ -821,7 +822,7 @@ Cover these exact sequences:
 
 For every sequence, assert operation order, `partKey`, ordinal, media path order, and byte-identical `JSON.stringify(plan)` for the cloned input. Assert that no fallback part contains a generated `tg://photo` marker.
 
-- [ ] **Step 6: Verify old durable rich and legacy contracts**
+- [x] **Step 6: Verify old durable rich and legacy contracts**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run \
@@ -838,7 +839,7 @@ TMPDIR=/var/tmp npx vitest run \
 
 Expected: mixed new plans follow the selector, while all persisted rich, legacy, fallback, migration, resume, and media fixtures remain green without modification to their payload schema.
 
-- [ ] **Step 7: Run complete verification and manual scope review**
+- [x] **Step 7: Run complete verification and manual scope review**
 
 ```bash
 TMPDIR=/var/tmp npm test
@@ -857,12 +858,13 @@ Also inspect the final diff and verify:
 - the existing Rich Message fallback still owns all `:fallback:` keys;
 - `formatTelegramRichResult` remains the only producer of positioned image IDs.
 
-- [ ] **Step 8: Review and checkpoint 07.1c**
+- [x] **Step 8: Review and checkpoint 07.1c**
 
 Stop for user review. Commit only after explicit authorization:
 
 ```bash
-git add src/telegram-response-plan.ts test/telegram-response-plan.test.ts
+git add docs/superpowers/plans/2026-09-11-telecodex-hybrid-rich-selection.md \
+  src/telegram-response-plan.ts test/telegram-response-plan.test.ts
 git commit -m "NO-TICKET feat: preserve hybrid telegram content ordering"
 ```
 

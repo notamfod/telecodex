@@ -36,7 +36,7 @@ Files:
 - Modify: `src/format.ts:1-82`
 - Modify: `test/format.test.ts:1-216`
 
-- [ ] **Step 1: Add failing readability fixtures**
+- [x] **Step 1: Add failing readability fixtures**
 
 Import `normalizeTelegramPresentation`, then add:
 
@@ -67,7 +67,7 @@ it("uses the same normalized source for sizing and rendering", () => {
 });
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run test/format.test.ts
@@ -75,7 +75,7 @@ TMPDIR=/var/tmp npx vitest run test/format.test.ts
 
 Expected: the new assertions fail because excess blanks, heading adjacency, and blank rows between list items are currently preserved.
 
-- [ ] **Step 3: Implement the pure normalizer**
+- [x] **Step 3: Implement the pure normalizer**
 
 Add above `formatTelegramHTML`:
 
@@ -83,7 +83,7 @@ Add above `formatTelegramHTML`:
 type TelegramPresentationLineKind = "heading" | "list" | "fence" | "text";
 
 export function normalizeTelegramPresentation(markdown: string): string {
-  if (!markdown) return "";
+  if (!markdown || markdown.trim() === "") return markdown;
   const output: string[] = [];
   let inFence = false;
   let pendingBlank = false;
@@ -129,7 +129,7 @@ function presentationLineKind(line: string): TelegramPresentationLineKind {
 
 In `formatTelegramHTML`, escape `normalizeTelegramPresentation(markdown)` instead of `markdown`. In `splitTelegramMarkdown`, normalize once and pass that value to `splitMarkdownBlocks`. Keep the stored turn result unchanged.
 
-- [ ] **Step 4: Add fence-isolation and idempotence tests**
+- [x] **Step 4: Add fence-isolation and idempotence tests**
 
 ```ts
 it("does not normalize indentation or blank lines inside a fence", () => {
@@ -144,7 +144,7 @@ it("does not normalize indentation or blank lines inside a fence", () => {
 });
 ```
 
-- [ ] **Step 5: Run focused compatibility**
+- [x] **Step 5: Run focused compatibility**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run \
@@ -158,7 +158,7 @@ git diff --check
 
 Expected: normalized source and HTML agree, fences retain their body bytes, response operation types remain unchanged, and all limits remain bounded.
 
-- [ ] **Step 6: Run the full gate and review**
+- [x] **Step 6: Run the full gate and review**
 
 ```bash
 TMPDIR=/var/tmp npm test -- --maxWorkers=1 --minWorkers=1
@@ -171,7 +171,7 @@ git status --short
 
 Review for fence-local mutation, quadratic work, payload changes, or files outside `src/format.ts`, `test/format.test.ts`, and this plan. Correct findings and repeat affected tests.
 
-- [ ] **Step 7: Commit 07.2a**
+- [x] **Step 7: Commit 07.2a**
 
 ```bash
 git add src/format.ts test/format.test.ts \

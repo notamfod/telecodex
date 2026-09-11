@@ -5,8 +5,71 @@ const INLINE_CODE_SUFFIX = "_\uE001";
 const MAX_FENCE_LANGUAGE_LENGTH = 64;
 const CHUNK_BUDGET_ERROR = "Telegram markdown split exceeds chunk budget";
 
+type TelegramPresentationLineKind = "heading" | "list" | "fence" | "text";
+
 export function escapeHTML(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+export function normalizeTelegramPresentation(markdown: string): string {
+  if (!markdown || markdown.trim() === "") return markdown;
+
+  const output: string[] = [];
+  let inFence = false;
+  let pendingBlank = false;
+  let previousKind: TelegramPresentationLineKind | undefined;
+
+  const appendBlank = (): void => {
+    if (output.length > 0 && output.at(-1) !== "") output.push("");
+  };
+
+  for (const sourceLine of markdown.split("\n")) {
+    const fence = /^```([^`]*)$/.exec(sourceLine);
+    if (inFence) {
+      if (/^```[ \t]*\r?$/.test(sourceLine)) {
+        output.push(sourceLine.trimEnd());
+        inFence = false;
+        previousKind = "fence";
+      } else {
+        output.push(sourceLine);
+      }
+      continue;
+    }
+    if (fence) {
+      appendBlank();
+      output.push(sourceLine.trimEnd());
+      inFence = true;
+      pendingBlank = false;
+      previousKind = "fence";
+      continue;
+    }
+    if (sourceLine.trim() === "") {
+      pendingBlank = true;
+      continue;
+    }
+
+    const kind = presentationLineKind(sourceLine);
+    const adjacentList = kind === "list" && previousKind === "list";
+    if (
+      kind === "heading"
+      || previousKind === "heading"
+      || previousKind === "fence"
+      || (pendingBlank && !adjacentList)
+    ) {
+      appendBlank();
+    }
+    output.push(sourceLine.trimEnd());
+    pendingBlank = false;
+    previousKind = kind;
+  }
+
+  return output.join("\n");
+}
+
+function presentationLineKind(line: string): TelegramPresentationLineKind {
+  if (/^#{1,6}[ \t]+\S/.test(line)) return "heading";
+  if (/^[ \t]*(?:[-+*]|\d+[.)])[ \t]+\S/.test(line)) return "list";
+  return "text";
 }
 
 export function formatTelegramHTML(markdown: string): string {
@@ -14,6 +77,10 @@ export function formatTelegramHTML(markdown: string): string {
     return "";
   }
 
+  return formatNormalizedTelegramHTML(normalizeTelegramPresentation(markdown));
+}
+
+function formatNormalizedTelegramHTML(markdown: string): string {
   const escaped = escapeHTML(markdown);
   const codeBlocks: string[] = [];
   const inlineCode: string[] = [];
@@ -45,6 +112,8 @@ export function splitTelegramMarkdown(
 ): TelegramMarkdownChunk[] {
   if (!markdown) return [];
 
+  const normalizedMarkdown = normalizeTelegramPresentation(markdown);
+
   const chunks: TelegramMarkdownChunk[] = [];
   let current = "";
 
@@ -53,13 +122,13 @@ export function splitTelegramMarkdown(
     if (chunks.length >= maximumChunks) throw new Error(CHUNK_BUDGET_ERROR);
     chunks.push({
       sourceText: current,
-      html: formatTelegramHTML(current),
+      html: formatNormalizedTelegramHTML(current),
       plain: current,
     });
     current = "";
   };
 
-  for (const block of splitMarkdownBlocks(markdown)) {
+  for (const block of splitMarkdownBlocks(normalizedMarkdown)) {
     const maximumPieces = Number.isFinite(maximumChunks)
       ? Math.max(1, maximumChunks - chunks.length + 1)
       : Number.POSITIVE_INFINITY;
@@ -68,7 +137,7 @@ export function splitTelegramMarkdown(
       if (
         current &&
         (codePointLength(candidate) > targetLength
-          || codePointLength(formatTelegramHTML(candidate)) > maxHtmlLength)
+          || codePointLength(formatNormalizedTelegramHTML(candidate)) > maxHtmlLength)
       ) {
         flush();
         current = piece;
@@ -126,7 +195,7 @@ function splitOversizedBlock(
   maximumPieces: number,
 ): string[] {
   if (codePointLength(block) <= targetLength
-    && codePointLength(formatTelegramHTML(block)) <= maxHtmlLength) {
+    && codePointLength(formatNormalizedTelegramHTML(block)) <= maxHtmlLength) {
     return [block];
   }
 
@@ -135,7 +204,14 @@ function splitOversizedBlock(
     return splitFencedCode(fenced[1], fenced[2], targetLength, maxHtmlLength, maximumPieces);
   }
 
-  return splitBoundedSource(block, targetLength, maxHtmlLength, formatTelegramHTML, true, maximumPieces);
+  return splitBoundedSource(
+    block,
+    targetLength,
+    maxHtmlLength,
+    formatNormalizedTelegramHTML,
+    true,
+    maximumPieces,
+  );
 }
 
 function splitFencedCode(
@@ -148,12 +224,12 @@ function splitFencedCode(
   let language = sanitizeLanguage(rawLanguage);
   let wrap = (value: string): string => `\`\`\`${language}\n${value}\n\`\`\``;
   if (codePointLength(wrap("")) >= targetLength
-    || codePointLength(formatTelegramHTML(wrap(""))) >= maxHtmlLength) {
+    || codePointLength(formatNormalizedTelegramHTML(wrap(""))) >= maxHtmlLength) {
     language = "";
     wrap = (value: string): string => `\`\`\`\n${value}\n\`\`\``;
   }
   const sourceOverhead = codePointLength(wrap(""));
-  const htmlOverhead = codePointLength(formatTelegramHTML(wrap("")));
+  const htmlOverhead = codePointLength(formatNormalizedTelegramHTML(wrap("")));
   if (sourceOverhead >= targetLength || htmlOverhead >= maxHtmlLength) {
     throw new Error("Telegram markdown limits cannot fit fenced block");
   }
@@ -162,7 +238,7 @@ function splitFencedCode(
     code,
     bodyTargetLength,
     maxHtmlLength,
-    (value) => formatTelegramHTML(wrap(value)),
+    (value) => formatNormalizedTelegramHTML(wrap(value)),
     false,
     maximumPieces,
   ).map(wrap);

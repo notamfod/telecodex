@@ -3,6 +3,7 @@ import { performance } from "node:perf_hooks";
 import {
   escapeHTML,
   formatTelegramHTML,
+  normalizeTelegramPresentation,
   splitTelegramMarkdown,
 } from "../src/format.js";
 
@@ -96,6 +97,48 @@ describe("formatTelegramHTML", () => {
   it("renders headings and lists using Telegram-native HTML", () => {
     expect(formatTelegramHTML("# Заголовок\n\n- первый\n- **второй**\n1. третий")).toBe(
       "<b>Заголовок</b>\n\n• первый\n• <b>второй</b>\n1. третий",
+    );
+  });
+
+  it("normalizes Russian section spacing without expanding lists", () => {
+    const input = [
+      "# Что сделано", "Текст раздела.", "", "", "## Проверка",
+      "- первый пункт", "", "- второй пункт",
+    ].join("\n");
+
+    expect(formatTelegramHTML(input)).toBe([
+      "<b>Что сделано</b>", "", "Текст раздела.", "", "<b>Проверка</b>",
+      "", "• первый пункт", "• второй пункт",
+    ].join("\n"));
+  });
+
+  it("keeps authored paragraphs and collapses only excess outside-fence blanks", () => {
+    expect(formatTelegramHTML("Первый.\n\n\n\nВторой.")).toBe("Первый.\n\nВторой.");
+  });
+});
+
+describe("normalizeTelegramPresentation", () => {
+  it("preserves whitespace-only input", () => {
+    expect(normalizeTelegramPresentation("   ")).toBe("   ");
+  });
+
+  it("does not normalize indentation or blank lines inside a fence and is idempotent", () => {
+    const source = [
+      "Перед кодом", "```text", "  first  ", "", "    second", "```", "После кода",
+    ].join("\n");
+    const normalized = normalizeTelegramPresentation(source);
+
+    expect(normalized).toBe([
+      "Перед кодом", "", "```text", "  first  ", "", "    second", "```", "", "После кода",
+    ].join("\n"));
+    expect(normalizeTelegramPresentation(normalized)).toBe(normalized);
+  });
+
+  it("recognizes a CRLF closing fence while preserving its body bytes", () => {
+    const source = "Перед\r\n```text\r\n  first  \r\n\r\n    second\r\n```\r\nПосле  \r\n";
+
+    expect(normalizeTelegramPresentation(source)).toBe(
+      "Перед\n\n```text\n  first  \r\n\r\n    second\r\n```\n\nПосле",
     );
   });
 });
@@ -212,5 +255,37 @@ describe("splitTelegramMarkdown", () => {
     ) => ReturnType<typeof splitTelegramMarkdown>;
     expect(() => boundedSplit("x".repeat(10_000), 3_000, 4_096, 2))
       .toThrow("Telegram markdown split exceeds chunk budget");
+  });
+
+  it("uses the same normalized source for sizing and rendering", () => {
+    const chunks = splitTelegramMarkdown("# Раздел\nТекст\n\n\n- один\n\n- два", 4_096, 4_096);
+
+    expect(chunks).toEqual([{
+      sourceText: "# Раздел\n\nТекст\n\n- один\n- два",
+      html: "<b>Раздел</b>\n\nТекст\n\n• один\n• два",
+      plain: "# Раздел\n\nТекст\n\n- один\n- два",
+    }]);
+  });
+
+  it("does not renormalize later chunks of an unclosed fence", () => {
+    const source = [
+      "```text",
+      "01234567890123456789",
+      "abcdefghijklmnopqrst",
+      "late  ",
+      "",
+      "",
+      "end",
+    ].join("\n");
+    const chunks = splitTelegramMarkdown(source, 35, 4_096);
+    const lateChunk = chunks.at(-1);
+    const expected = "ghijklmnopqrst\nlate  \n\n\nend";
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(lateChunk).toEqual({
+      sourceText: expected,
+      html: expected,
+      plain: expected,
+    });
   });
 });

@@ -100,6 +100,23 @@ describe("formatTelegramHTML", () => {
     );
   });
 
+  it("caps visual list indentation at two levels", () => {
+    const input = [
+      "- root", "  - child", "    - deep", "      - deeper",
+      "        1. ordered", "          - [x] checked",
+    ].join("\n");
+
+    expect(formatTelegramHTML(input)).toBe([
+      "• root", "  • child", "    • deep", "    • • deeper",
+      "    • • 1. ordered", "    • • • ☑ checked",
+    ].join("\n"));
+  });
+
+  it("treats tabs as one bounded list level", () => {
+    expect(formatTelegramHTML("- root\n\t- child\n\t\t\t- deep"))
+      .toBe("• root\n  • child\n    • • deep");
+  });
+
   it("normalizes Russian section spacing without expanding lists", () => {
     const input = [
       "# Что сделано", "Текст раздела.", "", "", "## Проверка",
@@ -265,6 +282,113 @@ describe("splitTelegramMarkdown", () => {
       html: "<b>Раздел</b>\n\nТекст\n\n• один\n• два",
       plain: "# Раздел\n\nТекст\n\n- один\n- два",
     }]);
+  });
+
+  it("keeps a long Russian list compact and within Telegram limits", () => {
+    const source = Array.from({ length: 300 }, (_, index) =>
+      `${"  ".repeat(index % 6)}- пункт ${index + 1} 😀`).join("\n");
+    const chunks = splitTelegramMarkdown(source, 3_000, 4_096);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every(({ html }) => Array.from(html).length <= 4_096)).toBe(true);
+    expect(chunks.every(({ html }) => !/^ {6}/m.test(html))).toBe(true);
+    expect(chunks.map(({ html }) => html).join("\n")).toContain("пункт 300 😀");
+  });
+
+  it("canonicalizes pathological task-list indentation before splitting", () => {
+    const expected = "    • • • …×2043 ☑ deep 😀";
+    const chunks = splitTelegramMarkdown(`${"\t".repeat(2_045)}- [x] deep 😀`, 3_000, 4_096);
+
+    expect(chunks).toEqual([{ sourceText: expected, html: expected, plain: expected }]);
+    expect(chunks.some(({ sourceText, html, plain }) =>
+      sourceText.includes("\t") || html.includes("\t") || plain.includes("\t"))).toBe(false);
+  });
+
+  it("canonicalizes pathological ordered-list indentation before splitting", () => {
+    const expected = "    • • • …×2998 0042) deep 😀";
+    const chunks = splitTelegramMarkdown(`${"\t".repeat(3_000)}0042) deep 😀`, 3_000, 4_096);
+
+    expect(chunks).toEqual([{ sourceText: expected, html: expected, plain: expected }]);
+    expect(chunks.some(({ sourceText, html, plain }) =>
+      sourceText.includes("\t") || html.includes("\t") || plain.includes("\t"))).toBe(false);
+  });
+
+  it("canonicalizes a 2045-tab task row inside an adjacent list block", () => {
+    const sourceText = "- root\n    • • • …×2043 ☑ deep 😀\n- tail";
+    const html = "• root\n    • • • …×2043 ☑ deep 😀\n• tail";
+    const chunks = splitTelegramMarkdown(
+      `- root\n${"\t".repeat(2_045)}- [x] deep 😀\n- tail`, 3_000, 4_096,
+    );
+
+    expect(chunks).toEqual([{ sourceText, html, plain: sourceText }]);
+    expect(chunks.every((chunk) => Array.from(chunk.sourceText).length <= 3_000
+      && Array.from(chunk.html).length <= 4_096)).toBe(true);
+    expect(chunks.every(({ sourceText: text, html: rendered, plain }) =>
+      !text.includes("\t") && !rendered.includes("\t") && !plain.includes("\t"))).toBe(true);
+  });
+
+  it("canonicalizes a 3000-tab task row inside an adjacent list block", () => {
+    const sourceText = "- root\n    • • • …×2998 ☑ deep 😀\n- tail";
+    const html = "• root\n    • • • …×2998 ☑ deep 😀\n• tail";
+    const chunks = splitTelegramMarkdown(
+      `- root\n${"\t".repeat(3_000)}- [x] deep 😀\n- tail`, 3_000, 4_096,
+    );
+
+    expect(chunks).toEqual([{ sourceText, html, plain: sourceText }]);
+    expect(chunks.every((chunk) => Array.from(chunk.sourceText).length <= 3_000
+      && Array.from(chunk.html).length <= 4_096)).toBe(true);
+    expect(chunks.every(({ sourceText: text, html: rendered, plain }) =>
+      !text.includes("\t") && !rendered.includes("\t") && !plain.includes("\t"))).toBe(true);
+  });
+
+  it("canonicalizes a 2045-tab task row between prose lines", () => {
+    const expected = "intro\n    • • • …×2043 ☑ deep 😀\noutro";
+    const chunks = splitTelegramMarkdown(
+      `intro\n${"\t".repeat(2_045)}- [x] deep 😀\noutro`, 3_000, 4_096,
+    );
+
+    expect(chunks).toEqual([{ sourceText: expected, html: expected, plain: expected }]);
+    expect(chunks.every((chunk) => Array.from(chunk.sourceText).length <= 3_000
+      && Array.from(chunk.html).length <= 4_096)).toBe(true);
+    expect(chunks.every(({ sourceText, html, plain }) =>
+      !sourceText.includes("\t") && !html.includes("\t") && !plain.includes("\t"))).toBe(true);
+  });
+
+  it("canonicalizes a 3000-tab task row between prose lines", () => {
+    const expected = "intro\n    • • • …×2998 ☑ deep 😀\noutro";
+    const chunks = splitTelegramMarkdown(
+      `intro\n${"\t".repeat(3_000)}- [x] deep 😀\noutro`, 3_000, 4_096,
+    );
+
+    expect(chunks).toEqual([{ sourceText: expected, html: expected, plain: expected }]);
+    expect(chunks.every((chunk) => Array.from(chunk.sourceText).length <= 3_000
+      && Array.from(chunk.html).length <= 4_096)).toBe(true);
+    expect(chunks.every(({ sourceText, html, plain }) =>
+      !sourceText.includes("\t") && !html.includes("\t") && !plain.includes("\t"))).toBe(true);
+  });
+
+  it("does not canonicalize a pathological list row inside fenced code", () => {
+    const body = `${"\t".repeat(2_045)}- [x] deep 😀`;
+    const sourceText = `\`\`\`\n${body}\n\`\`\``;
+
+    expect(splitTelegramMarkdown(sourceText, 3_000, 4_096)).toEqual([{
+      sourceText,
+      html: `<pre><code>${body}\n</code></pre>`,
+      plain: sourceText,
+    }]);
+  });
+
+  it("preserves a pathological list row inside an indented fence", () => {
+    const body = `${"\t".repeat(2_045)}- [x] deep 😀`;
+    const sourceText = `  \`\`\`\n${body}\n  \`\`\``;
+    const html = `  <pre><code>${body}\n  </code></pre>`;
+    const chunks = splitTelegramMarkdown(sourceText, 3_000, 4_096);
+
+    expect(chunks).toEqual([{ sourceText, html, plain: sourceText }]);
+    expect(chunks.every((chunk) => Array.from(chunk.sourceText).length <= 3_000
+      && Array.from(chunk.html).length <= 4_096)).toBe(true);
+    expect(chunks[0]?.sourceText.match(/\t/g)).toHaveLength(2_045);
+    expect(chunks[0]?.html.match(/\t/g)).toHaveLength(2_045);
   });
 
   it("does not renormalize later chunks of an unclosed fence", () => {

@@ -195,7 +195,7 @@ Restart `telecodex.service` exactly once. Verify stable PID, `NRestarts=0`, heal
 - Modify: `test/format.test.ts:96-216`
 - Modify: this plan for progress
 
-- [ ] **Step 1: Add failing nested-list fixtures**
+- [x] **Step 1: Add failing nested-list fixtures**
 
 ```ts
 it("caps visual list indentation at two levels", () => {
@@ -215,7 +215,7 @@ it("treats tabs as one bounded list level", () => {
 });
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run test/format.test.ts
@@ -223,7 +223,7 @@ TMPDIR=/var/tmp npx vitest run test/format.test.ts
 
 Expected: deep items retain unbounded spaces and tabs.
 
-- [ ] **Step 3: Implement bounded list prefixes**
+- [x] **Step 3: Implement bounded list prefixes**
 
 Replace the three list replacements in `formatBlockStructure` and add the ordered-list branch:
 
@@ -254,7 +254,7 @@ function listLine(indentation: string, marker: string, content: string): string 
 
 Keep task-list replacements before the unordered replacement. Never renumber ordered items.
 
-- [ ] **Step 4: Add a bounded long-list regression**
+- [x] **Step 4: Add a bounded long-list regression**
 
 ```ts
 it("keeps a long Russian list compact and within Telegram limits", () => {
@@ -268,7 +268,7 @@ it("keeps a long Russian list compact and within Telegram limits", () => {
 });
 ```
 
-- [ ] **Step 5: Verify, review, and commit 07.2b**
+- [x] **Step 5: Verify, review, and commit 07.2b**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run test/format.test.ts test/telegram-response-plan.test.ts

@@ -1,3 +1,4 @@
+import { mapOutsideMarkdownFences, markdownFenceTransition, parseMarkdownFenceBlock } from "./markdown-fence.js";
 const CODE_BLOCK_PREFIX = "\uE000CODE_";
 const CODE_BLOCK_SUFFIX = "_\uE000";
 const INLINE_CODE_PREFIX = "\uE001INLINE_";
@@ -24,9 +25,9 @@ export function normalizeTelegramPresentation(markdown: string): string {
   };
 
   for (const sourceLine of markdown.split("\n")) {
-    const fence = /^```([^`]*)$/.exec(sourceLine);
+    const fence = markdownFenceTransition(sourceLine, inFence);
     if (inFence) {
-      if (/^```[ \t]*\r?$/.test(sourceLine)) {
+      if (fence?.kind === "close") {
         output.push(sourceLine.trimEnd());
         inFence = false;
         previousKind = "fence";
@@ -35,7 +36,7 @@ export function normalizeTelegramPresentation(markdown: string): string {
       }
       continue;
     }
-    if (fence) {
+    if (fence?.kind === "open") {
       appendBlank();
       output.push(sourceLine.trimEnd());
       inFence = true;
@@ -153,9 +154,28 @@ export function splitTelegramMarkdown(
 function formatBlockStructure(text: string): string {
   return text
     .replace(/^#{1,6}[ \t]+(.+)$/gm, "<b>$1</b>")
-    .replace(/^(\s*)[-+*][ \t]+\[x\][ \t]+(.+)$/gim, "$1☑ $2")
-    .replace(/^(\s*)[-+*][ \t]+\[[ ]\][ \t]+(.+)$/gm, "$1☐ $2")
-    .replace(/^(\s*)[-+*][ \t]+(.+)$/gm, "$1• $2");
+    .replace(/^([ \t]*)[-+*][ \t]+\[x\][ \t]+(.+)$/gim,
+      (_match, indentation: string, content: string) => listLine(indentation, "☑", content))
+    .replace(/^([ \t]*)[-+*][ \t]+\[[ ]\][ \t]+(.+)$/gm,
+      (_match, indentation: string, content: string) => listLine(indentation, "☐", content))
+    .replace(/^([ \t]*)[-+*][ \t]+(.+)$/gm,
+      (_match, indentation: string, content: string) => listLine(indentation, "•", content))
+    .replace(/^([ \t]*)(\d+[.)])[ \t]+(.+)$/gm,
+      (_match, indentation: string, marker: string, content: string) =>
+        listLine(indentation, marker, content));
+}
+
+function listLine(indentation: string, marker: string, content: string): string {
+  const level = listLevel(indentation);
+  const visibleLevel = Math.min(level, 2);
+  const hiddenLevels = Math.max(0, level - visibleLevel);
+  const overflow = hiddenLevels <= 3 ? "• ".repeat(hiddenLevels) : `• • • …×${hiddenLevels} `;
+  return `${"  ".repeat(visibleLevel)}${overflow}${marker} ${content}`;
+}
+
+function listLevel(indentation: string): number {
+  return Math.floor([...indentation]
+    .reduce((total, character) => total + (character === "\t" ? 2 : 1), 0) / 2);
 }
 
 function splitMarkdownBlocks(markdown: string): string[] {
@@ -169,11 +189,12 @@ function splitMarkdownBlocks(markdown: string): string[] {
   };
 
   for (const line of markdown.split("\n")) {
-    if (/^```/.test(line)) {
-      if (!inFence) flush();
+    const fence = markdownFenceTransition(line, inFence);
+    if (fence) {
+      if (fence.kind === "open") flush();
       lines.push(line);
-      inFence = !inFence;
-      if (!inFence) flush();
+      inFence = fence.kind === "open";
+      if (fence.kind === "close") flush();
       continue;
     }
     if (inFence) {
@@ -194,14 +215,13 @@ function splitOversizedBlock(
   maxHtmlLength: number,
   maximumPieces: number,
 ): string[] {
-  if (codePointLength(block) <= targetLength
-    && codePointLength(formatNormalizedTelegramHTML(block)) <= maxHtmlLength) {
-    return [block];
-  }
+  const compactList = compactOversizedListBlock(block, targetLength, maxHtmlLength);
+  if (compactList !== block) return splitOversizedBlock(compactList, targetLength, maxHtmlLength, maximumPieces);
+  if (codePointLength(block) <= targetLength && codePointLength(formatNormalizedTelegramHTML(block)) <= maxHtmlLength) return [block];
 
-  const fenced = block.match(/^```([^\n`]*)\n([\s\S]*?)\n?```$/);
+  const fenced = parseMarkdownFenceBlock(block);
   if (fenced) {
-    return splitFencedCode(fenced[1], fenced[2], targetLength, maxHtmlLength, maximumPieces);
+    return splitFencedCode(fenced.language, fenced.body, targetLength, maxHtmlLength, maximumPieces);
   }
 
   return splitBoundedSource(
@@ -212,6 +232,18 @@ function splitOversizedBlock(
     true,
     maximumPieces,
   );
+}
+
+function compactOversizedListBlock(block: string, targetLength: number, maxHtmlLength: number): string {
+  return mapOutsideMarkdownFences(block, (line) => {
+    if (presentationLineKind(line) !== "list") return line;
+    const indentation = /^([ \t]*)/.exec(line)?.[1] ?? "";
+    const hiddenLevels = Math.max(0, listLevel(indentation) - 2);
+    const compactOverflowLength = hiddenLevels <= 3 ? hiddenLevels * 2 : codePointLength(`• • • …×${hiddenLevels} `);
+    const unboundedHtmlLength = codePointLength(formatNormalizedTelegramHTML(line)) + hiddenLevels * 2
+      - compactOverflowLength;
+    return codePointLength(line) > targetLength || unboundedHtmlLength > maxHtmlLength ? formatBlockStructure(line) : line;
+  });
 }
 
 function splitFencedCode(

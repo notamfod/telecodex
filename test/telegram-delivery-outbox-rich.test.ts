@@ -19,18 +19,19 @@ import { TelegramReliabilityFixture } from "./telegram-reliability-fixtures.js";
 
 describe("TelegramDeliveryOutbox rich fallback and recovery", () => {
   let fixture: TelegramReliabilityFixture;
+  const richContent = [{ kind: "text" as const, text: "| A | B |\n|---|---|\n| 1 | 2 |" }];
 
   beforeEach(() => { fixture = new TelegramReliabilityFixture(); });
   afterEach(() => { vi.useRealTimers(); fixture.close(); });
 
   function installEdit(id: string, worker = fixture.outbox()): TelegramDeliveryOutbox {
-    const job = fixture.delivering(id);
+    const job = fixture.delivering(id, richContent);
     worker.installPlan(job.id, { chatId: -100_001, messageThreadId: 7, anchorMessageId: 501 });
     return worker;
   }
 
   function installSend(id: string, worker = fixture.outbox()): TelegramDeliveryOutbox {
-    const job = fixture.delivering(id);
+    const job = fixture.delivering(id, richContent);
     worker.installPlan(job.id, { chatId: -100_001, messageThreadId: 7, anchorMessageId: null });
     return worker;
   }

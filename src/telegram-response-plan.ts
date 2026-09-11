@@ -15,6 +15,7 @@ import {
   isTelegramRichMediaId,
   type TelegramFormattedRichPart,
 } from "./telegram-rich-message.js";
+import { selectTelegramTurnRepresentation } from "./telegram-representation-selector.js";
 import { normalizeTelegramTurnResult, type TelegramTurnResult } from "./telegram-turn-result.js";
 
 export {
@@ -77,9 +78,13 @@ export interface TelegramSupplementalResponsePart {
   readonly payload: TelegramLegacyDeliveryPayload;
 }
 
-interface TelegramRichContentPlan {
+type TelegramEditableFinal =
+  | { readonly kind: "compact"; readonly html: string }
+  | { readonly kind: "rich"; readonly formatted: Extract<TelegramFormattedRichPart, { kind: "rich" }> };
+
+interface TelegramContentPlan {
   readonly parts: readonly TelegramPlannedResponsePart[];
-  readonly singleTextRich?: Extract<TelegramFormattedRichPart, { kind: "rich" }>;
+  readonly singleText?: TelegramEditableFinal;
 }
 
 export function buildTelegramResponsePlan(input: {
@@ -101,24 +106,31 @@ export function buildTelegramResponsePlan(input: {
     content: result.content.filter((content) => content.kind !== "text" || content.phase !== "commentary"),
   };
   const summaries = buildCommentaryParts(commentary, destination);
-  const generated = buildRichContentParts(finalResult, destination);
-  const editableRich = failure === undefined
+  const generated = buildSelectedContentParts(finalResult, destination);
+  const editable = failure === undefined
     && summaries.length === 0
     && Array.isArray(input.supplementalParts ?? []) && (input.supplementalParts ?? []).length === 0
     && destination.anchorMessageId !== null
-    ? generated.singleTextRich
+    ? generated.singleText
     : undefined;
-  const anchor = editableRich !== undefined
-    ? richAnchorPart(destination, editableRich)
-    : part(
-        TELEGRAM_STATUS_ANCHOR_PART_KEY,
-        0,
-        "status-anchor",
-        anchorPayload(destination, generated.parts.length === 0
-          ? failure === undefined ? "Completed." : failureText(failure)
-          : "Response follows."),
-      );
-  const content = [...summaries, ...(editableRich === undefined ? generated.parts : [])];
+  const anchor = editable?.kind === "compact"
+    ? part(TELEGRAM_STATUS_ANCHOR_PART_KEY, 0, "status-anchor", {
+        operation: "edit_text",
+        chatId: destination.chatId,
+        messageId: destination.anchorMessageId!,
+        text: editable.html,
+      })
+    : editable?.kind === "rich"
+      ? richAnchorPart(destination, editable.formatted)
+      : part(
+          TELEGRAM_STATUS_ANCHOR_PART_KEY,
+          0,
+          "status-anchor",
+          anchorPayload(destination, generated.parts.length === 0
+            ? failure === undefined ? "Completed." : failureText(failure)
+            : "Response follows."),
+        );
+  const content = [...summaries, ...(editable === undefined ? generated.parts : [])];
   const notice: TelegramPlannedResponsePart[] = failure === undefined || generated.parts.length === 0
     ? []
     : [part("notice:failure", 0, "notice", sendText(destination, formatTelegramHTML(failureText(failure))))];
@@ -255,10 +267,31 @@ function buildLegacyContentParts(
   return parts;
 }
 
+function buildCompactTextContentParts(
+  result: TelegramTurnResult,
+  destination: TelegramResponseDestination,
+): TelegramContentPlan {
+  const parts = buildLegacyContentParts(result, destination);
+  const only = parts.length === 1 && parts[0]?.payload.operation === "send_text"
+    ? { kind: "compact" as const, html: parts[0].payload.text }
+    : undefined;
+  return { parts, ...(only === undefined ? {} : { singleText: only }) };
+}
+
+function buildSelectedContentParts(
+  result: TelegramTurnResult,
+  destination: TelegramResponseDestination,
+): TelegramContentPlan {
+  const textOnly = result.content.every((content) => content.kind === "text");
+  return textOnly && selectTelegramTurnRepresentation(result) === "compact_html"
+    ? buildCompactTextContentParts(result, destination)
+    : buildRichContentParts(result, destination);
+}
+
 function buildRichContentParts(
   result: TelegramTurnResult,
   destination: TelegramResponseDestination,
-): TelegramRichContentPlan {
+): TelegramContentPlan {
   const formatted = formatTelegramRichResult(result);
   const parts: TelegramPlannedResponsePart[] = [];
   let finalIndex = 0;
@@ -288,12 +321,12 @@ function buildRichContentParts(
     }));
     assertPartBudget(parts.length);
   }
-  const singleTextRich = formatted.length === 1 && formatted[0]?.kind === "rich"
+  const singleText = formatted.length === 1 && formatted[0]?.kind === "rich"
     && formatted[0].media.length === 0 && result.content.every((content) => content.kind === "text")
     && hasSingleEditFallback(formatted[0], destination)
-    ? formatted[0]
+    ? { kind: "rich" as const, formatted: formatted[0] }
     : undefined;
-  return { parts, ...(singleTextRich === undefined ? {} : { singleTextRich }) };
+  return { parts, ...(singleText === undefined ? {} : { singleText }) };
 }
 
 function richAnchorPart(

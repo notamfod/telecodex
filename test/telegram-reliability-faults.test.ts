@@ -455,7 +455,7 @@ describe("Telegram reliability fault injection", () => {
     await outbox.pump();
 
     expect(fixture.telegram.calls[0]?.payload).toMatchObject({
-      operation: "edit_rich",
+      operation: "edit_text",
       messageId: 501,
     });
     expect(fixture.store.listDeliveries(delivering.id)[0]).toMatchObject({

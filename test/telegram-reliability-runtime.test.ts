@@ -333,11 +333,7 @@ describe("Telegram reliability runtime", () => {
       .toHaveLength(1);
     expect(harness.delivery.deliver).toHaveBeenCalledOnce();
     expect(harness.delivery.deliver.mock.calls[0]![0]).toEqual({
-      operation: "edit_rich", chatId: -1001, messageId: 501, markdown: "answer", media: [],
-      fallbackParts: [{
-        partKey: "final:0000:fallback:0000", kind: "final",
-        payload: { operation: "edit_text", chatId: -1001, messageId: 501, text: "answer" },
-      }],
+      operation: "edit_text", chatId: -1001, messageId: 501, text: "answer",
     });
   });
 
@@ -380,15 +376,8 @@ describe("Telegram reliability runtime", () => {
     expect(harness.delivery.deliver.mock.calls.map(([payload]) => payload)).toEqual([
       { operation: "edit_text", chatId: -1001, messageId: 501, text: "Response follows." },
       {
-        operation: "send_rich", chatId: -1001, messageThreadId: 7,
-        markdown: "answer without topic marker", media: [],
-        fallbackParts: [{
-          partKey: "final:0000:fallback:0000", kind: "final",
-          payload: {
-            operation: "send_text", chatId: -1001, messageThreadId: 7,
-            text: "answer without topic marker",
-          },
-        }],
+        operation: "send_text", chatId: -1001, messageThreadId: 7,
+        text: "answer without topic marker",
       },
       {
         operation: "send_text", chatId: -1001, messageThreadId: 7, text: "saved",
@@ -828,13 +817,7 @@ describe("Telegram reliability runtime", () => {
     expect(runningJob).toMatchObject({ phase: "running", turnId: "turn-exact" });
     expect(whileRunning).toEqual([]);
     expect(harness.delivery.deliver.mock.calls.map(([payload]) => payload)).toEqual([
-      {
-        operation: "edit_rich", chatId: -1001, messageId: 501, markdown: "Done.", media: [],
-        fallbackParts: [{
-          partKey: "final:0000:fallback:0000", kind: "final",
-          payload: { operation: "edit_text", chatId: -1001, messageId: 501, text: "Done." },
-        }],
-      },
+      { operation: "edit_text", chatId: -1001, messageId: 501, text: "Done." },
     ]);
     expect(store.listDeliveries(runningJob!.id).filter((part) => part.kind === "summary")).toEqual([]);
   });
@@ -909,8 +892,8 @@ describe("Telegram reliability runtime", () => {
       await handling;
 
       expect(harness.delivery.deliver.mock.calls[0]![0]).toMatchObject({
-        operation: "edit_rich",
-        markdown: "final bypasses status gate",
+        operation: "edit_text",
+        text: "final bypasses status gate",
       });
     } finally {
       statusGate.dispose();
@@ -941,7 +924,7 @@ describe("Telegram reliability runtime", () => {
     await runtime.handle(source());
     const statusEdits = harness.status.edit.mock.calls.length;
     expect(harness.delivery.deliver.mock.calls.at(-1)?.[0]).toMatchObject({
-      operation: "edit_rich", markdown: "answer",
+      operation: "edit_text", text: "answer",
     });
 
     await vi.advanceTimersByTimeAsync(10_000);
@@ -1185,15 +1168,8 @@ describe("Telegram reliability runtime", () => {
     });
     expect(harness.delivery.deliver).toHaveBeenCalledWith(
       {
-        operation: "send_rich", chatId: -1001, messageThreadId: 7,
-        markdown: "recovered answer", media: [],
-        fallbackParts: [{
-          partKey: "final:0000:fallback:0000", kind: "final",
-          payload: {
-            operation: "send_text", chatId: -1001, messageThreadId: 7,
-            text: "recovered answer",
-          },
-        }],
+        operation: "send_text", chatId: -1001, messageThreadId: 7,
+        text: "recovered answer",
       },
       expect.any(AbortSignal),
     );
@@ -1699,7 +1675,7 @@ describe("Telegram reliability runtime", () => {
     await runtime.runDashboardAction(action);
 
     expect(harness.delivery.deliver.mock.calls.map(([payload]) => payload.operation)).toEqual([
-      "edit_text", "send_text", "send_rich", "send_text",
+      "edit_text", "send_text", "send_text", "send_text",
     ]);
     expect(harness.delivery.deliver.mock.calls[1]![0]).toMatchObject({
       operation: "send_text", chatId: -1001, messageThreadId: 7,

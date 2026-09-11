@@ -19,6 +19,7 @@ import { TelegramReliabilityFixture } from "./telegram-reliability-fixtures.js";
 
 describe("TelegramDeliveryOutbox rich media preflight", () => {
   let fixture: TelegramReliabilityFixture;
+  const richContent = [{ kind: "text" as const, text: "| A | B |\n|---|---|\n| 1 | 2 |" }];
 
   beforeEach(() => { fixture = new TelegramReliabilityFixture(); });
   afterEach(() => { fixture.close(); });
@@ -170,7 +171,7 @@ describe("TelegramDeliveryOutbox rich media preflight", () => {
     const attachmentRoot = path.join(fixture.directory, "attachments");
     mkdirSync(attachmentRoot, { recursive: true });
     const worker = fixture.outbox({ attachmentRoot });
-    const first = fixture.delivering("circuit-media-a");
+    const first = fixture.delivering("circuit-media-a", richContent);
     worker.installPlan(first.id, { chatId: -100_001, messageThreadId: 7, anchorMessageId: 501 });
     installMissingEditRich("circuit-media-b");
     fixture.telegram.behavior = async (payload) => {
@@ -191,7 +192,7 @@ describe("TelegramDeliveryOutbox rich media preflight", () => {
   it("fails a post-lease rich local media error as definitely not sent", async () => {
     const attachmentRoot = path.join(fixture.directory, "attachments");
     mkdirSync(attachmentRoot, { recursive: true });
-    const job = fixture.delivering("rich-local-after-lease");
+    const job = fixture.delivering("rich-local-after-lease", richContent);
     const worker = fixture.outbox({ attachmentRoot });
     worker.installPlan(job.id, { chatId: -100_001, messageThreadId: 7, anchorMessageId: 501 });
     fixture.telegram.behavior = async () => { throw new TelegramDeliveryLocalError(); };

@@ -43,7 +43,7 @@
 - Create: `src/telegram-representation-selector.ts`
 - Create: `test/telegram-representation-selector.test.ts`
 
-- [ ] **Step 1: Write failing ordinary-content tests**
+- [x] **Step 1: Write failing ordinary-content tests**
 
 Create `test/telegram-representation-selector.test.ts` with typed helpers and a table proving that paragraphs, headings, emphasis, links, lists, quotes, inline code, and fenced code select compact HTML:
 
@@ -79,7 +79,7 @@ describe("Telegram representation selector", () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run test/telegram-representation-selector.test.ts
@@ -87,7 +87,7 @@ TMPDIR=/var/tmp npx vitest run test/telegram-representation-selector.test.ts
 
 Expected: FAIL because `src/telegram-representation-selector.ts` does not exist.
 
-- [ ] **Step 3: Add failing advanced-content and literal-safety tests**
+- [x] **Step 3: Add failing advanced-content and literal-safety tests**
 
 Extend the same suite with supported advanced constructs and nearby literals:
 
@@ -164,7 +164,7 @@ it("keeps over-limit advanced input on the existing rich-to-legacy path", () => 
 });
 ```
 
-- [ ] **Step 4: Implement the pure selector**
+- [x] **Step 4: Implement the pure selector**
 
 Create `src/telegram-representation-selector.ts`. Keep the public contract limited to two string results and do not return source fragments, identities, or mutable parser state:
 
@@ -395,7 +395,7 @@ function isFormulaBoundaryLine(line: string): boolean {
 
 The selector deliberately returns `native_rich` for invalid or over-limit advanced units. That preserves the current `formatTelegramRichResult` decision to emit a local `legacy` fallback instead of bypassing its validation path.
 
-- [ ] **Step 5: Add determinism and bounded-work regression tests**
+- [x] **Step 5: Add determinism and bounded-work regression tests**
 
 ```ts
 it("is deterministic and does not mutate the result", () => {
@@ -425,7 +425,7 @@ it("bounds adjacent text runs before joining them", () => {
 });
 ```
 
-- [ ] **Step 6: Run focused verification**
+- [x] **Step 6: Run focused verification**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run test/telegram-representation-selector.test.ts \
@@ -436,7 +436,7 @@ git diff --check
 
 Expected: all focused tests pass, TypeScript succeeds, and Git reports no whitespace errors.
 
-- [ ] **Step 7: Run the complete repository gate**
+- [x] **Step 7: Run the complete repository gate**
 
 ```bash
 TMPDIR=/var/tmp npm test
@@ -448,7 +448,7 @@ git status --short
 
 Expected: all tests pass, Svelte reports zero errors and zero warnings, both builds succeed, and the change set contains only the selector, its tests, and this plan.
 
-- [ ] **Step 8: Review and checkpoint 07.1a**
+- [x] **Step 8: Review and checkpoint 07.1a**
 
 Confirm that the selector is not imported by `src/telegram-response-plan.ts`, no delivery behavior changed, and no new dependency or configuration was added. Stop for user review. Commit only after explicit authorization:
 
@@ -468,8 +468,13 @@ After separate live approval, rebuild the exact commit, run `npm run release:pre
 **Files:**
 - Modify: `src/telegram-response-plan.ts:13-18,80-130,258-297`
 - Modify: `test/telegram-response-plan.test.ts:22-74,139-156,203-303`
+- Modify: `test/telegram-reliability-runtime.test.ts` (ordinary final integration expectations)
+- Modify: `test/telegram-delivery-outbox.test.ts` (ordinary final integration expectations)
+- Modify: `test/telegram-delivery-outbox-rich.test.ts` (explicit advanced-rich fixtures)
+- Modify: `test/telegram-delivery-outbox-rich-media.test.ts` (explicit advanced-rich fixtures)
+- Modify: `test/telegram-reliability-faults.test.ts` (ordinary no-op edit expectation)
 
-- [ ] **Step 1: Write failing compact-anchor tests**
+- [x] **Step 1: Write failing compact-anchor tests**
 
 Change the current `# Hello` expectation and add ordinary Markdown fixtures. A single ordinary result with an anchor must become one `edit_text` anchor and no response rows:
 
@@ -510,7 +515,7 @@ it("uses compact send_text after commentary or without an editable anchor", () =
 });
 ```
 
-- [ ] **Step 2: Run the response-plan test and verify RED**
+- [x] **Step 2: Run the response-plan test and verify RED**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run test/telegram-response-plan.test.ts
@@ -518,7 +523,7 @@ TMPDIR=/var/tmp npx vitest run test/telegram-response-plan.test.ts
 
 Expected: FAIL because ordinary final text still produces `edit_rich` or `send_rich`.
 
-- [ ] **Step 3: Add rich-compatibility fixtures before changing production code**
+- [x] **Step 3: Add rich-compatibility fixtures before changing production code**
 
 Pin the existing table and positioned-image behavior to their current payload hashes:
 
@@ -536,7 +541,7 @@ it("keeps an advanced table on the existing rich anchor contract", () => {
 
 Keep the generated-image fixture for 07.1c unchanged at this checkpoint. This ensures 07.1b does not alter mixed-content planning.
 
-- [ ] **Step 4: Add a compact editable candidate to the content plan**
+- [x] **Step 4: Add a compact editable candidate to the content plan**
 
 Import `selectTelegramTurnRepresentation`. Replace `TelegramRichContentPlan` with a neutral internal plan:
 
@@ -587,7 +592,7 @@ const singleText = formatted.length === 1 && formatted[0]?.kind === "rich"
 return { parts, ...(singleText === undefined ? {} : { singleText }) };
 ```
 
-- [ ] **Step 5: Wire compact and rich editable anchors without changing durable payload types**
+- [x] **Step 5: Wire compact and rich editable anchors without changing durable payload types**
 
 Replace `editableRich` with one eligibility gate and a tagged candidate:
 
@@ -621,7 +626,7 @@ const content = [...summaries, ...(editable === undefined ? generated.parts : []
 
 Call `buildSelectedContentParts(finalResult, destination)` at the current generation seam. Do not modify the payload normalizer or hash function.
 
-- [ ] **Step 6: Update affected text-only expectations and add split coverage**
+- [x] **Step 6: Update affected text-only expectations and add split coverage**
 
 Update only fixtures whose final content is ordinary text. Keep tables, formulas, details, footnotes, embedded images, positioned images, invalid rich fallback, attachments, and hand-built durable rich rows unchanged.
 
@@ -641,7 +646,7 @@ it("splits oversized ordinary text into bounded compact rows", () => {
 });
 ```
 
-- [ ] **Step 7: Run focused compatibility tests**
+- [x] **Step 7: Run focused compatibility tests**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run \
@@ -650,14 +655,19 @@ TMPDIR=/var/tmp npx vitest run \
   test/telegram-response-plan-budget.test.ts \
   test/telegram-delivery-payload.test.ts \
   test/telegram-delivery-replan.test.ts \
-  test/telegram-topic-resume-rich-lineage.test.ts
+  test/telegram-topic-resume-rich-lineage.test.ts \
+  test/telegram-reliability-runtime.test.ts \
+  test/telegram-delivery-outbox.test.ts \
+  test/telegram-delivery-outbox-rich.test.ts \
+  test/telegram-delivery-outbox-rich-media.test.ts \
+  test/telegram-reliability-faults.test.ts
 npm run build:server
 git diff --check
 ```
 
 Expected: ordinary text-only plans use text operations, advanced and mixed fixtures retain their prior rich operations and hashes, all durable compatibility suites pass, and TypeScript builds.
 
-- [ ] **Step 8: Run complete verification and review scope**
+- [x] **Step 8: Run complete verification and review scope**
 
 ```bash
 TMPDIR=/var/tmp npm test
@@ -668,14 +678,21 @@ git diff --name-only
 git status --short
 ```
 
-Expected: the full gate is green and the change set contains only the selector files plus response-plan source/tests.
+Expected: the full gate is green and the change set contains only the response planner, selector-aware plan tests, and integration fixtures whose old generic text accidentally selected rich mode.
 
-- [ ] **Step 9: Review and checkpoint 07.1b**
+- [x] **Step 9: Review and checkpoint 07.1b**
 
 Stop for user review. Commit only after explicit authorization:
 
 ```bash
-git add src/telegram-response-plan.ts test/telegram-response-plan.test.ts
+git add docs/superpowers/plans/2026-09-11-telecodex-hybrid-rich-selection.md \
+  src/telegram-response-plan.ts \
+  test/telegram-response-plan.test.ts \
+  test/telegram-reliability-runtime.test.ts \
+  test/telegram-delivery-outbox.test.ts \
+  test/telegram-delivery-outbox-rich.test.ts \
+  test/telegram-delivery-outbox-rich-media.test.ts \
+  test/telegram-reliability-faults.test.ts
 git commit -m "NO-TICKET feat: use compact html for ordinary telegram answers"
 ```
 

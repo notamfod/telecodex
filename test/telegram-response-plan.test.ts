@@ -19,23 +19,33 @@ describe("buildTelegramResponsePlan", () => {
       .toEqualTypeOf<TelegramLegacyDeliveryPayload>();
   });
 
-  it("turns one text result into one stable rich status-anchor edit", () => {
-    const plan = buildTelegramResponsePlan({ result: result([{ kind: "text", text: "# Hello" }]), destination });
+  it("edits the status anchor with compact HTML for one ordinary final answer", () => {
+    const plan = buildTelegramResponsePlan({
+      result: result([{ kind: "text", text: "# Hello\n\n- one\n- two" }]),
+      destination,
+    });
 
     expect(plan.responsePlan).toEqual([]);
     expect(plan.parts).toEqual([]);
     expect(plan.anchor).toEqual(expect.objectContaining({
       partKey: "status-anchor", ordinal: 0, kind: "status-anchor",
       payload: {
-        operation: "edit_rich", chatId: -1001, messageId: 501,
-        markdown: "# Hello", media: [],
-        fallbackParts: [{
-          partKey: "final:0000:fallback:0000", kind: "final",
-          payload: { operation: "edit_text", chatId: -1001, messageId: 501, text: "<b>Hello</b>" },
-        }],
+        operation: "edit_text", chatId: -1001, messageId: 501,
+        text: "<b>Hello</b>\n\n• one\n• two",
       },
       contentHash: expect.stringMatching(/^[0-9a-f]{64}$/),
     }));
+  });
+
+  it("keeps an advanced table on the existing rich anchor contract", () => {
+    const plan = buildTelegramResponsePlan({
+      result: result([{ kind: "text", text: "| A | B |\n|---|---|\n| 1 | 2 |" }]),
+      destination,
+    });
+
+    expect(plan.anchor.payload.operation).toBe("edit_rich");
+    expect(plan.anchor.contentHash)
+      .toBe("ba6271b979233e17ff6008c3a1c836639587e0cb5b536b490cb0ae3a6c815fbb");
   });
 
   it("sends each commentary message separately before the final answer", () => {
@@ -67,7 +77,7 @@ describe("buildTelegramResponsePlan", () => {
       }),
       expect.objectContaining({
         partKey: "final:0000", ordinal: 2, kind: "final",
-        payload: expect.objectContaining({ operation: "send_rich", markdown: "# Done" }),
+        payload: expect.objectContaining({ operation: "send_text", text: "<b>Done</b>" }),
       }),
     ]);
   });
@@ -136,23 +146,24 @@ describe("buildTelegramResponsePlan", () => {
     expect(JSON.stringify(payload.fallbackParts)).not.toContain("generated_0002");
   });
 
-  it("keeps Unicode text intact in a rich anchor without splitting surrogate pairs", () => {
+  it("keeps Unicode text intact in a compact anchor without splitting surrogate pairs", () => {
     const text = `${"a".repeat(1_499)}😀${"b".repeat(1_499)}`;
     const plan = buildTelegramResponsePlan({ result: result([{ kind: "text", text }]), destination });
 
-    expect(plan.anchor.payload).toMatchObject({ operation: "edit_rich", markdown: text });
+    expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text });
     expect(plan.parts).toEqual([]);
     expect(plan.responsePlan).toEqual([]);
   });
 
-  it("keeps Response follows when a rich edit would require multiple legacy fallback parts", () => {
+  it("splits oversized ordinary text into bounded compact rows", () => {
     const text = `${"a".repeat(2_047)}😀${"b".repeat(2_047)}`;
     const plan = buildTelegramResponsePlan({ result: result([{ kind: "text", text }]), destination });
 
     expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text: "Response follows." });
-    expect(plan.parts).toEqual([expect.objectContaining({
-      partKey: "final:0000", payload: expect.objectContaining({ operation: "send_rich", markdown: text }),
-    })]);
+    expect(plan.parts.length).toBeGreaterThan(1);
+    expect(plan.parts.every((part) => part.payload.operation === "send_text")).toBe(true);
+    expect(plan.parts.every((part) => part.payload.operation !== "send_text"
+      || [...part.payload.text].length <= 4_096)).toBe(true);
   });
 
   it("preserves text around a generated image before an ordered document", () => {
@@ -210,7 +221,7 @@ describe("buildTelegramResponsePlan", () => {
     expect(plan.parts.map((part) => part.ordinal)).toEqual([0, 1]);
     expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text: "Response follows." });
     expect(plan.parts[0]).toMatchObject({
-      kind: "final", payload: { operation: "send_rich", markdown: "partial answer" },
+      kind: "final", payload: { operation: "send_text", text: "partial answer" },
     });
     expect(plan.parts[1]).toMatchObject({
       kind: "notice",
@@ -233,7 +244,7 @@ describe("buildTelegramResponsePlan", () => {
     })).toThrow("Invalid Telegram response failure");
   });
 
-  it("keeps a response anchor and a rich part when no stable anchor message id exists", () => {
+  it("keeps a response anchor and compact text when no stable anchor message id exists", () => {
     const plan = buildTelegramResponsePlan({
       result: result([{ kind: "text", text: "hello" }]),
       destination: { chatId: -1001, messageThreadId: null, anchorMessageId: null },
@@ -244,7 +255,7 @@ describe("buildTelegramResponsePlan", () => {
     });
     expect(plan.parts).toEqual([expect.objectContaining({
       partKey: "final:0000",
-      payload: expect.objectContaining({ operation: "send_rich", markdown: "hello" }),
+      payload: expect.objectContaining({ operation: "send_text", text: "hello" }),
     })]);
     expect(plan.responsePlan).toEqual([{ partId: "final:0000", kind: "final" }]);
   });
@@ -292,7 +303,7 @@ describe("buildTelegramResponsePlan", () => {
 
     expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text: "Response follows." });
     expect(plan.parts.map((part) => part.partKey)).toEqual(["final:0000", "jira-confirm"]);
-    expect(plan.parts[0]).toMatchObject({ ordinal: 0, kind: "final", payload: { operation: "send_rich" } });
+    expect(plan.parts[0]).toMatchObject({ ordinal: 0, kind: "final", payload: { operation: "send_text" } });
     expect(plan.parts[1]).toEqual(expect.objectContaining({
       partKey: "jira-confirm", ordinal: 1, kind: "notice", payload: confirmation.payload,
       contentHash: expect.stringMatching(/^[0-9a-f]{64}$/),
@@ -310,7 +321,7 @@ describe("buildTelegramResponsePlan", () => {
 
   it("reserves generated fallback keys against supplemental part collisions", () => {
     expect(() => buildTelegramResponsePlan({
-      result: result([{ kind: "text", text: "answer" }]),
+      result: result([{ kind: "text", text: "| A | B |\n|---|---|\n| 1 | 2 |" }]),
       destination,
       supplementalParts: [{
         partKey: "final:0000:fallback:0000",

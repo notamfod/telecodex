@@ -220,7 +220,7 @@ Build the exact commit, require idle safe preflight, make and verify a mode-`060
 - Modify: `test/telegram-session-codex-adapter.test.ts:95-129`
 - Modify: this plan for progress
 
-- [ ] **Step 1: Add a failing prompt-order test**
+- [x] **Step 1: Add a failing prompt-order test**
 
 ```ts
 it("keeps user text first and appends bounded Telegram code-format guidance", async () => {
@@ -245,7 +245,7 @@ it("keeps user text first and appends bounded Telegram code-format guidance", as
 });
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run test/telegram-session-codex-adapter.test.ts
@@ -253,7 +253,7 @@ TMPDIR=/var/tmp npx vitest run test/telegram-session-codex-adapter.test.ts
 
 Expected: the structured prompt lacks the new guidance.
 
-- [ ] **Step 3: Add one deterministic instruction**
+- [x] **Step 3: Add one deterministic instruction**
 
 ```ts
 const TELEGRAM_PRESENTATION_INSTRUCTION = [
@@ -275,7 +275,7 @@ const instructions = [
 
 Keep `prompt.text` as the separate leading field. Do not add Telegram identifiers or change recovery.
 
-- [ ] **Step 4: Add attachment-order and determinism checks**
+- [x] **Step 4: Add attachment-order and determinism checks**
 
 In the existing materialized-attachment test:
 
@@ -311,7 +311,7 @@ it("builds byte-identical presentation instructions for equivalent prompts", asy
 });
 ```
 
-- [ ] **Step 5: Focused compatibility**
+- [x] **Step 5: Focused compatibility**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run \
@@ -326,7 +326,7 @@ git diff --check
 
 Expected: user text stays first, staged files and images are unchanged, instructions are deterministic, and completed text reaches the same planner.
 
-- [ ] **Step 6: Full gate, review, and commit 07.2d**
+- [x] **Step 6: Full gate, review, and commit 07.2d**
 
 ```bash
 TMPDIR=/var/tmp npm test -- --maxWorkers=1 --minWorkers=1

@@ -49,6 +49,12 @@ export interface TelegramSessionCodexAdapterOptions {
   readonly materializationRoot: string;
 }
 
+const TELEGRAM_PRESENTATION_INSTRUCTION = [
+  "For Telegram readability, wrap every multiline code, command, configuration, SQL, or log excerpt",
+  "in a closed triple-backtick fence on separate lines, with a blank line before and after.",
+  "Use a language tag when known, otherwise use text. Preserve indentation and internal blank lines.",
+].join(" ");
+
 export function createTelegramSessionCodexAdapter(
   options: TelegramSessionCodexAdapterOptions,
 ): TelegramCoordinatorCodexAdapter {
@@ -166,6 +172,7 @@ function toPromptInput(prompt: MaterializedPrompt, root: string, jobId: string):
   const outbox = durableOutbox(root, jobId);
   const instructions = [
     ...(files.length ? [stagedFileInstructions(files)] : []),
+    TELEGRAM_PRESENTATION_INSTRUCTION,
     `If you create a file for the user, save or copy it directly into ${JSON.stringify(outbox.absolutePath)}. Files elsewhere are not delivered.`,
   ].join("\n\n");
   return {

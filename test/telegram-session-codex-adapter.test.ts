@@ -120,6 +120,12 @@ describe("Telegram session Codex adapter", () => {
         imagePaths: [path.join(materializationRoot, "job/photo.jpg")],
         stagedFileInstructions: expect.stringContaining("report.txt"),
       }, expect.any(Object));
+      const promptInput = harness.session.prompt.mock.calls[0]![0];
+      if (typeof promptInput === "string") throw new Error("expected structured prompt");
+      expect(promptInput.stagedFileInstructions?.indexOf("report.txt")).toBeLessThan(
+        promptInput.stagedFileInstructions?.indexOf("For Telegram readability") ?? -1,
+      );
+      expect(promptInput.stagedFileInstructions).not.toContain("-1001");
       expect(observed.slice(0, 5)).toEqual([
         "before", "written", "started:turn-1", "activity:tool", "text:answer",
       ]);
@@ -128,6 +134,39 @@ describe("Telegram session Codex adapter", () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  it("keeps user text first and appends bounded Telegram code-format guidance", async () => {
+    const harness = createHarness(THREAD);
+    await createTelegramSessionCodexAdapter(harness.options).startTurn({
+      jobId: "job-1", threadId: THREAD,
+      prompt: { text: "show commands", attachments: [] }, callbacks: coordinatorCallbacks([]),
+    });
+    const input = harness.session.prompt.mock.calls[0]![0];
+    if (typeof input === "string") throw new Error("expected structured prompt");
+    expect(input.text).toBe("show commands");
+    expect(input.stagedFileInstructions).toContain(
+      "For Telegram readability, wrap every multiline code, command, configuration, SQL, or log excerpt",
+    );
+    expect(input.stagedFileInstructions).toContain(
+      "Use a language tag when known, otherwise use text. Preserve indentation and internal blank lines.",
+    );
+    expect(input.stagedFileInstructions).toMatch(/Files elsewhere are not delivered\.$/);
+  });
+
+  it("builds byte-identical presentation instructions for equivalent prompts", async () => {
+    const first = createHarness(THREAD);
+    const second = createHarness(THREAD);
+    const turn = { jobId: "job-1", threadId: THREAD,
+      prompt: { text: "inspect", attachments: [] }, callbacks: coordinatorCallbacks([]) };
+    await createTelegramSessionCodexAdapter(first.options).startTurn(turn);
+    await createTelegramSessionCodexAdapter(second.options).startTurn(turn);
+    const firstInput = first.session.prompt.mock.calls[0]![0];
+    const secondInput = second.session.prompt.mock.calls[0]![0];
+    if (typeof firstInput === "string" || typeof secondInput === "string") {
+      throw new Error("expected structured prompts");
+    }
+    expect(firstInput.stagedFileInstructions).toBe(secondInput.stagedFileInstructions);
   });
 
   it("forwards live commentary and final deltas with their logical agent-message boundaries", async () => {

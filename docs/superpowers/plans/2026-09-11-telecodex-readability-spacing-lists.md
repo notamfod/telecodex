@@ -284,7 +284,7 @@ git commit -m "NO-TICKET fix: bound telegram list indentation"
 
 Review regex ordering, list-content preservation, Unicode splitting, and scope before committing.
 
-- [ ] **Step 6: Deploy 07.2b**
+- [x] **Step 6: Deploy 07.2b**
 
 Repeat the exact-build, idle-preflight, verified online backup, one-restart, health/readiness, PID, SQLite, `getMe`, and fresh-log checks from 07.2a. Use a user-initiated nested-list answer for visual acceptance and inspect only aggregate delivery evidence.
 

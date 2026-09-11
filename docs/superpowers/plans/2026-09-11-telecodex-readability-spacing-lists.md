@@ -180,7 +180,7 @@ git diff --cached --check
 git commit -m "NO-TICKET fix: normalize telegram answer spacing"
 ```
 
-- [ ] **Step 8: Deploy 07.2a**
+- [x] **Step 8: Deploy 07.2a**
 
 Require the inherited organic-smoke gate, build the exact commit, and run `npm run release:preflight`. Require `safeToRestart=true`, `queued=0`, `running=0`, `sending=0`, and `uncertain=0`. Create an online `better-sqlite3` backup under `.telecodex/release-state/readability-code-fences/`, mode `0600`; verify SHA-256 length 64, `quick_check=ok`, and FK=0.
 

@@ -18,18 +18,6 @@ describe("escapeHTML", () => {
 });
 
 describe("formatTelegramHTML", () => {
-  it("formats fenced code blocks with a language", () => {
-    const input = "```ts\nconst x = 1 < 2;\n```";
-    expect(formatTelegramHTML(input)).toBe(
-      '<pre><code class="language-ts">const x = 1 &lt; 2;\n</code></pre>',
-    );
-  });
-
-  it("formats fenced code blocks without a language and does not parse nested markdown", () => {
-    const input = "```\n**bold**\n`code`\n```";
-    expect(formatTelegramHTML(input)).toBe("<pre><code>**bold**\n`code`\n</code></pre>");
-  });
-
   it("formats inline code with single and double backticks", () => {
     expect(formatTelegramHTML("Use `const x = 1` now")).toBe("Use <code>const x = 1</code> now");
     expect(formatTelegramHTML("Use ``a ` tricky` value`` now")).toBe(
@@ -158,6 +146,7 @@ describe("normalizeTelegramPresentation", () => {
       "Перед\n\n```text\n  first  \r\n\r\n    second\r\n```\n\nПосле",
     );
   });
+
 });
 
 describe("splitTelegramMarkdown", () => {
@@ -246,24 +235,6 @@ describe("splitTelegramMarkdown", () => {
     expect(chunks.every((chunk) => chunk.html.startsWith('<pre><code class="language-txt">'))).toBe(true);
     expect(chunks.every((chunk) => chunk.html.endsWith("</code></pre>"))).toBe(true);
     expect(chunks.every((chunk) => chunk.html.length <= 4_096)).toBe(true);
-  });
-
-  it("drops an unbounded fenced language identifier instead of repeating it per chunk", () => {
-    const language = "a".repeat(5_000);
-    const input = `\`\`\`${language}\nten characters\n\`\`\``;
-    const chunks = splitTelegramMarkdown(input, 3_000, 4_096);
-
-    expect(chunks).toHaveLength(1);
-    expect(chunks[0]?.sourceText).toBe("```\nten characters\n```");
-    expect(chunks[0]?.html).toBe("<pre><code>ten characters\n</code></pre>");
-    expect(chunks.every((chunk) => chunk.html.length <= 4_096)).toBe(true);
-
-    const started = performance.now();
-    const longChunks = splitTelegramMarkdown(`\`\`\`${language}\n${"<&>\n".repeat(50_000)}\`\`\``, 3_000, 4_096);
-    expect(performance.now() - started).toBeLessThan(10_000);
-    expect(longChunks.length).toBeLessThanOrEqual(512);
-    expect(longChunks.every((chunk) => chunk.sourceText.length <= 3_000)).toBe(true);
-    expect(longChunks.every((chunk) => chunk.html.length <= 4_096)).toBe(true);
   });
 
   it("stops bounded splitting before generating excess chunks", () => {
@@ -365,30 +336,6 @@ describe("splitTelegramMarkdown", () => {
       && Array.from(chunk.html).length <= 4_096)).toBe(true);
     expect(chunks.every(({ sourceText, html, plain }) =>
       !sourceText.includes("\t") && !html.includes("\t") && !plain.includes("\t"))).toBe(true);
-  });
-
-  it("does not canonicalize a pathological list row inside fenced code", () => {
-    const body = `${"\t".repeat(2_045)}- [x] deep 😀`;
-    const sourceText = `\`\`\`\n${body}\n\`\`\``;
-
-    expect(splitTelegramMarkdown(sourceText, 3_000, 4_096)).toEqual([{
-      sourceText,
-      html: `<pre><code>${body}\n</code></pre>`,
-      plain: sourceText,
-    }]);
-  });
-
-  it("preserves a pathological list row inside an indented fence", () => {
-    const body = `${"\t".repeat(2_045)}- [x] deep 😀`;
-    const sourceText = `  \`\`\`\n${body}\n  \`\`\``;
-    const html = `  <pre><code>${body}\n  </code></pre>`;
-    const chunks = splitTelegramMarkdown(sourceText, 3_000, 4_096);
-
-    expect(chunks).toEqual([{ sourceText, html, plain: sourceText }]);
-    expect(chunks.every((chunk) => Array.from(chunk.sourceText).length <= 3_000
-      && Array.from(chunk.html).length <= 4_096)).toBe(true);
-    expect(chunks[0]?.sourceText.match(/\t/g)).toHaveLength(2_045);
-    expect(chunks[0]?.html.match(/\t/g)).toHaveLength(2_045);
   });
 
   it("does not renormalize later chunks of an unclosed fence", () => {

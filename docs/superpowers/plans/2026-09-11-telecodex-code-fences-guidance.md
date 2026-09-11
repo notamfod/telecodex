@@ -21,7 +21,9 @@ Do not infer fences around arbitrary prose. Do not alter user text, stored resul
 
 Files:
 
-- Modify `src/format.ts` and `test/format.test.ts` for strict fences and exact splitting.
+- Modify `src/format.ts`, the shared `src/markdown-fence.ts` recognizer,
+  `test/format.test.ts`, and `test/format-fences.test.ts` for strict fences and
+  exact splitting.
 - Modify `src/telegram-session-codex-adapter.ts` and its test for output guidance.
 - Modify this plan only to record progress.
 
@@ -31,9 +33,11 @@ Files:
 
 **Files:**
 - Modify: `src/format.ts:122-199,260-269`
+- Modify: `src/markdown-fence.ts`
 - Modify: `test/format.test.ts:19-37,103-216`
+- Create: `test/format-fences.test.ts`
 
-- [ ] **Step 1: Add failing language and strict-fence tests**
+- [x] **Step 1: Add failing language and strict-fence tests**
 
 ```ts
 it("uses text for a fenced block without a known language", () => {
@@ -50,7 +54,7 @@ it("leaves an unclosed fence literal instead of inventing code structure", () =>
 
 Update the existing overlong-language test to expect a `text` fence and `language-text` HTML.
 
-- [ ] **Step 2: Add a failing exact round-trip split fixture**
+- [x] **Step 2: Add a failing exact round-trip split fixture**
 
 ```ts
 it("round-trips indentation trailing spaces and blank lines across fenced chunks", () => {
@@ -70,7 +74,7 @@ it("round-trips indentation trailing spaces and blank lines across fenced chunks
 });
 ```
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run test/format.test.ts
@@ -78,7 +82,7 @@ TMPDIR=/var/tmp npx vitest run test/format.test.ts
 
 Expected: bare fences lack `language-text`, and the splitter trims or moves code whitespace.
 
-- [ ] **Step 4: Use line-bounded fences and a safe language default**
+- [x] **Step 4: Use line-bounded fences and a safe language default**
 
 ```ts
 function fenceLanguage(rawLanguage: string): string {
@@ -104,12 +108,11 @@ Use the same boundary in `splitMarkdownBlocks`: outside a fence, only `^```([^`]
 const fenced = block.match(/^```([^\n`]*)\n([\s\S]*?)\n```[ \t]*$/);
 ```
 
-- [ ] **Step 5: Preserve whitespace in the bounded splitter**
+- [x] **Step 5: Preserve whitespace in the bounded splitter**
 
 ```ts
 function fencedSource(language: string, value: string): string {
-  const separator = value.endsWith("\n") ? "" : "\n";
-  return `\`\`\`${language}\n${value}${separator}\`\`\``;
+  return `\`\`\`${language}\n${value}\n\`\`\``;
 }
 
 function splitFencedCode(
@@ -123,6 +126,9 @@ function splitFencedCode(
   const wrap = (value: string): string => fencedSource(language, value);
   const sourceOverhead = codePointLength(wrap(""));
   const htmlOverhead = codePointLength(formatTelegramHTML(wrap("")));
+  if (code.length === 0 && sourceOverhead <= targetLength && htmlOverhead <= maxHtmlLength) {
+    return [wrap("")];
+  }
   if (sourceOverhead >= targetLength || htmlOverhead >= maxHtmlLength) {
     throw new Error("Telegram markdown limits cannot fit fenced block");
   }
@@ -148,9 +154,10 @@ if (trimAllLeadingWhitespace) {
 }
 ```
 
-Do not skip a newline after a code chunk. A selected newline belongs to the code body.
+Do not skip a newline after a code chunk. A selected newline belongs to the code body,
+and the closing fence needs its own additional delimiter newline.
 
-- [ ] **Step 6: Add command, config, SQL, and log fixtures**
+- [x] **Step 6: Add command, config, SQL, and log fixtures**
 
 ```ts
 it.each([
@@ -166,11 +173,12 @@ it.each([
 });
 ```
 
-- [ ] **Step 7: Run focused durability and budget compatibility**
+- [x] **Step 7: Run focused durability and budget compatibility**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run \
   test/format.test.ts \
+  test/format-fences.test.ts \
   test/telegram-response-plan.test.ts \
   test/telegram-response-plan-budget.test.ts \
   test/telegram-delivery-payload.test.ts \
@@ -183,7 +191,7 @@ git diff --check
 
 Expected: every generated fence is closed, body bytes round-trip, Unicode limits hold, fallback stays deterministic, and old durable rows remain compatible.
 
-- [ ] **Step 8: Full gate, review, and commit 07.2c**
+- [x] **Step 8: Full gate, review, and commit 07.2c**
 
 ```bash
 TMPDIR=/var/tmp npm test -- --maxWorkers=1 --minWorkers=1
@@ -191,7 +199,7 @@ npm run check:web
 npm run build
 git diff --check
 git diff --name-only
-git add src/format.ts test/format.test.ts \
+git add src/format.ts src/markdown-fence.ts test/format.test.ts test/format-fences.test.ts \
   docs/superpowers/plans/2026-09-11-telecodex-code-fences-guidance.md
 git diff --cached --check
 git commit -m "NO-TICKET fix: preserve telegram fenced code"

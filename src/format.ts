@@ -1,9 +1,15 @@
-import { mapOutsideMarkdownFences, markdownFenceTransition, parseMarkdownFenceBlock } from "./markdown-fence.js";
+import {
+  fenceLanguage,
+  findMarkdownFenceClose,
+  mapOutsideMarkdownFences,
+  markdownFenceTransition,
+  parseMarkdownFenceBlock,
+  replaceMarkdownFenceBlocks,
+} from "./markdown-fence.js";
 const CODE_BLOCK_PREFIX = "\uE000CODE_";
 const CODE_BLOCK_SUFFIX = "_\uE000";
 const INLINE_CODE_PREFIX = "\uE001INLINE_";
 const INLINE_CODE_SUFFIX = "_\uE001";
-const MAX_FENCE_LANGUAGE_LENGTH = 64;
 const CHUNK_BUDGET_ERROR = "Telegram markdown split exceeds chunk budget";
 
 type TelegramPresentationLineKind = "heading" | "list" | "fence" | "text";
@@ -24,7 +30,9 @@ export function normalizeTelegramPresentation(markdown: string): string {
     if (output.length > 0 && output.at(-1) !== "") output.push("");
   };
 
-  for (const sourceLine of markdown.split("\n")) {
+  const sourceLines = markdown.split("\n");
+  for (let lineIndex = 0; lineIndex < sourceLines.length; lineIndex += 1) {
+    const sourceLine = sourceLines[lineIndex] ?? "";
     const fence = markdownFenceTransition(sourceLine, inFence);
     if (inFence) {
       if (fence?.kind === "close") {
@@ -37,7 +45,7 @@ export function normalizeTelegramPresentation(markdown: string): string {
       continue;
     }
     if (fence?.kind === "open") {
-      appendBlank();
+      if (findMarkdownFenceClose(sourceLines, lineIndex) !== undefined || pendingBlank) appendBlank();
       output.push(sourceLine.trimEnd());
       inFence = true;
       pendingBlank = false;
@@ -82,11 +90,11 @@ export function formatTelegramHTML(markdown: string): string {
 }
 
 function formatNormalizedTelegramHTML(markdown: string): string {
-  const escaped = escapeHTML(markdown);
   const codeBlocks: string[] = [];
   const inlineCode: string[] = [];
 
-  let text = extractCodeBlocks(escaped, codeBlocks);
+  let text = escapeHTML(markdown);
+  text = extractCodeBlocks(text, codeBlocks);
   text = extractInlineCode(text, inlineCode);
   text = formatBlockStructure(text);
   text = formatBold(text);
@@ -253,15 +261,11 @@ function splitFencedCode(
   maxHtmlLength: number,
   maximumPieces: number,
 ): string[] {
-  let language = sanitizeLanguage(rawLanguage);
-  let wrap = (value: string): string => `\`\`\`${language}\n${value}\n\`\`\``;
-  if (codePointLength(wrap("")) >= targetLength
-    || codePointLength(formatNormalizedTelegramHTML(wrap(""))) >= maxHtmlLength) {
-    language = "";
-    wrap = (value: string): string => `\`\`\`\n${value}\n\`\`\``;
-  }
+  const language = fenceLanguage(rawLanguage);
+  const wrap = (value: string): string => fencedSource(language, value);
   const sourceOverhead = codePointLength(wrap(""));
   const htmlOverhead = codePointLength(formatNormalizedTelegramHTML(wrap("")));
+  if (code.length === 0 && sourceOverhead <= targetLength && htmlOverhead <= maxHtmlLength) return [wrap("")];
   if (sourceOverhead >= targetLength || htmlOverhead >= maxHtmlLength) {
     throw new Error("Telegram markdown limits cannot fit fenced block");
   }
@@ -274,6 +278,10 @@ function splitFencedCode(
     false,
     maximumPieces,
   ).map(wrap);
+}
+
+function fencedSource(language: string, value: string): string {
+  return `\`\`\`${language}\n${value}\n\`\`\``;
 }
 
 function splitBoundedSource(
@@ -291,7 +299,8 @@ function splitBoundedSource(
     const maxSource = largestFittingPrefix(window, maxHtmlLength, (value) => codePointLength(render(value)));
     if (maxSource < 1) throw new Error("Telegram markdown limits cannot fit source character");
     const cut = preferredSplit(window, maxSource);
-    const chunk = window.slice(0, cut).trimEnd();
+    const sourceChunk = window.slice(0, cut);
+    const chunk = trimAllLeadingWhitespace ? sourceChunk.trimEnd() : sourceChunk;
     if (chunk.length > 0) {
       if (result.length >= maximumPieces) throw new Error(CHUNK_BUDGET_ERROR);
       result.push(chunk);
@@ -299,8 +308,6 @@ function splitBoundedSource(
     offset += cut;
     if (trimAllLeadingWhitespace) {
       while (offset < source.length && source[offset]!.trim() === "") offset += 1;
-    } else if (source[offset] === "\n") {
-      offset += 1;
     }
   }
   return result;
@@ -366,11 +373,8 @@ function isHighSurrogate(value: number): boolean { return value >= 0xD800 && val
 function isLowSurrogate(value: number): boolean { return value >= 0xDC00 && value <= 0xDFFF; }
 
 function extractCodeBlocks(text: string, codeBlocks: string[]): string {
-  return text.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_match, rawLanguage: string, rawCode: string) => {
-    const language = sanitizeLanguage(rawLanguage);
-    const code = language
-      ? `<pre><code class="language-${language}">${rawCode}</code></pre>`
-      : `<pre><code>${rawCode}</code></pre>`;
+  return replaceMarkdownFenceBlocks(text, ({ language, body }) => {
+    const code = `<pre><code class="language-${language}">${body}\n</code></pre>`;
     const index = codeBlocks.push(code) - 1;
     return `${CODE_BLOCK_PREFIX}${index}${CODE_BLOCK_SUFFIX}`;
   });
@@ -477,11 +481,6 @@ function restorePlaceholders(
 ): string {
   const pattern = new RegExp(`${escapeRegExp(prefix)}(\\d+)${escapeRegExp(suffix)}`, "g");
   return text.replace(pattern, (_match, rawIndex: string) => values[Number.parseInt(rawIndex, 10)] ?? "");
-}
-
-function sanitizeLanguage(language: string): string {
-  const sanitized = language.trim().replace(/[^a-zA-Z0-9_+-]/g, "");
-  return sanitized.length <= MAX_FENCE_LANGUAGE_LENGTH ? sanitized : "";
 }
 
 const SAFE_URL_PROTOCOL = /^(https?|tg|mailto):/i;

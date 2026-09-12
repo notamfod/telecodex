@@ -4,7 +4,7 @@
 
 **Goal:** Turn the pinned Telegram Dashboard message into a compact operational summary with one Mini App launcher and only unambiguous, currently required actions.
 
-**Architecture:** Keep snapshot collection, callback DTOs, Mini App data, publisher lifecycle, and stored Dashboard location unchanged. Replace only the Telegram topic projection in `status-board-render`: bounded summary sections first, then a separately releasable required-action selector whose numbered buttons are derived from the same visible attention rows.
+**Architecture:** Keep snapshot collection, callback DTOs, Mini App data, publisher lifecycle, and stored Dashboard location unchanged. Replace the Telegram topic projection in `status-board-render`: bounded summary sections first, then a separately releasable required-action selector whose numbered buttons are derived from the same visible attention rows. Keep the callback wire format unchanged and make its shared encoder fail closed for job IDs that the existing bot parser cannot accept.
 
 **Tech Stack:** TypeScript 5.9, Vitest, grammY inline keyboards, existing status-board publisher, SQLite release preflight.
 
@@ -19,13 +19,16 @@ This plan contains two independently releasable checkpoints:
 1. **07.3a:** compact summary and launcher-only keyboard.
 2. **07.3b:** required-action-only numbered callbacks.
 
-Do not change `StatusSnapshot`, canonical projections, callback encoding, action execution, authorization, stale-version checks, Mini App API, persisted Dashboard location, topic lifecycle, outbox, or database schema. Do not render recent session history or canonical diagnostic facts in the topic. Do not create a replacement Dashboard topic or message.
+Do not change `StatusSnapshot`, canonical projections, callback wire format, action execution, authorization, stale-version checks, Mini App API, persisted Dashboard location, topic lifecycle, outbox, or database schema. Do not render recent session history or canonical diagnostic facts in the topic. Do not create a replacement Dashboard topic or message.
 
 Files:
 
 - Modify `src/status-board-render.ts` for the compact topic projection.
+- Modify `src/telegram-grammy-transport.ts` so the shared callback encoder accepts only parser-compatible job IDs.
 - Split the existing oversized `test/status-board.test.ts` before changing its render expectations.
 - Modify `test/status-board-render.test.ts` for canonical attention and callback coverage.
+- Split callback-specific coverage from `test/telegram-grammy-transport.test.ts` into
+  `test/telegram-status-callback.test.ts` and add encoder/parser compatibility fixtures there.
 - Modify `test/status-board-lifecycle.test.ts` only for the removed topic-link button behavior.
 - Modify this plan only to record checkpoint progress.
 
@@ -71,7 +74,7 @@ expect(buttons).toEqual([{
 }]);
 ```
 
-Without a Mini App URL, require no buttons. Run RED:
+For the launcher-only 07.3a checkpoint, without a Mini App URL require no buttons; 07.3b later permits required callbacks independently of the launcher. Run RED:
 
 ```bash
 TMPDIR=/var/tmp npx vitest run test/status-board-summary.test.ts test/status-board-render.test.ts
@@ -145,16 +148,20 @@ Restart `telecodex.service` exactly once. Require a stable new PID, `NRestarts=0
 
 ### Task 3: Derive actions from visible attention rows
 
-- [ ] **Step 1: Add failing action-selection fixtures**
+- [x] **Step 1: Add failing action-selection fixtures**
 
 In `test/status-board-render.test.ts`, require:
 
 - a board with only healthy queued or running jobs has the launcher and no callbacks;
 - `attention.kind = "required"` exposes at most one non-informational action;
 - `details` and `inspect` never become topic buttons;
+- required callbacks remain available without a Mini App URL;
 - a button label begins with the exact number of its visible attention row;
 - an action whose job ID or version does not match its projection throws;
 - an oversized callback is omitted while its attention row stays visible;
+- a parser-incompatible job ID is omitted by the shared encoder while its attention row stays visible;
+- a parser-incompatible delivery `partKey` is omitted by the shared encoder while its attention row stays visible;
+- without a launcher, eight required rows and eight matching callbacks remain visible; with a launcher, seven remain visible;
 - many required jobs keep the body and button count bounded;
 - repeated rendering is byte-identical.
 
@@ -164,17 +171,17 @@ Run RED:
 TMPDIR=/var/tmp npx vitest run test/status-board-render.test.ts
 ```
 
-- [ ] **Step 2: Select one exact action per canonical attention item**
+- [x] **Step 2: Select one exact action per canonical attention item**
 
 Create one internal `AttentionRow` model containing rendered text, optional projected job, and optional selected action. Projected jobs are eligible only when `projection.attention.kind === "required"`. Prefer the first exact action not in `{ details, inspect }`, preserving canonical action order and full DTO fields such as `partKey` or `alertId`. Waiting root sessions remain visible attention rows without callbacks.
 
-Number projected and waiting rows once, then derive both text and buttons from that same bounded array. Button text is `${number}. ${actionLabel(kind)}` and is capped at 60 Unicode code points. Keep `telegramStatusActionCallbackData` as the only encoder; omit a button if it cannot fit. Do not synthesize fallback `details` actions.
+Number projected and waiting rows once, then derive both text and buttons from that same bounded array. Derive its limit as `STATUS_BOARD_BUTTON_LIMIT - launcherButtons.length` and use that exact value for visible rows, hidden count, and callbacks. Button text is `${number}. ${actionLabel(kind)}` and is capped at 60 Unicode code points. Keep `telegramStatusActionCallbackData` as the only encoder; omit a button if it cannot fit. Do not synthesize fallback `details` actions.
 
-- [ ] **Step 3: Keep callback safety unchanged**
+- [x] **Step 3: Keep callback safety unchanged**
 
-Before encoding, require exact `jobId` and `expectedVersion` equality with the projection. Preserve the existing action DTO so part-specific delivery retries and Guardian alert bindings remain exact. Do not modify `src/bot.ts` parsing or execution.
+Before encoding, require exact `jobId` and `expectedVersion` equality with the projection. Preserve the existing action DTO so part-specific delivery retries and Guardian alert bindings remain exact. In the common encoder, accept only job IDs matching the existing parser contract `/^[A-Za-z0-9_-]{1,40}$/` and, when present, only part keys matching `/^[A-Za-z0-9_.:-]{1,24}$/`; return `null` for incompatible values so no dead callback is emitted. Do not modify `src/bot.ts` parsing or execution.
 
-- [ ] **Step 4: Verify 07.3b locally**
+- [x] **Step 4: Verify 07.3b locally**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run \
@@ -182,6 +189,8 @@ TMPDIR=/var/tmp npx vitest run \
   test/status-board-summary.test.ts \
   test/status-board-lifecycle.test.ts \
   test/bot-message-reliability.test.ts \
+  test/telegram-grammy-transport.test.ts \
+  test/telegram-status-callback.test.ts \
   test/telegram-status-projection.test.ts
 TMPDIR=/var/tmp npm test -- --maxWorkers=1 --minWorkers=1
 npm run check:web
@@ -191,10 +200,13 @@ git diff --check
 
 Review visible-row/button correspondence, first-action determinism, callback bounds, exact DTO preservation, launcher ordering, and unchanged lifecycle behavior. Correct findings and repeat affected tests.
 
-- [ ] **Step 5: Commit 07.3b**
+- [x] **Step 5: Commit 07.3b**
 
 ```bash
-git add src/status-board-render.ts test/status-board-render.test.ts \
+git add src/status-board-render.ts src/telegram-grammy-transport.ts \
+  test/status-board-render.test.ts test/status-board-summary.test.ts \
+  test/telegram-grammy-transport.test.ts \
+  test/telegram-status-callback.test.ts \
   docs/superpowers/plans/2026-09-12-telecodex-dashboard-topic-cleanup.md
 git diff --cached --check
 git commit -m "NO-TICKET fix: show required dashboard actions"

@@ -32,6 +32,8 @@ import type { TurnProgressTransportClassification } from "./turn-progress.js";
 const DOWNLOAD_TIMEOUT_MS = 30_000;
 const STATUS_TIMEOUT_MS = 30_000;
 const TELEGRAM_CALLBACK_LIMIT_BYTES = 64;
+const TELEGRAM_STATUS_CALLBACK_JOB_ID_PATTERN = /^[A-Za-z0-9_-]{1,40}$/;
+const TELEGRAM_STATUS_CALLBACK_PART_KEY_PATTERN = /^[A-Za-z0-9_.:-]{1,24}$/;
 const TELEGRAM_ERROR_DESCRIPTION_LIMIT = 512;
 
 export { TelegramDeliveryLocalError } from "./telegram-delivery-error.js";
@@ -343,6 +345,9 @@ function actionCallback(action: TelegramStatusAction): string | null {
 }
 
 export function telegramStatusActionCallbackData(action: TelegramStatusAction): string | null {
+  if (!TELEGRAM_STATUS_CALLBACK_JOB_ID_PATTERN.test(action.jobId)) return null;
+  if (action.partKey !== undefined
+    && !TELEGRAM_STATUS_CALLBACK_PART_KEY_PATTERN.test(action.partKey)) return null;
   const codes: Partial<Record<TelegramStatusAction["kind"], string>> = {
     abort: "a",
     retry_new_turn: "r",

@@ -1,15 +1,31 @@
 import { escapeHTML } from "./format.js";
-import type { StatusSnapshot, WaitingOn } from "./status-board-snapshot.js";
+import type {
+  RunningTask,
+  StatusSnapshot,
+  WaitingOn,
+} from "./status-board-snapshot.js";
+import type {
+  TelegramStatusAction,
+  TelegramStatusActionKind,
+} from "./telegram-status-projection.js";
+import { telegramStatusActionCallbackData } from "./telegram-grammy-transport.js";
 import { containsSecret, workspaceLabel } from "./topic-sync.js";
 
 const MAX_LABEL_LENGTH = 40;
 const TELEGRAM_MESSAGE_UTF16_LIMIT = 4096;
 const MAX_ACTIVE_ROWS = 5;
 const MAX_QUEUE_ROWS = 3;
-const MAX_ATTENTION_ROWS = 7;
 const MAX_ROW_COMPONENT_HTML_UNITS = 72;
 export const STATUS_BOARD_BUTTON_LIMIT = 8;
 const HIDDEN_LABEL = "(скрыто)";
+
+type ProjectedJobRow = NonNullable<StatusSnapshot["jobs"]>[number];
+
+interface AttentionRow {
+  readonly text: string;
+  readonly job?: ProjectedJobRow;
+  readonly action?: TelegramStatusAction;
+}
 
 export type BoardButton =
   | { text: string; url: string; callbackData?: never }
@@ -38,6 +54,10 @@ export function renderStatusBoard(
   _chatId: number,
   miniAppLaunchUrl?: string,
 ): RenderedBoard {
+  const launcherButtons: BoardButton[] = miniAppLaunchUrl
+    ? [{ text: "Открыть Dashboard", url: miniAppLaunchUrl }]
+    : [];
+  const attentionRowLimit = STATUS_BOARD_BUTTON_LIMIT - launcherButtons.length;
   const waiting = snapshot.running.reduce(
     (count, task) => count + Number(Boolean(task.waitingOn))
       + task.children.filter((child) => child.waitingOn).length,
@@ -51,15 +71,15 @@ export function renderStatusBoard(
   ].join(" · ");
 
   const sections: string[] = [];
-  const waitingRoots = snapshot.running.filter((task) => task.waitingOn);
+  const attentionRows = projectAttentionRows(snapshot);
+  const visibleAttentionRows = attentionRows.slice(0, attentionRowLimit);
 
-  if (waitingRoots.length > 0) {
+  if (attentionRows.length > 0) {
     sections.push(section(
       "Требуют внимания",
-      waitingRoots,
-      MAX_ATTENTION_ROWS,
-      (task, index) => `${index + 1}. ${rowText(task)} · ${waitingText(task.waitingOn)}`
-        + ` · ${elapsed(snapshot.now - task.since)}`,
+      attentionRows,
+      attentionRowLimit,
+      (row, index) => `${index + 1}. ${row.text}`,
     ));
   }
 
@@ -100,10 +120,93 @@ export function renderStatusBoard(
 
   return {
     body,
-    buttons: miniAppLaunchUrl
-      ? [{ text: "Открыть Dashboard", url: miniAppLaunchUrl }]
-      : [],
+    buttons: [
+      ...launcherButtons,
+      ...attentionButtons(
+        visibleAttentionRows,
+        attentionRowLimit,
+      ),
+    ],
   };
+}
+
+function projectAttentionRows(snapshot: StatusSnapshot): AttentionRow[] {
+  const rows: AttentionRow[] = [];
+  const seenIdentities = new Set<string>();
+  for (const job of snapshot.jobs ?? []) {
+    if (job.projection.attention.kind !== "required") continue;
+    const identities = projectedIdentities(job);
+    identities.forEach((identity) => seenIdentities.add(identity));
+    rows.push({
+      text: `${rowText(job)} · требует действия`
+        + ` · ${elapsed(snapshot.now - job.projection.timestamps.updatedAt)}`,
+      job,
+      action: job.projection.actions.find((action) => !isInformationalAction(action.kind)),
+    });
+  }
+  for (const task of snapshot.running) {
+    if (!task.waitingOn) continue;
+    const identities = runningIdentities(task);
+    if (identities.some((identity) => seenIdentities.has(identity))) continue;
+    identities.forEach((identity) => seenIdentities.add(identity));
+    rows.push({
+      text: `${rowText(task)} · ${waitingText(task.waitingOn)}`
+        + ` · ${elapsed(snapshot.now - task.since)}`,
+    });
+  }
+  return rows;
+}
+
+function projectedIdentities(job: ProjectedJobRow): string[] {
+  return [
+    job.projection.threadId ? `thread:${job.projection.threadId}` : undefined,
+    job.messageThreadId === undefined ? undefined : `topic:${job.messageThreadId}`,
+  ].filter((identity): identity is string => identity !== undefined);
+}
+
+function runningIdentities(task: RunningTask): string[] {
+  return [
+    task.threadId ? `thread:${task.threadId}` : undefined,
+    task.messageThreadId === undefined ? undefined : `topic:${task.messageThreadId}`,
+  ].filter((identity): identity is string => identity !== undefined);
+}
+
+function attentionButtons(rows: readonly AttentionRow[], maximum: number): BoardButton[] {
+  return rows.flatMap((row, index) => {
+    if (!row.job || !row.action) return [];
+    const projection = row.job.projection;
+    if (row.action.jobId !== projection.jobId
+      || row.action.expectedVersion !== projection.expectedVersion) {
+      throw new Error("Status action does not match its projection");
+    }
+    const callbackData = telegramStatusActionCallbackData(row.action);
+    if (callbackData === null) return [];
+    return [{
+      text: buttonLabel(`${index + 1}. ${actionLabel(row.action.kind)}`),
+      callbackData,
+    }];
+  }).slice(0, maximum);
+}
+
+function isInformationalAction(kind: TelegramStatusActionKind): boolean {
+  return kind === "details" || kind === "inspect";
+}
+
+function actionLabel(kind: TelegramStatusActionKind): string {
+  const labels: Record<TelegramStatusActionKind, string> = {
+    abort: "Abort", refresh: "Refresh", details: "Details", inspect: "Inspect",
+    retry_new_turn: "Retry as new turn", guardian_restore: "Guardian Restore",
+    retry_delivery: "Retry delivery", recover_missing_topic: "Recover topic",
+    resume_existing_topic: "Resume topic",
+    resume_existing_topic_warning: "Resume topic (may resend status)",
+    send_again_warning: "Send again with warning",
+  };
+  return labels[kind];
+}
+
+function buttonLabel(raw: string): string {
+  const characters = [...raw];
+  return characters.length <= 60 ? raw : `${characters.slice(0, 59).join("")}…`;
 }
 
 function section<T>(

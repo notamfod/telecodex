@@ -27,6 +27,29 @@ function projection(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function projectedJob(
+  jobId: string,
+  overrides: Record<string, unknown> = {},
+  viewOverrides: Record<string, unknown> = {},
+) {
+  return {
+    projection: projection({
+      jobId,
+      shortJobId: jobId.slice(0, 8),
+      attention: { kind: "required", code: "OPERATOR_REQUIRED", actions: ["retry"] },
+      actions: [
+        { kind: "details", jobId, expectedVersion: 7 },
+        { kind: "inspect", jobId, expectedVersion: 7 },
+        { kind: "retry_new_turn", jobId, expectedVersion: 7 },
+      ],
+      ...overrides,
+    }),
+    label: `Attention ${jobId}`,
+    workspace: "/srv/telecodex",
+    ...viewOverrides,
+  };
+}
+
 function snapshot(jobs: unknown[]): StatusSnapshot {
   return {
     limit: 8, telegramActive: 0, running: [], queued: [], recent: [], recentThreads: [],
@@ -72,14 +95,17 @@ describe("unified status board rendering", () => {
     expect(renderStatusBoard(result, CHAT_ID).body).not.toContain("terminal_incomplete");
   });
 
-  it("renders no topic buttons without a Mini App URL", () => {
+  it("renders a required callback without a Mini App URL", () => {
     const value = projection({ attention: {
       kind: "required", code: "OPERATOR_REQUIRED", actions: ["abort"],
     } });
 
     expect(renderStatusBoard(snapshot([{
       projection: value, label: "Attention", workspace: "/srv/telecodex",
-    }]), CHAT_ID).buttons).toEqual([]);
+    }]), CHAT_ID).buttons).toEqual([{
+      text: "1. Abort",
+      callbackData: "tcj:a:job-123456789:7",
+    }]);
   });
 
   it("counts only projected running or delivering work against Telegram slots", () => {
@@ -203,5 +229,209 @@ describe("unified status board rendering", () => {
     expect(rendered.body).not.toContain("reason_0_0");
     expect(rendered.buttons).toEqual([]);
     expect(renderStatusBoard(snapshot(jobs), CHAT_ID)).toEqual(rendered);
+  });
+
+  it("keeps the launcher as the only button for healthy queued and running jobs", () => {
+    const jobs = [
+      projectedJob("queued-healthy", {
+        attention: { kind: "none" },
+        actions: [
+          { kind: "abort", jobId: "queued-healthy", expectedVersion: 7 },
+          { kind: "refresh", jobId: "queued-healthy", expectedVersion: 7 },
+        ],
+      }),
+      projectedJob("running-healthy", {
+        phase: "running",
+        state: "running",
+        queue: null,
+        attention: { kind: "none" },
+        actions: [
+          { kind: "abort", jobId: "running-healthy", expectedVersion: 7 },
+          { kind: "refresh", jobId: "running-healthy", expectedVersion: 7 },
+        ],
+      }),
+    ];
+
+    expect(renderStatusBoard(snapshot(jobs), CHAT_ID, "https://example.test/dashboard").buttons)
+      .toEqual([{ text: "Открыть Dashboard", url: "https://example.test/dashboard" }]);
+  });
+
+  it("numbers one first non-informational action from the same visible attention row", () => {
+    const action = {
+      kind: "retry_delivery", jobId: "delivery-failed", expectedVersion: 7,
+      partKey: "final:0000",
+    };
+    const value = projectedJob("delivery-failed", {
+      actions: [
+        { kind: "details", jobId: "delivery-failed", expectedVersion: 7 },
+        { kind: "inspect", jobId: "delivery-failed", expectedVersion: 7 },
+        action,
+        { kind: "refresh", jobId: "delivery-failed", expectedVersion: 7 },
+      ],
+    });
+
+    const rendered = renderStatusBoard(snapshot([value]), CHAT_ID, "https://example.test/dashboard");
+
+    expect(rendered.body).toContain("<b>Требуют внимания</b>\n1. telecodex · Attention delivery-failed");
+    expect(rendered.buttons).toEqual([
+      { text: "Открыть Dashboard", url: "https://example.test/dashboard" },
+      { text: "1. Retry delivery", callbackData: "tcj:y:delivery-failed:7:final:0000" },
+    ]);
+    expect(value.projection.actions[2]).toBe(action);
+  });
+
+  it("numbers projected and waiting attention once and suppresses duplicate thread rows", () => {
+    const required = projectedJob("needs-action", {}, {
+      messageThreadId: 42,
+    });
+    const waiting = {
+      threadId: "host-thread", label: "Waiting reply", workspace: "/srv/telecodex",
+      source: "telegram", since: NOW - 60_000, waitingOn: "input" as const,
+      messageThreadId: 42, children: [],
+    };
+    const distinctWaiting = { ...waiting, threadId: "other-thread", messageThreadId: 43 };
+
+    const rendered = renderStatusBoard({
+      ...snapshot([required]),
+      running: [waiting, distinctWaiting],
+    }, CHAT_ID, "https://example.test/dashboard");
+
+    expect(rendered.body).toContain("1. telecodex · Attention needs-action");
+    expect(rendered.body).toContain("2. telecodex · Waiting reply · ждёт ответа");
+    expect(rendered.body.match(/Waiting reply · ждёт ответа/g)).toHaveLength(1);
+    expect(rendered.buttons[1]).toEqual({
+      text: "1. Retry as new turn",
+      callbackData: "tcj:r:needs-action:7",
+    });
+  });
+
+  it("keeps distinct required jobs that share one thread and topic", () => {
+    const first = projectedJob("shared-first", { threadId: "shared-thread" }, {
+      messageThreadId: 42,
+    });
+    const second = projectedJob("shared-second", { threadId: "shared-thread" }, {
+      messageThreadId: 42,
+    });
+
+    const rendered = renderStatusBoard(
+      snapshot([first, second]), CHAT_ID, "https://example.test/dashboard",
+    );
+
+    expect(rendered.body).toContain("1. telecodex · Attention shared-first");
+    expect(rendered.body).toContain("2. telecodex · Attention shared-second");
+    expect(rendered.buttons.slice(1)).toEqual([
+      { text: "1. Retry as new turn", callbackData: "tcj:r:shared-first:7" },
+      { text: "2. Retry as new turn", callbackData: "tcj:r:shared-second:7" },
+    ]);
+  });
+
+  it.each([
+    ["job id", { kind: "abort", jobId: "wrong-job", expectedVersion: 7 }],
+    ["version", { kind: "abort", jobId: "exact-job", expectedVersion: 8 }],
+  ])("rejects a selected action with a mismatched %s", (_field, action) => {
+    const job = projectedJob("exact-job", { actions: [action] });
+
+    expect(() => renderStatusBoard(
+      snapshot([job]), CHAT_ID, "https://example.test/dashboard",
+    ))
+      .toThrow("Status action does not match its projection");
+  });
+
+  it("omits an oversized callback while keeping its attention row visible", () => {
+    const jobId = "x".repeat(40);
+    const job = projectedJob(jobId, {
+      expectedVersion: 9_999_999_999_999_999,
+      actions: [{
+        kind: "retry_delivery", jobId, expectedVersion: 9_999_999_999_999_999,
+        partKey: "y".repeat(24),
+      }],
+    });
+
+    const rendered = renderStatusBoard(snapshot([job]), CHAT_ID, "https://example.test/dashboard");
+
+    expect(rendered.body).toContain(`Attention ${jobId.slice(0, 20)}`);
+    expect(rendered.buttons).toEqual([
+      { text: "Открыть Dashboard", url: "https://example.test/dashboard" },
+    ]);
+  });
+
+  it("keeps a parser-incompatible job visible without emitting a dead callback", () => {
+    const job = projectedJob("legacy.job", {
+      actions: [{ kind: "abort", jobId: "legacy.job", expectedVersion: 7 }],
+    });
+
+    const rendered = renderStatusBoard(snapshot([job]), CHAT_ID, "https://example.test/dashboard");
+
+    expect(rendered.body).toContain("Attention legacy.job");
+    expect(rendered.buttons).toEqual([
+      { text: "Открыть Dashboard", url: "https://example.test/dashboard" },
+    ]);
+  });
+
+  it("keeps a parser-incompatible part key visible without emitting a dead callback", () => {
+    const job = projectedJob("valid-job", {
+      actions: [{
+        kind: "retry_delivery", jobId: "valid-job", expectedVersion: 7,
+        partKey: "invalid part",
+      }],
+    });
+
+    const rendered = renderStatusBoard(snapshot([job]), CHAT_ID, "https://example.test/dashboard");
+
+    expect(rendered.body).toContain("Attention valid-job");
+    expect(rendered.buttons).toEqual([
+      { text: "Открыть Dashboard", url: "https://example.test/dashboard" },
+    ]);
+  });
+
+  it("uses all eight attention rows and buttons when no launcher is configured", () => {
+    const jobs = Array.from({ length: 10 }, (_, index) => projectedJob(`no-launcher-${index}`));
+
+    const rendered = renderStatusBoard(snapshot(jobs), CHAT_ID);
+
+    expect(rendered.body).toContain("8. telecodex · Attention no-launcher-7");
+    expect(rendered.body).not.toContain("Attention no-launcher-8");
+    expect(rendered.body).toContain("… ещё 2");
+    expect(rendered.buttons).toHaveLength(8);
+    expect(rendered.buttons.map((button) => button.text)).toEqual([
+      "1. Retry as new turn", "2. Retry as new turn", "3. Retry as new turn",
+      "4. Retry as new turn", "5. Retry as new turn", "6. Retry as new turn",
+      "7. Retry as new turn", "8. Retry as new turn",
+    ]);
+  });
+
+  it("keeps eight hostile HTML attention rows within the Telegram body limit", () => {
+    const hostile = "&".repeat(40);
+    const jobs = Array.from({ length: 8 }, (_, index) => projectedJob(`hostile-${index}`, {}, {
+      label: hostile,
+      workspace: `/srv/${hostile}`,
+    }));
+
+    const rendered = renderStatusBoard(snapshot(jobs), CHAT_ID);
+
+    expect(rendered.body).toContain("8. ");
+    expect(rendered.body.length).toBeLessThanOrEqual(4096);
+    expect(rendered.body).toContain("&amp;");
+    expect(rendered.body.replaceAll("&amp;", "")).not.toContain("&");
+    expect(rendered.buttons).toHaveLength(8);
+  });
+
+  it("bounds many required rows and their matching buttons deterministically", () => {
+    const jobs = Array.from({ length: 12 }, (_, index) => projectedJob(`required-${index}`));
+
+    const rendered = renderStatusBoard(snapshot(jobs), CHAT_ID, "https://example.test/dashboard");
+
+    expect(rendered.body).toContain("7. telecodex · Attention required-6");
+    expect(rendered.body).not.toContain("Attention required-7");
+    expect(rendered.body).toContain("… ещё 5");
+    expect(rendered.body.length).toBeLessThanOrEqual(4096);
+    expect(rendered.buttons).toHaveLength(8);
+    expect(rendered.buttons.slice(1).map((button) => button.text)).toEqual([
+      "1. Retry as new turn", "2. Retry as new turn", "3. Retry as new turn",
+      "4. Retry as new turn", "5. Retry as new turn", "6. Retry as new turn",
+      "7. Retry as new turn",
+    ]);
+    expect(renderStatusBoard(snapshot(jobs), CHAT_ID, "https://example.test/dashboard"))
+      .toEqual(rendered);
   });
 });

@@ -207,7 +207,7 @@ git commit -m "NO-TICKET fix: preserve telegram fenced code"
 
 Review trimming, regex bounds, generated closures, rich hashes, and payload scope before committing.
 
-- [ ] **Step 9: Deploy 07.2c**
+- [x] **Step 9: Deploy 07.2c**
 
 Build the exact commit, require idle safe preflight, make and verify a mode-`0600` online SQLite backup, and restart once. Verify stable PID, `NRestarts=0`, health/readiness, Guardian, SQLite, `getMe`, contained history, and fresh sanitized logs. Use only a user-initiated answer with inline code plus fenced commands or logs for visual and aggregate-ledger acceptance.
 
@@ -342,7 +342,7 @@ git commit -m "NO-TICKET fix: guide telegram code formatting"
 
 Review prompt-title order, duplicate guidance, identifier leakage, recovery divergence, and scope before committing.
 
-- [ ] **Step 7: Deploy 07.2d and close 07.2**
+- [x] **Step 7: Deploy 07.2d and close 07.2**
 
 Repeat exact-build, idle-preflight, verified backup, one restart, runtime, SQLite, `getMe`, and fresh-log checks. Use an organic request that naturally calls for commands, config, SQL, or logs. Require a closed fence with the expected language or `text`, copy-paste indentation, no fallback, no uncertainty, and no duplicate part keys.
 

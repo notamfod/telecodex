@@ -135,7 +135,7 @@ git diff --cached --check
 git commit -m "NO-TICKET fix: compact telegram dashboard topic"
 ```
 
-- [ ] **Step 5: Deploy 07.3a**
+- [x] **Step 5: Deploy 07.3a**
 
 Build the exact commit and run `npm run release:preflight`. Require `safeToRestart=true`, `queued=0`, `running=0`, `sending=0`, and `uncertain=0`. Capture the persisted Dashboard chat, topic, and message identity without printing it. Create and verify a mode-`0600` online SQLite backup under `.telecodex/release-state/dashboard-topic-cleanup/`.
 

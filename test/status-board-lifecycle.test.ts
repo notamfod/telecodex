@@ -1,10 +1,6 @@
 import { vi } from "vitest";
 
-import {
-  StatusBoard,
-  type RenderedMessage,
-  type StatusSnapshot,
-} from "../src/status-board.js";
+import { StatusBoard, type RenderedMessage, type StatusSnapshot } from "../src/status-board.js";
 
 const CHAT_ID = -1001234567890;
 const NOW = Date.UTC(2026, 7, 13, 6, 41, 0);
@@ -251,18 +247,14 @@ describe("StatusBoard lifecycle", () => {
     }));
   });
 
-  it("edits the board when only a create button becomes a topic link", async () => {
+  it("does not edit when only hidden topic metadata changes", async () => {
     const telegram = new FakeTelegram();
     let snapshot = emptySnapshot({ running: [task()] });
     const board = createBoard(telegram, async () => snapshot);
-
     await board.refreshOnce();
     snapshot = emptySnapshot({ running: [task({ messageThreadId: 91 })] });
-
-    expect(await board.refreshOnce()).toBe("edited");
-    expect(telegram.edit).toHaveBeenCalledWith(42, 777, expect.objectContaining({
-      buttons: [expect.objectContaining({ url: expect.stringContaining("/91") })],
-    }));
+    expect(await board.refreshOnce()).toBe("unchanged");
+    expect(telegram.edit).not.toHaveBeenCalled();
   });
 
   it("pins a saved Dashboard board again after restart", async () => {

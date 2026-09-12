@@ -26,13 +26,14 @@ Files:
 - Modify `src/status-board-render.ts` for the compact topic projection.
 - Split the existing oversized `test/status-board.test.ts` before changing its render expectations.
 - Modify `test/status-board-render.test.ts` for canonical attention and callback coverage.
+- Modify `test/status-board-lifecycle.test.ts` only for the removed topic-link button behavior.
 - Modify this plan only to record checkpoint progress.
 
 ## Microrelease 07.3a: Compact body and launcher-only keyboard
 
 ### Task 1: Establish focused render tests
 
-- [ ] **Step 1: Split the oversized mixed test file without changing behavior**
+- [x] **Step 1: Split the oversized mixed test file without changing behavior**
 
 Move the `renderStatusBoard` and `renderMiniAppLauncher` describes, their local `emptySnapshot` and `task` helpers, and required imports from `test/status-board.test.ts` to `test/status-board-summary.test.ts`. Keep both files below 500 lines. Run both test files before changing expectations.
 
@@ -40,7 +41,7 @@ Move the `renderStatusBoard` and `renderMiniAppLauncher` describes, their local 
 TMPDIR=/var/tmp npx vitest run test/status-board.test.ts test/status-board-summary.test.ts
 ```
 
-- [ ] **Step 2: Add failing compact-summary expectations**
+- [x] **Step 2: Add failing compact-summary expectations**
 
 Change the focused render tests to require:
 
@@ -59,7 +60,7 @@ expect(body).not.toContain("delivery ");
 
 Add fixtures proving that active roots are capped at five, queued rows at three, hidden counts are exact, labels remain secret-safe, and the body stays within 4096 UTF-16 units.
 
-- [ ] **Step 3: Add the launcher-only RED fixture**
+- [x] **Step 3: Add the launcher-only RED fixture**
 
 Render many projected jobs with `details`, `abort`, and `refresh` actions and a Mini App URL. Require exactly:
 
@@ -80,7 +81,7 @@ Expected: old recent sections, projected diagnostics, topic links, and repeated 
 
 ### Task 2: Render the compact topic projection
 
-- [ ] **Step 1: Introduce bounded summary rows**
+- [x] **Step 1: Introduce bounded summary rows**
 
 In `src/status-board-render.ts`, use constants `MAX_ACTIVE_ROWS = 5`, `MAX_QUEUE_ROWS = 3`, and `MAX_ATTENTION_ROWS = 7`. Build the heading only from active roots, waiting roots or children, queued rows, and 24-hour failed jobs:
 
@@ -95,7 +96,7 @@ const heading = [
 
 Render in order: optional `Требуют внимания`, `Сейчас`, optional `Очередь`, and `Система`. Number visible rows, append exact `… ещё N` summaries, and omit source labels and child detail. Show waiting roots in `Требуют внимания`; show all bounded active roots in `Сейчас` without duplicating source or workspace text.
 
-- [ ] **Step 2: Remove duplicated topic detail**
+- [x] **Step 2: Remove duplicated topic detail**
 
 Delete topic rendering for `recent`, `recentThreads`, projected health/delivery/reason diagnostics, topic open/create buttons, and per-job action allocation. Keep the Mini App launcher as the sole button when configured. Keep `renderMiniAppLauncher` unchanged.
 
@@ -107,7 +108,7 @@ snapshot.failedJobs24h > 0
   : "🟢 Доставка без ошибок за 24ч"
 ```
 
-- [ ] **Step 3: Verify 07.3a locally**
+- [x] **Step 3: Verify 07.3a locally**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run \
@@ -123,11 +124,12 @@ git diff --check
 
 Review for unbounded rows, hidden diagnostic leakage, changed callback handling, changed Mini App output, and files outside the plan. Correct findings and repeat affected tests.
 
-- [ ] **Step 4: Commit 07.3a**
+- [x] **Step 4: Commit 07.3a**
 
 ```bash
 git add src/status-board-render.ts test/status-board.test.ts \
   test/status-board-summary.test.ts test/status-board-render.test.ts \
+  test/status-board-lifecycle.test.ts \
   docs/superpowers/plans/2026-09-12-telecodex-dashboard-topic-cleanup.md
 git diff --cached --check
 git commit -m "NO-TICKET fix: compact telegram dashboard topic"

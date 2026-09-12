@@ -42,25 +42,20 @@ function buildProjected(values: unknown[], state = "active") {
 }
 
 describe("unified status board rendering", () => {
-  it("renders one projection with age, health, delivery and versioned actions", () => {
+  it("keeps canonical projection detail in the Mini App and out of the topic", () => {
     const value = projection();
     const { body, buttons } = renderStatusBoard(snapshot([{
       projection: value, label: "Не потерять ответ", workspace: "/srv/telecodex",
       messageThreadId: 42,
-    }]), CHAT_ID);
+    }]), CHAT_ID, "https://example.test/dashboard");
 
-    expect(body).toContain("Не потерять ответ");
-    expect(body).toMatch(/очеред.*2/i);
-    expect(body).toContain("45с");
-    expect(body).toContain("healthy");
-    expect(body).toContain("0/1");
-    expect(buttons).toEqual([
-      { text: "Abort", callbackData: "tcj:a:job-123456789:7" },
-      { text: "Refresh", callbackData: "tcj:f:job-123456789:7" },
-      { text: "Details", callbackData: "tcj:d:job-123456789:7" },
-    ]);
-    expect(buttons.every((button) => !button.callbackData
-      || Buffer.byteLength(button.callbackData) <= 64)).toBe(true);
+    expect(body).not.toContain("Не потерять ответ");
+    expect(body).not.toContain("healthy");
+    expect(body).not.toContain("0/1");
+    expect(buttons).toEqual([{
+      text: "Открыть Dashboard",
+      url: "https://example.test/dashboard",
+    }]);
   });
 
   it("keeps terminal work visible until its anchor is delivered and preserves the DTO", () => {
@@ -74,102 +69,17 @@ describe("unified status board rendering", () => {
     expect((result as never as { jobs: Array<{ projection: unknown }> }).jobs[0]!.projection)
       .toBe(value);
     expect(result.recent).toEqual([]);
-    expect(renderStatusBoard(result, CHAT_ID).body).toContain("terminal_incomplete");
+    expect(renderStatusBoard(result, CHAT_ID).body).not.toContain("terminal_incomplete");
   });
 
-  it("shows Guardian and delivery problems with their bounded reason codes", () => {
-    const value = projection({
-      phase: "delivering", state: "delivery_uncertain", health: "unavailable",
-      guardian: { availability: "unavailable", health: "unavailable",
-        reasonCode: "GUARDIAN_UNAVAILABLE", threadStatus: null, lastObservedAt: null,
-        ageMs: null, unchangedSince: null, staleForMs: null, alertId: null,
-        repairState: null, repairOutcome: null },
-      delivery: { total: 2, delivered: 1, pending: 0, sending: 0, uncertain: 1, failed: 0,
-        anchorState: "delivered", anchorMessageId: 51, complete: false },
-      reasonCodes: ["GUARDIAN_UNAVAILABLE", "telegram_send_uncertain"],
-      actions: [{ kind: "send_again_warning", jobId: "job-123456789", expectedVersion: 9 }],
-      expectedVersion: 9,
-    });
-    const rendered = renderStatusBoard(snapshot([{
-      projection: value, label: "Ответ", workspace: "/srv/telecodex",
-    }]), CHAT_ID);
-
-    expect(rendered.body).toContain("GUARDIAN_UNAVAILABLE");
-    expect(rendered.body).toContain("telegram_send_uncertain");
-    expect(rendered.body).toContain("1/2");
-    expect(rendered.buttons).toEqual([
-      { text: "Send again with warning", callbackData: "tcj:s:job-123456789:9" },
-      { text: "Details", callbackData: "tcj:d:job-123456789:9" },
-    ]);
-  });
-
-  it("omits an action that cannot fit Telegram callback data without hiding the job", () => {
-    const longId = `sameprefix-${"x".repeat(80)}`;
-    const value = projection({ jobId: longId, shortJobId: "samepref",
-      actions: [{ kind: "details", jobId: longId, expectedVersion: 7 }] });
-
-    const rendered = renderStatusBoard(snapshot([{
-      projection: value, label: "Long", workspace: "/srv/telecodex",
-      actionResolverTokens: { details: "tok_A1" },
-    }]), CHAT_ID);
-
-    expect(rendered.body).toContain("Long");
-    expect(rendered.buttons).toEqual([]);
-  });
-
-  it("binds Guardian restore buttons to the exact canonical job envelope", () => {
-    const first = projection({ state: "stalled", actions: [{
-      kind: "guardian_restore", jobId: "job-123456789", expectedVersion: 7,
-      alertId: "alert-old",
-    }] });
-    const second = projection({ state: "stalled", actions: [{
-      kind: "guardian_restore", jobId: "job-123456789", expectedVersion: 7,
-      alertId: "alert-new",
-    }] });
+  it("renders no topic buttons without a Mini App URL", () => {
+    const value = projection({ attention: {
+      kind: "required", code: "OPERATOR_REQUIRED", actions: ["abort"],
+    } });
 
     expect(renderStatusBoard(snapshot([{
-      projection: first, label: "First", workspace: "/srv/telecodex",
-    }]), CHAT_ID).buttons[0]).toEqual({
-      text: "Guardian Restore", callbackData: "tcj:g:job-123456789:7",
-    });
-    expect(renderStatusBoard(snapshot([{
-      projection: second, label: "Second", workspace: "/srv/telecodex",
-    }]), CHAT_ID).buttons[0]).toEqual({
-      text: "Guardian Restore", callbackData: "tcj:g:job-123456789:7",
-    });
-  });
-
-  it("renders the bounded missing-topic recovery action", () => {
-    const value = projection({ actions: [{
-      kind: "recover_missing_topic",
-      jobId: "job-123456789",
-      expectedVersion: 541,
-    }], expectedVersion: 541 });
-
-    expect(renderStatusBoard(snapshot([{
-      projection: value, label: "Missing topic", workspace: "/srv/telecodex",
-    }]), CHAT_ID).buttons[0]).toEqual({
-      text: "Recover topic",
-      callbackData: "tcj:o:job-123456789:541",
-    });
-  });
-
-  it.each([
-    ["resume_existing_topic", "u", "Resume topic"],
-    ["resume_existing_topic_warning", "w", "Resume topic (may resend status)"],
-  ] as const)("renders the bounded %s action", (kind, code, label) => {
-    const value = projection({ actions: [{
-      kind,
-      jobId: "job-123456789",
-      expectedVersion: 541,
-    }], expectedVersion: 541 });
-
-    expect(renderStatusBoard(snapshot([{
-      projection: value, label: "Existing topic", workspace: "/srv/telecodex",
-    }]), CHAT_ID).buttons[0]).toEqual({
-      text: label,
-      callbackData: `tcj:${code}:job-123456789:541`,
-    });
+      projection: value, label: "Attention", workspace: "/srv/telecodex",
+    }]), CHAT_ID).buttons).toEqual([]);
   });
 
   it("counts only projected running or delivering work against Telegram slots", () => {
@@ -268,7 +178,7 @@ describe("unified status board rendering", () => {
     expect(result.recent).toEqual([]);
   });
 
-  it("bounds the complete board by Telegram UTF-16 units with an exact omitted-job summary", () => {
+  it("renders projected jobs deterministically without topic diagnostics or callbacks", () => {
     const jobs = Array.from({ length: 8 }, (_, index) => {
       const jobId = `job-${index}`;
       return {
@@ -287,47 +197,11 @@ describe("unified status board rendering", () => {
     });
 
     const rendered = renderStatusBoard(snapshot(jobs), CHAT_ID);
-    const omitted = jobs.length - rendered.buttons.length;
 
     expect(rendered.body.length).toBeLessThanOrEqual(4096);
-    expect(omitted).toBeGreaterThan(0);
-    expect(rendered.body).toContain(`… ещё задач: ${omitted}`);
+    expect(rendered.body).not.toContain("Job 0");
+    expect(rendered.body).not.toContain("reason_0_0");
+    expect(rendered.buttons).toEqual([]);
     expect(renderStatusBoard(snapshot(jobs), CHAT_ID)).toEqual(rendered);
-    for (const button of rendered.buttons) {
-      expect(button.text).toBe("Details");
-      const index = button.callbackData?.match(/^tcj:d:job-(\d+):7$/)?.[1];
-      expect(index).toBeDefined();
-      expect(rendered.body).toContain(`Job ${index}`);
-    }
-  });
-
-  it("reserves Details for every displayed job before optional action buttons", () => {
-    const jobs = Array.from({ length: 4 }, (_, index) => {
-      const jobId = `job-${index}`;
-      return {
-        projection: projection({
-          jobId,
-          shortJobId: jobId,
-          actions: [
-            { kind: "abort", jobId, expectedVersion: 7 },
-            { kind: "refresh", jobId, expectedVersion: 7 },
-            { kind: "details", jobId, expectedVersion: 7 },
-          ],
-        }),
-        label: `Job ${index}`,
-        workspace: "/srv/telecodex",
-      };
-    });
-
-    const rendered = renderStatusBoard(snapshot(jobs), CHAT_ID);
-
-    expect(rendered.buttons).toHaveLength(8);
-    for (let index = 0; index < jobs.length; index += 1) {
-      expect(rendered.body).toContain(`Job ${index}`);
-      expect(rendered.buttons).toContainEqual({
-        text: "Details",
-        callbackData: `tcj:d:job-${index}:7`,
-      });
-    }
   });
 });

@@ -212,7 +212,7 @@ git diff --cached --check
 git commit -m "NO-TICKET fix: show required dashboard actions"
 ```
 
-- [ ] **Step 6: Deploy 07.3b and close 07.3**
+- [x] **Step 6: Deploy 07.3b and close 07.3**
 
 Repeat the exact-build, idle-preflight, verified-backup, single-restart, service, SQLite, Guardian, `getMe`, and fresh-log gates from 07.3a. Verify the persisted Dashboard identity remains unchanged again. Inspect the canonical live snapshot without message content: if required attention exists, prove every emitted callback decodes to the same job ID, version, and optional part key or alert ID; otherwise prove the launcher is the only button. Verify the Mini App endpoint and confirm no topic lifecycle event was produced.
 

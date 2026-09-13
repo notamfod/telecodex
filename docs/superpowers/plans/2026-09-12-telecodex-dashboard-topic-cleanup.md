@@ -278,7 +278,7 @@ git diff --check
 
 Commit as `NO-TICKET fix: keep telegram dashboard launcher-only`.
 
-- [ ] **Step 4: Deploy and close 07.3c**
+- [x] **Step 4: Deploy and close 07.3c**
 
 Build the exact commit, require a safe release preflight, create and verify a
 mode-`0600` online SQLite backup, then restart `telecodex.service` exactly once.

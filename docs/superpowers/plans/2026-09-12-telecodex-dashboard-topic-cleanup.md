@@ -217,3 +217,73 @@ git commit -m "NO-TICKET fix: show required dashboard actions"
 Repeat the exact-build, idle-preflight, verified-backup, single-restart, service, SQLite, Guardian, `getMe`, and fresh-log gates from 07.3a. Verify the persisted Dashboard identity remains unchanged again. Inspect the canonical live snapshot without message content: if required attention exists, prove every emitted callback decodes to the same job ID, version, and optional part key or alert ID; otherwise prove the launcher is the only button. Verify the Mini App endpoint and confirm no topic lifecycle event was produced.
 
 07.3 is complete only when both commits are green and live, the existing pinned message identity survived both releases, the launcher remains reachable, action mapping is exact, and the full Telegram output-quality cycle is recorded complete.
+
+## Microrelease 07.3c: Launcher-only topic correction
+
+Live acceptance showed that repeated required-action labels are hard to understand
+outside the Mini App cards that provide their session context. Keep canonical
+actions and callback infrastructure unchanged, but remove all callbacks from the
+pinned topic. The topic remains a bounded summary and points to the Mini App for
+inspection and action execution.
+
+**Files:**
+
+- Modify: `test/status-board-render.test.ts`
+- Modify: `src/status-board-render.ts`
+- Verify: `test/status-board-summary.test.ts`
+- Verify: `test/status-board-lifecycle.test.ts`
+- Verify: `test/dashboard-controller.test.ts`
+- Verify: `test/mini-app-ui.test.ts`
+
+- [ ] **Step 1: Add the failing launcher-only regression**
+
+Change the required-attention renderer fixture to preserve its numbered body row
+while requiring exactly one launcher button. Add a no-Mini-App fixture that
+requires no buttons even when canonical actions exist.
+
+```ts
+expect(rendered.buttons).toEqual([{
+  text: "Открыть Dashboard",
+  url: "https://example.test/dashboard",
+}]);
+expect(renderStatusBoard(snapshot([value]), CHAT_ID).buttons).toEqual([]);
+```
+
+Run `TMPDIR=/var/tmp npx vitest run test/status-board-render.test.ts` and require
+failure because 07.3b still emits the callback.
+
+- [ ] **Step 2: Make the topic renderer launcher-only**
+
+Use a fixed `MAX_ATTENTION_ROWS = 7` for the body. Return `launcherButtons`
+directly and remove topic-only action selection, validation, label and callback
+helpers from `src/status-board-render.ts`. Do not change
+`telegramStatusActionCallbackData`, canonical projections, Mini App APIs or action
+execution.
+
+- [ ] **Step 3: Verify locally and commit**
+
+```bash
+TMPDIR=/var/tmp npx vitest run \
+  test/status-board-render.test.ts \
+  test/status-board-summary.test.ts \
+  test/status-board-lifecycle.test.ts \
+  test/dashboard-controller.test.ts \
+  test/mini-app-ui.test.ts \
+  test/telegram-status-callback.test.ts
+TMPDIR=/var/tmp npm test -- --maxWorkers=1 --minWorkers=1
+npm run check:web
+npm run build
+git diff --check
+```
+
+Commit as `NO-TICKET fix: keep telegram dashboard launcher-only`.
+
+- [ ] **Step 4: Deploy and close 07.3c**
+
+Build the exact commit, require a safe release preflight, create and verify a
+mode-`0600` online SQLite backup, then restart `telecodex.service` exactly once.
+Require stable PID, `NRestarts=0`, health/readiness 200, Guardian ready,
+authenticated `getMe`, SQLite `quick_check=ok`, FK=0, `sending=0`, `uncertain=0`,
+and clean fresh logs. Verify the persisted Dashboard identity is unchanged, the
+Mini App URL responds, the live topic projection has one launcher and zero
+callbacks, and no topic lifecycle event occurs.

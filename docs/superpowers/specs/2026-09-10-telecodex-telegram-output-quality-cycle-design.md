@@ -300,6 +300,23 @@ Production gate:
 - confirm the Mini App opens and required actions still target the correct job;
 - confirm no topic close, reopen, or replacement event is produced.
 
+### Step 07.3c: Launcher-only topic correction
+
+Live use showed that required-action callbacks repeat the same action label without
+the session context that the Mini App already provides. The pinned Telegram topic
+therefore returns to a summary-only role: it keeps bounded attention rows and one
+`Открыть Dashboard` launcher, but renders no job callbacks. Canonical actions,
+callback encoding and execution remain available to the Mini App and other
+consumers; this correction changes only the topic renderer.
+
+Acceptance:
+
+- required attention remains visible in the message body;
+- with a Mini App URL, the launcher is the only topic button;
+- without a Mini App URL, the topic has no buttons;
+- the existing Dashboard topic and pinned message are edited in place;
+- Mini App data and action execution remain unchanged.
+
 ## Verification for every step
 
 Use test-driven changes. Run focused tests for the changed boundary first, then:
@@ -340,4 +357,4 @@ The existing custom formatter already covers the selected Telegram subset and it
 
 ## Cycle completion
 
-The cycle is complete only when all four steps are independently implemented, verified, released through their gates, and observed without duplicate delivery or credential leakage. Completion evidence must distinguish repository state from the exact revision running in TeleCodex.
+The cycle is complete only when all four steps and the 07.3c launcher-only correction are independently implemented, verified, released through their gates, and observed without duplicate delivery or credential leakage. Completion evidence must distinguish repository state from the exact revision running in TeleCodex.

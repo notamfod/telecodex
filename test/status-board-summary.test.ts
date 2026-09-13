@@ -141,9 +141,9 @@ describe("renderStatusBoard", () => {
 
     const { body } = renderStatusBoard(emptySnapshot({ running }), CHAT_ID);
 
-    expect(body).toContain("8. mir-back · waiting-7");
-    expect(body).not.toContain("9. mir-back · waiting-8");
-    expect(body).toContain("… ещё 1");
+    expect(body).toContain("7. mir-back · waiting-6");
+    expect(body).not.toContain("8. mir-back · waiting-7");
+    expect(body).toContain("… ещё 2");
   });
 
   it("keeps the bounded compact body within Telegram UTF-16 limits", () => {

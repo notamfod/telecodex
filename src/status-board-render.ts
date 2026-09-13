@@ -4,17 +4,13 @@ import type {
   StatusSnapshot,
   WaitingOn,
 } from "./status-board-snapshot.js";
-import type {
-  TelegramStatusAction,
-  TelegramStatusActionKind,
-} from "./telegram-status-projection.js";
-import { telegramStatusActionCallbackData } from "./telegram-grammy-transport.js";
 import { containsSecret, workspaceLabel } from "./topic-sync.js";
 
 const MAX_LABEL_LENGTH = 40;
 const TELEGRAM_MESSAGE_UTF16_LIMIT = 4096;
 const MAX_ACTIVE_ROWS = 5;
 const MAX_QUEUE_ROWS = 3;
+const MAX_ATTENTION_ROWS = 7;
 const MAX_ROW_COMPONENT_HTML_UNITS = 72;
 export const STATUS_BOARD_BUTTON_LIMIT = 8;
 const HIDDEN_LABEL = "(скрыто)";
@@ -23,8 +19,6 @@ type ProjectedJobRow = NonNullable<StatusSnapshot["jobs"]>[number];
 
 interface AttentionRow {
   readonly text: string;
-  readonly job?: ProjectedJobRow;
-  readonly action?: TelegramStatusAction;
 }
 
 export type BoardButton =
@@ -57,7 +51,6 @@ export function renderStatusBoard(
   const launcherButtons: BoardButton[] = miniAppLaunchUrl
     ? [{ text: "Открыть Dashboard", url: miniAppLaunchUrl }]
     : [];
-  const attentionRowLimit = STATUS_BOARD_BUTTON_LIMIT - launcherButtons.length;
   const waiting = snapshot.running.reduce(
     (count, task) => count + Number(Boolean(task.waitingOn))
       + task.children.filter((child) => child.waitingOn).length,
@@ -72,13 +65,12 @@ export function renderStatusBoard(
 
   const sections: string[] = [];
   const attentionRows = projectAttentionRows(snapshot);
-  const visibleAttentionRows = attentionRows.slice(0, attentionRowLimit);
 
   if (attentionRows.length > 0) {
     sections.push(section(
       "Требуют внимания",
       attentionRows,
-      attentionRowLimit,
+      MAX_ATTENTION_ROWS,
       (row, index) => `${index + 1}. ${row.text}`,
     ));
   }
@@ -120,13 +112,7 @@ export function renderStatusBoard(
 
   return {
     body,
-    buttons: [
-      ...launcherButtons,
-      ...attentionButtons(
-        visibleAttentionRows,
-        attentionRowLimit,
-      ),
-    ],
+    buttons: launcherButtons,
   };
 }
 
@@ -140,8 +126,6 @@ function projectAttentionRows(snapshot: StatusSnapshot): AttentionRow[] {
     rows.push({
       text: `${rowText(job)} · требует действия`
         + ` · ${elapsed(snapshot.now - job.projection.timestamps.updatedAt)}`,
-      job,
-      action: job.projection.actions.find((action) => !isInformationalAction(action.kind)),
     });
   }
   for (const task of snapshot.running) {
@@ -169,44 +153,6 @@ function runningIdentities(task: RunningTask): string[] {
     task.threadId ? `thread:${task.threadId}` : undefined,
     task.messageThreadId === undefined ? undefined : `topic:${task.messageThreadId}`,
   ].filter((identity): identity is string => identity !== undefined);
-}
-
-function attentionButtons(rows: readonly AttentionRow[], maximum: number): BoardButton[] {
-  return rows.flatMap((row, index) => {
-    if (!row.job || !row.action) return [];
-    const projection = row.job.projection;
-    if (row.action.jobId !== projection.jobId
-      || row.action.expectedVersion !== projection.expectedVersion) {
-      throw new Error("Status action does not match its projection");
-    }
-    const callbackData = telegramStatusActionCallbackData(row.action);
-    if (callbackData === null) return [];
-    return [{
-      text: buttonLabel(`${index + 1}. ${actionLabel(row.action.kind)}`),
-      callbackData,
-    }];
-  }).slice(0, maximum);
-}
-
-function isInformationalAction(kind: TelegramStatusActionKind): boolean {
-  return kind === "details" || kind === "inspect";
-}
-
-function actionLabel(kind: TelegramStatusActionKind): string {
-  const labels: Record<TelegramStatusActionKind, string> = {
-    abort: "Abort", refresh: "Refresh", details: "Details", inspect: "Inspect",
-    retry_new_turn: "Retry as new turn", guardian_restore: "Guardian Restore",
-    retry_delivery: "Retry delivery", recover_missing_topic: "Recover topic",
-    resume_existing_topic: "Resume topic",
-    resume_existing_topic_warning: "Resume topic (may resend status)",
-    send_again_warning: "Send again with warning",
-  };
-  return labels[kind];
-}
-
-function buttonLabel(raw: string): string {
-  const characters = [...raw];
-  return characters.length <= 60 ? raw : `${characters.slice(0, 59).join("")}…`;
 }
 
 function section<T>(

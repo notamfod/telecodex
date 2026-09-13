@@ -235,7 +235,7 @@ inspection and action execution.
 - Verify: `test/dashboard-controller.test.ts`
 - Verify: `test/mini-app-ui.test.ts`
 
-- [ ] **Step 1: Add the failing launcher-only regression**
+- [x] **Step 1: Add the failing launcher-only regression**
 
 Change the required-attention renderer fixture to preserve its numbered body row
 while requiring exactly one launcher button. Add a no-Mini-App fixture that
@@ -252,7 +252,7 @@ expect(renderStatusBoard(snapshot([value]), CHAT_ID).buttons).toEqual([]);
 Run `TMPDIR=/var/tmp npx vitest run test/status-board-render.test.ts` and require
 failure because 07.3b still emits the callback.
 
-- [ ] **Step 2: Make the topic renderer launcher-only**
+- [x] **Step 2: Make the topic renderer launcher-only**
 
 Use a fixed `MAX_ATTENTION_ROWS = 7` for the body. Return `launcherButtons`
 directly and remove topic-only action selection, validation, label and callback
@@ -260,7 +260,7 @@ helpers from `src/status-board-render.ts`. Do not change
 `telegramStatusActionCallbackData`, canonical projections, Mini App APIs or action
 execution.
 
-- [ ] **Step 3: Verify locally and commit**
+- [x] **Step 3: Verify locally and commit**
 
 ```bash
 TMPDIR=/var/tmp npx vitest run \

@@ -95,17 +95,14 @@ describe("unified status board rendering", () => {
     expect(renderStatusBoard(result, CHAT_ID).body).not.toContain("terminal_incomplete");
   });
 
-  it("renders a required callback without a Mini App URL", () => {
+  it("renders no callbacks without a Mini App URL", () => {
     const value = projection({ attention: {
       kind: "required", code: "OPERATOR_REQUIRED", actions: ["abort"],
     } });
 
     expect(renderStatusBoard(snapshot([{
       projection: value, label: "Attention", workspace: "/srv/telecodex",
-    }]), CHAT_ID).buttons).toEqual([{
-      text: "1. Abort",
-      callbackData: "tcj:a:job-123456789:7",
-    }]);
+    }]), CHAT_ID).buttons).toEqual([]);
   });
 
   it("counts only projected running or delivering work against Telegram slots", () => {
@@ -256,16 +253,15 @@ describe("unified status board rendering", () => {
       .toEqual([{ text: "Открыть Dashboard", url: "https://example.test/dashboard" }]);
   });
 
-  it("numbers one first non-informational action from the same visible attention row", () => {
-    const action = {
-      kind: "retry_delivery", jobId: "delivery-failed", expectedVersion: 7,
-      partKey: "final:0000",
-    };
+  it("keeps required attention visible while the launcher is the only button", () => {
     const value = projectedJob("delivery-failed", {
       actions: [
         { kind: "details", jobId: "delivery-failed", expectedVersion: 7 },
         { kind: "inspect", jobId: "delivery-failed", expectedVersion: 7 },
-        action,
+        {
+          kind: "retry_delivery", jobId: "delivery-failed", expectedVersion: 7,
+          partKey: "final:0000",
+        },
         { kind: "refresh", jobId: "delivery-failed", expectedVersion: 7 },
       ],
     });
@@ -275,9 +271,8 @@ describe("unified status board rendering", () => {
     expect(rendered.body).toContain("<b>Требуют внимания</b>\n1. telecodex · Attention delivery-failed");
     expect(rendered.buttons).toEqual([
       { text: "Открыть Dashboard", url: "https://example.test/dashboard" },
-      { text: "1. Retry delivery", callbackData: "tcj:y:delivery-failed:7:final:0000" },
     ]);
-    expect(value.projection.actions[2]).toBe(action);
+    expect(renderStatusBoard(snapshot([value]), CHAT_ID).buttons).toEqual([]);
   });
 
   it("numbers projected and waiting attention once and suppresses duplicate thread rows", () => {
@@ -299,10 +294,9 @@ describe("unified status board rendering", () => {
     expect(rendered.body).toContain("1. telecodex · Attention needs-action");
     expect(rendered.body).toContain("2. telecodex · Waiting reply · ждёт ответа");
     expect(rendered.body.match(/Waiting reply · ждёт ответа/g)).toHaveLength(1);
-    expect(rendered.buttons[1]).toEqual({
-      text: "1. Retry as new turn",
-      callbackData: "tcj:r:needs-action:7",
-    });
+    expect(rendered.buttons).toEqual([
+      { text: "Открыть Dashboard", url: "https://example.test/dashboard" },
+    ]);
   });
 
   it("keeps distinct required jobs that share one thread and topic", () => {
@@ -319,88 +313,23 @@ describe("unified status board rendering", () => {
 
     expect(rendered.body).toContain("1. telecodex · Attention shared-first");
     expect(rendered.body).toContain("2. telecodex · Attention shared-second");
-    expect(rendered.buttons.slice(1)).toEqual([
-      { text: "1. Retry as new turn", callbackData: "tcj:r:shared-first:7" },
-      { text: "2. Retry as new turn", callbackData: "tcj:r:shared-second:7" },
-    ]);
-  });
-
-  it.each([
-    ["job id", { kind: "abort", jobId: "wrong-job", expectedVersion: 7 }],
-    ["version", { kind: "abort", jobId: "exact-job", expectedVersion: 8 }],
-  ])("rejects a selected action with a mismatched %s", (_field, action) => {
-    const job = projectedJob("exact-job", { actions: [action] });
-
-    expect(() => renderStatusBoard(
-      snapshot([job]), CHAT_ID, "https://example.test/dashboard",
-    ))
-      .toThrow("Status action does not match its projection");
-  });
-
-  it("omits an oversized callback while keeping its attention row visible", () => {
-    const jobId = "x".repeat(40);
-    const job = projectedJob(jobId, {
-      expectedVersion: 9_999_999_999_999_999,
-      actions: [{
-        kind: "retry_delivery", jobId, expectedVersion: 9_999_999_999_999_999,
-        partKey: "y".repeat(24),
-      }],
-    });
-
-    const rendered = renderStatusBoard(snapshot([job]), CHAT_ID, "https://example.test/dashboard");
-
-    expect(rendered.body).toContain(`Attention ${jobId.slice(0, 20)}`);
     expect(rendered.buttons).toEqual([
       { text: "Открыть Dashboard", url: "https://example.test/dashboard" },
     ]);
   });
 
-  it("keeps a parser-incompatible job visible without emitting a dead callback", () => {
-    const job = projectedJob("legacy.job", {
-      actions: [{ kind: "abort", jobId: "legacy.job", expectedVersion: 7 }],
-    });
-
-    const rendered = renderStatusBoard(snapshot([job]), CHAT_ID, "https://example.test/dashboard");
-
-    expect(rendered.body).toContain("Attention legacy.job");
-    expect(rendered.buttons).toEqual([
-      { text: "Открыть Dashboard", url: "https://example.test/dashboard" },
-    ]);
-  });
-
-  it("keeps a parser-incompatible part key visible without emitting a dead callback", () => {
-    const job = projectedJob("valid-job", {
-      actions: [{
-        kind: "retry_delivery", jobId: "valid-job", expectedVersion: 7,
-        partKey: "invalid part",
-      }],
-    });
-
-    const rendered = renderStatusBoard(snapshot([job]), CHAT_ID, "https://example.test/dashboard");
-
-    expect(rendered.body).toContain("Attention valid-job");
-    expect(rendered.buttons).toEqual([
-      { text: "Открыть Dashboard", url: "https://example.test/dashboard" },
-    ]);
-  });
-
-  it("uses all eight attention rows and buttons when no launcher is configured", () => {
+  it("keeps seven attention rows and no buttons when no launcher is configured", () => {
     const jobs = Array.from({ length: 10 }, (_, index) => projectedJob(`no-launcher-${index}`));
 
     const rendered = renderStatusBoard(snapshot(jobs), CHAT_ID);
 
-    expect(rendered.body).toContain("8. telecodex · Attention no-launcher-7");
-    expect(rendered.body).not.toContain("Attention no-launcher-8");
-    expect(rendered.body).toContain("… ещё 2");
-    expect(rendered.buttons).toHaveLength(8);
-    expect(rendered.buttons.map((button) => button.text)).toEqual([
-      "1. Retry as new turn", "2. Retry as new turn", "3. Retry as new turn",
-      "4. Retry as new turn", "5. Retry as new turn", "6. Retry as new turn",
-      "7. Retry as new turn", "8. Retry as new turn",
-    ]);
+    expect(rendered.body).toContain("7. telecodex · Attention no-launcher-6");
+    expect(rendered.body).not.toContain("Attention no-launcher-7");
+    expect(rendered.body).toContain("… ещё 3");
+    expect(rendered.buttons).toEqual([]);
   });
 
-  it("keeps eight hostile HTML attention rows within the Telegram body limit", () => {
+  it("keeps hostile HTML attention rows within the Telegram body limit", () => {
     const hostile = "&".repeat(40);
     const jobs = Array.from({ length: 8 }, (_, index) => projectedJob(`hostile-${index}`, {}, {
       label: hostile,
@@ -409,14 +338,16 @@ describe("unified status board rendering", () => {
 
     const rendered = renderStatusBoard(snapshot(jobs), CHAT_ID);
 
-    expect(rendered.body).toContain("8. ");
+    expect(rendered.body).toContain("7. ");
+    expect(rendered.body).not.toContain("8. ");
+    expect(rendered.body).toContain("… ещё 1");
     expect(rendered.body.length).toBeLessThanOrEqual(4096);
     expect(rendered.body).toContain("&amp;");
     expect(rendered.body.replaceAll("&amp;", "")).not.toContain("&");
-    expect(rendered.buttons).toHaveLength(8);
+    expect(rendered.buttons).toEqual([]);
   });
 
-  it("bounds many required rows and their matching buttons deterministically", () => {
+  it("bounds many required rows with one launcher deterministically", () => {
     const jobs = Array.from({ length: 12 }, (_, index) => projectedJob(`required-${index}`));
 
     const rendered = renderStatusBoard(snapshot(jobs), CHAT_ID, "https://example.test/dashboard");
@@ -425,11 +356,8 @@ describe("unified status board rendering", () => {
     expect(rendered.body).not.toContain("Attention required-7");
     expect(rendered.body).toContain("… ещё 5");
     expect(rendered.body.length).toBeLessThanOrEqual(4096);
-    expect(rendered.buttons).toHaveLength(8);
-    expect(rendered.buttons.slice(1).map((button) => button.text)).toEqual([
-      "1. Retry as new turn", "2. Retry as new turn", "3. Retry as new turn",
-      "4. Retry as new turn", "5. Retry as new turn", "6. Retry as new turn",
-      "7. Retry as new turn",
+    expect(rendered.buttons).toEqual([
+      { text: "Открыть Dashboard", url: "https://example.test/dashboard" },
     ]);
     expect(renderStatusBoard(snapshot(jobs), CHAT_ID, "https://example.test/dashboard"))
       .toEqual(rendered);

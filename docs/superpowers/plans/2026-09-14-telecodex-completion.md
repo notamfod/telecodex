@@ -50,8 +50,9 @@ TeleCodex перезапущен 2026-09-14 в 07:03:24 UTC. Новый PID 1917
 - [x] Проверить назначения и причины исторических сбоев, выполнить доступные штатные действия.
 - [x] Исправить восстановление отсутствующего rich anchor и повтор терминального статусного сообщения; проверить сохранность payload, CAS, неопределённых отправок и конечного результата задачи.
 - [x] Добавить отдельную операторскую повторную попытку failed topic resume с сохранением прежней попытки, новым token/version и повторной проверкой source/binding/topology; не ослаблять обычный retry.
-- [ ] Провести review, tests/build, backup, merge/push, обновить работающий сервис и выполнить восстановление через проверенные операции.
-- [ ] Записать конечные счётчики и ограничения.
+- [x] Провести review, tests/build, backup, merge/push и обновить работающий сервис.
+- [ ] Восстановить исторические доставки в Telegram: заблокировано удалением всех шести исходных топиков; проверенные попытки отклонены Telegram, ответы сохранены локально.
+- [x] Записать конечные счётчики и ограничения.
 
 /tmp: шесть неиспользуемых Go cache каталогов перенесены в /var/cache/codex-relocated-tmp, SHA256 каждого файла проверен, исходные пути сохранены symlink. Свободно 1,3 ГБ вместо полного tmpfs. Исходники других проектов и Snap private tmp не удалялись. Manifest: /var/cache/codex-relocated-tmp/relocation-20260914.json. В telecodex.service применён TMPDIR=/var/cache/telecodex/tmp (0700), tmpfiles retention 7d; глобальная политика /tmp не изменена. После gated restart PID 288479, healthz/readyz ok, Guardian active, NRestarts=0.
 
@@ -59,7 +60,7 @@ Restore drill: /var/tmp/telecodex-restore-drill-42xbgh0m/report.json. Начал
 
 Live API smoke: /var/tmp/telecodex-live-smoke-e3bz6x0f/report.json. Технический топик 5480, карточка 5481. Через текущие TopicTaskCardService и TopicTaskLifecycleService подтверждены 11/11 вызовов: create, send/edit/pin, close/reopen/close. Изолированная task DB целостна, итоговая карточка ready+pinned+current, топик closed, незавершённых intents нет. Это проверка Telegram API, не физического телефона или Mini App WebView.
 
-Delivery audit: 13 failed anchors состоят из восьми сохранённых rich final answers, четырёх терминальных status updates и одного anchor с предыдущим failed resume, блокирующего два pending followers. Все привязки к исходным thread/topic сохранены; живой classifier подтвердил наличие всех шести топиков. У восьми rich anchors пустой responsePlan предусмотрен контрактом: final answer хранится в самом anchor и совпадает с turnResult. Штатный повтор подтвердил permanent failure; retry терминального status воспроизвёл 500 до сетевого вызова из-за отсутствующего terminal перехода в outbox ledger. Исторические состояния не очищаются вручную и не объявляются доставленными без подтверждения Telegram.
+Delivery audit: 13 failed anchors состоят из восьми сохранённых rich final answers, четырёх терминальных status updates и одного anchor с предыдущим failed resume, блокирующего два pending followers. Все привязки к исходным thread/topic сохранены; sendChatAction classifier вернул live для всех шести топиков. Позднее строгая проверка опровергла этот вывод: успешный typing не доказывает существование топика. У восьми rich anchors пустой responsePlan предусмотрен контрактом: final answer хранится в самом anchor и совпадает с turnResult. Штатный повтор подтвердил permanent failure; retry терминального status воспроизвёл 500 до сетевого вызова из-за отсутствующего terminal перехода в outbox ledger. Исторические состояния не очищаются вручную и не объявляются доставленными без подтверждения Telegram.
 
 Maintenance design: missing edit_rich becomes send_rich only after definitive message_missing, with unchanged Markdown/media and rebound fallback. The existing hash/attempt/lease/message CAS updates delivery and anchor plan atomically. Terminal status retries retain outcome, attention and terminalAt; pending/sending continuation is gated by a durable explicit-retry event, so historical rows are not adopted automatically. Operator retryFailed creates a fresh failed-resume attempt only after exact evidence checks, archives the previous terminal snapshot, and retains the generic retry fences.
 
@@ -69,3 +70,18 @@ Dry-run of the operator method on a current production DB copy completed the one
 
 Maintenance validation: full Vitest suite passed 3484 tests in 212 files (294.84 s), /var/tmp/telecodex-maintenance-full.log. Independent review found no blocking issues. No frontend behavior changed; the earlier 23 browser scenarios remain the browser evidence for this UX release.
 Final maintenance server/web build and Svelte check (0 errors, 0 warnings) passed; logs /var/tmp/telecodex-maintenance-build.log and /var/tmp/telecodex-maintenance-webcheck.log. No separate lint script exists. Diff check passed.
+
+
+## Итог дополнительного обслуживания
+
+Код `5705098` опубликован fast-forward в fork/main и подтянут в основной checkout. Сервис запущен с новой сборкой, PID 363506, NRestarts=0. Все 178 установленных файлов совпадают с manifest проверенной сборки. healthz/readyz ok, Guardian active/ready, fatal/uncaught/unhandled записей после старта не обнаружено. База jobs.sqlite успешно мигрирована в v10, quick_check/FK checks прошли.
+
+Новая резервная копия перед миграцией: /var/backups/telecodex/20260914T080211Z-delivery-maintenance, 528 файлов в исходном manifest, четыре целостных SQLite snapshot. Операторская попытка последней задачи создана штатным новым методом: прежний failed snapshot с baseline32 сохранён в topic_resume_attempt_history, новый token использован; Telegram отклонил anchor permanent на попытке34, followers остались pending с attempts0. Повторные попытки не запускались.
+
+Строгая проверка через reopenForumTopic вернула 400/missing_topic для 3601, 4465, 4555, 4113, 4546 и 4552. Ни один топик не был открыт или создан этим запросом. Более ранний успешный sendChatAction был ложноположительным свидетельством наличия топика. Отправку в удалённые топики прекращено; нельзя восстановить прежние Telegram topic ID или утверждать доставку по успешному typing.
+
+Текущие счётчики: delivering=9, attention=13, pending deliveries=2, failed deliveries=13, sending=0, uncertain=0. Это НЕ закрытая доставка. Новая поддержка повторов исправляет воспроизведённые ошибки, но не восстанавливает удалённые назначения и не переносит старые задачи в новые топики автоматически. Массовые новые топики и новые прогоны Codex не создавались.
+
+Содержимое девяти результатов (5686 символов) сохранено в /var/backups/telecodex/20260914T080211Z-delivery-maintenance/recovered-results/answers.md. Рядом private JSON каждой задачи с исходным source, deliveries и recovery/resume evidence; manifest содержит SHA256. Исходная база и её недоставленные состояния сохранены. Следующий отдельный сценарий для Telegram-доставки этих результатов: явно обозначенное восстановление в новые топики с сохраняемым соответствием старых и новых назначений; существующий retry не должен обходить эти проверки.
+
+/tmp освобождён, собственный TMPDIR/7d retention применён, restore drill и live Telegram API pilot завершены. Реальный телефон/Telegram WebView по-прежнему не проверен: доступного физического устройства в окружении нет. API pilot не подменяет такую проверку.

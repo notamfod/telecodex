@@ -45,6 +45,23 @@ describe("Mini App HTTP server", () => {
     rmSync(staticDir, { recursive: true, force: true });
   });
 
+  it("validates task filters and scopes preferences using authenticated user and configured chat", async () => {
+    const { server, loadDashboard } = await start();
+    const headers = { "x-telegram-init-data": signedInitData() };
+    for (const suffix of ["search=" + "a".repeat(161), "search=%00", "project=/root/private", "search=a&search=b", "project=bad"]) {
+      const response = await fetch(`${server.url}/api/dashboard?${suffix}`, { headers });
+      expect(response.status).toBe(400);
+    }
+    expect(loadDashboard).not.toHaveBeenCalled();
+    const response = await fetch(`${server.url}/api/dashboard?view=completed&search=%20ticket%20&project=`, { headers });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ preferencesNamespace: "telecodex:tasks:v1:123:-100456" });
+    expect(loadDashboard).toHaveBeenCalledWith({ view: "completed", offset: 0, limit: 30, search: "ticket" });
+    const unauthorized = await fetch(`${server.url}/api/dashboard?userId=999&boardChatId=-100999`);
+    expect(unauthorized.status).toBe(401);
+    expect(await unauthorized.json()).not.toHaveProperty("preferencesNamespace");
+  });
+
   async function start() {
     const runTaskAction = vi.fn(async (_action: unknown) => {});
     const loadDashboard = vi.fn(async () => ({ generatedAt: NOW_SECONDS * 1000, sessions: [] }));
@@ -64,6 +81,7 @@ describe("Mini App HTTP server", () => {
     } satisfies JiraMiniAppController;
     const runJobAction = vi.fn(async () => undefined);
     server = await startMiniAppServer({
+      boardChatId: -100456,
       host: "127.0.0.1",
       port: 0,
       staticDir,
@@ -122,7 +140,7 @@ describe("Mini App HTTP server", () => {
 
     expect(unauthorized.status).toBe(401);
     expect(authorized.status).toBe(200);
-    expect(await authorized.json()).toEqual({ generatedAt: NOW_SECONDS * 1000, sessions: [] });
+    expect(await authorized.json()).toEqual({ generatedAt: NOW_SECONDS * 1000, sessions: [], preferencesNamespace: "telecodex:tasks:v1:123:-100456" });
   });
 
   it("passes a bounded Dashboard view and page to the controller", async () => {

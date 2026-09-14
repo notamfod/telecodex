@@ -41,7 +41,7 @@
   let axis: "pending" | "horizontal" | "vertical" = "pending";
   let suppressClick = false;
 
-  $: statusLabel = thread.state === "stalled"
+  $: statusLabel = thread.taskContext?.stateLabel ?? (thread.state === "stalled"
     ? "зависла"
     : thread.waitingOn === "approval"
       ? "нужно подтвердить"
@@ -49,7 +49,7 @@
         ? "нужно ответить"
         : thread.state === "waiting"
           ? "ожидает"
-          : thread.state === "recent" ? "недавняя" : "активна";
+          : thread.state === "recent" ? "недавняя" : thread.state === "queued" ? "в очереди" : thread.state === "completed" ? "завершена" : "активна");
   $: tagType = (thread.state === "stalled"
     ? "red"
     : thread.state === "waiting"
@@ -66,7 +66,7 @@
   function runAction(action: ThreadSwipeAction): void {
     if (action === "telegram" ? !canOpenTelegram : !canOpenCodex) return;
     onReveal(swipeKey, null);
-    if (action === "codex") onCodex(thread.codexUrl);
+    if (action === "codex") onCodex(thread.codexUrl ?? "");
     else onTelegram(thread);
   }
 
@@ -201,6 +201,15 @@
         <Tag type={tagType} size="sm" inline>{statusLabel}</Tag>
         <span class="thread__age"><Time size={14} /> {relativeTime(thread.timestamp, now)}</span>
       </div>
+      {#if thread.taskContext}
+        <p class="thread__meta">
+          {#if thread.ticketKey}{thread.ticketKey} · {/if}
+          {#if thread.taskContext.confirmedAt}Подтверждено: {relativeTime(thread.taskContext.confirmedAt, now)}{:else}Нет подтверждённого события{/if}
+          {#if thread.taskContext.waitingLabel} · {thread.taskContext.waitingLabel}{/if}
+        </p>
+        {#if thread.taskContext.resultStatus === "missing"}<p class="thread__meta">Подтверждённого результата пока нет</p>{/if}
+        {#if thread.taskContext.resultStatus === "pending"}<p class="thread__meta">Новый результат пока не подтверждён{thread.taskContext.resultUrl ? "; ссылка ведёт к предыдущему результату" : ""}</p>{/if}
+      {/if}
       <div class="thread__open-actions">
         <button type="button" disabled={!canOpenTelegram} on:click={(event) => openFromClick(event, "telegram")}>
           {creating ? "Открываю…" : thread.telegramUrl ? "Открыть топик" : "Создать топик"}
@@ -213,7 +222,7 @@
             <button type="button" disabled={taskPending} on:click={() => performTaskAction(item.action)}>{item.label}</button>
           {/each}
           {#each thread.taskLinks ?? [] as link}
-            <button type="button" on:click={() => onTelegram({ ...thread, telegramUrl: link.url })}>{link.label}</button>
+            <button type="button" on:click={() => onTelegram({ ...thread, telegramUrl: link.url })}>{link.url === thread.taskContext?.resultUrl ? "Последний подтверждённый результат" : link.label}</button>
           {/each}
         </div>
       {/if}

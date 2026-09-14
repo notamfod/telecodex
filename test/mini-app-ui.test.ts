@@ -44,7 +44,7 @@ const session = (overrides: Partial<DashboardSession> = {}): DashboardSession =>
 
 const page = (overrides: Partial<DashboardPayload> = {}): DashboardPayload => ({
   generatedAt: NOW,
-  counts: { active: 1, recent: 0, attention: 0 },
+  counts: { active: 1, recent: 0, attention: 0, completed: 0 },
   page: { view: "active", offset: 0, limit: 30, total: 1, hasMore: false },
   sessions: [session()],
   system: { codexAvailable: true },
@@ -150,6 +150,27 @@ describe("Mini App API client", () => {
     expect(result.nextOffset).toBe(230);
   });
 
+  it("keeps search and project filters on every refreshed page", async () => {
+    const requests: URL[] = [];
+    const fetcher = async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), "http://test");
+      requests.push(url);
+      const offset = Number(url.searchParams.get("offset"));
+      const limit = Number(url.searchParams.get("limit"));
+      return new Response(JSON.stringify({
+        sessions: Array.from({ length: limit }, (_, index) => ({ id: String(offset + index) })),
+        page: { hasMore: offset + limit < 130 },
+      }));
+    };
+    await loadDashboardWindow("signed", "completed", 130, fetcher, undefined, { search: "MIR-123 & title", project: "project-id" });
+    expect(requests).toHaveLength(2);
+    for (const url of requests) {
+      expect(url.searchParams.get("search")).toBe("MIR-123 & title");
+      expect(url.searchParams.get("project")).toBe("project-id");
+      expect(url.searchParams.get("view")).toBe("completed");
+    }
+  });
+
   it("rejects an incomplete window instead of returning a partial replacement", async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -229,16 +250,17 @@ describe("Mini App responsive theme", () => {
     expect(app).toContain("revealedSwipe");
   });
 
-  it("renders three Jira-like scrollable views and virtualizes the session list", async () => {
+  it("renders four task views and virtualizes the session list", async () => {
     const app = await readFile(new URL("../web/src/App.svelte", import.meta.url), "utf8");
     const css = await readFile(new URL("../web/src/app.css", import.meta.url), "utf8");
     const list = await readFile(new URL("../web/src/SessionList.svelte", import.meta.url), "utf8");
 
-    expect(app).toContain("Активные");
+    expect(app).toContain("В работе");
     expect(app).toContain("Недавние");
-    expect(app).toContain("Зависшие и ожидающие");
+    expect(app).toContain("Завершённые");
+    expect(app).toContain("Нужно моё действие");
     expect(app).toContain("dashboardPollInterval");
-    expect(app).toContain("await ensureThreadTopic(session.id, initData)");
+    expect(app).toContain("await ensureThreadTopic(session.threadId ?? session.id, initData)");
     expect(app).not.toContain("if (session.telegramUrl)");
     expect(app).not.toContain("Canonical");
     expect(app).not.toContain("Runtime status");

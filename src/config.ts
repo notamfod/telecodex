@@ -1,3 +1,4 @@
+import { validateTopicSyncPolicy, type TopicSyncPolicy } from "./topic-sync-policy.js";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
@@ -95,6 +96,7 @@ export interface TeleCodexConfig {
   gitlabWorkspaceRoot?: string;
   topicSyncIntervalMs?: number;
   topicSyncEnabled: boolean;
+  topicSyncPolicy?: TopicSyncPolicy;
   telegramMaxActiveTopics: number;
   telegramProgressHeartbeatMs: number;
   jiraPanel?: JiraPanelConfig;
@@ -191,6 +193,10 @@ export function loadConfig(): TeleCodexConfig {
   // to switch on the moment the forum id became known, which meant you could
   // not name the forum for anything else without also opting into that sweep.
   const topicSyncEnabled = optionalString(process.env.TOPIC_SYNC_INTERVAL_SECONDS) !== undefined;
+  const topicSyncPolicy = validateTopicSyncPolicy({
+    mode: (optionalString(process.env.TOPIC_SYNC_MODE) ?? (topicSyncEnabled ? "all" : "onrequest")) as TopicSyncPolicy["mode"],
+    projects: (optionalString(process.env.TOPIC_SYNC_PROJECTS) ?? "").split(";").map(value => value.trim()).filter(Boolean),
+  });
   const telegramMaxActiveTopics = parseIntegerSetting(
     "TELEGRAM_MAX_ACTIVE_TOPICS",
     optionalString(process.env.TELEGRAM_MAX_ACTIVE_TOPICS),
@@ -270,6 +276,7 @@ export function loadConfig(): TeleCodexConfig {
     gitlabWorkspaceRoot,
     topicSyncIntervalMs,
     topicSyncEnabled,
+    topicSyncPolicy,
     telegramMaxActiveTopics,
     telegramProgressHeartbeatMs,
     jiraPanel,

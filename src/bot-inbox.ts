@@ -1,5 +1,5 @@
-import { readFile } from "node:fs/promises";
-import path from "node:path";
+import { registerInboxCommands } from "./bot-inbox-commands.js";
+import { TaskProvisioningService, TaskProvisioningStore } from "./task-provisioning.js";
 
 import { Bot, InlineKeyboard, type Context } from "grammy";
 
@@ -15,7 +15,6 @@ import { inboxFailureText, makeInboxFailure, type InboxProgress } from "./inbox-
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML } from "./format.js";
 import {
-  DEFAULT_TICKET_TEMPLATE,
   BurstBuffer,
   InboxStore,
   buildTicketPrompt,
@@ -23,14 +22,11 @@ import {
   duplicateTicketButtons,
   extractTicketKey,
   groupBurst,
-  groupTicketsByWorkspace,
   hasAttachment,
-  parseInboxTemplateCommand,
   prepareTicketLaunchPrompt,
   ticketActionButtons,
   ticketHeading,
   ticketTopicName,
-  validateTicketTemplate,
   type InboxSettings,
   type Ticket,
 } from "./inbox.js";
@@ -43,11 +39,12 @@ import {
 import { isSafeProjectContext, loadDofboxRealmContext } from "./project-context.js";
 import { topicUrl } from "./projects.js";
 import type { SessionRegistry } from "./session-registry.js";
-import { formatTelegramErrorLog, isTelegramTopicNotModified } from "./telegram-error-log.js";
-import { extractTopicRename, renamedTicketTopic } from "./topic-naming.js";
+import { formatTelegramErrorLog, type TelegramLogCategory } from "./telegram-error-log.js";
 
 const INBOX_QUIET_MS = 2_000;
 const INBOX_TOPIC_PAUSE_MS = 3_000;
+
+type InboxAttemptProgress = InboxProgress & { category?: TelegramLogCategory };
 
 type InboxItem = {
   contextKey: TelegramContextKey;
@@ -66,6 +63,7 @@ type TextOptions = {
 };
 
 export interface RegisterInboxHandlersDeps {
+  provisioning?: TaskProvisioningService | (() => TaskProvisioningService);
   renameTopicManually?(chatId: number, messageThreadId: number, title: string): Promise<void>;
   onManualTopicTitle?(chatId: number, messageThreadId: number, title: string): Promise<void>;
   bot: Bot<Context>;
@@ -94,13 +92,24 @@ export interface RegisterInboxHandlersDeps {
   safeReply(ctx: Context, text: string, options?: TextOptions): Promise<void>;
 }
 
-export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
+export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): { dispose(): Promise<void> } {
   const { bot, config, registry, inbox, jiraComment, topicActivity } = deps;
+  const provisioning = (typeof deps.provisioning === "function" ? deps.provisioning() : deps.provisioning) ?? inbox.getProvisioningService?.() ?? new TaskProvisioningService(new TaskProvisioningStore(":memory:"));
+  let stopping = false;
+  const background = new Set<Promise<unknown>>();
+  const track = (promise: Promise<unknown>): void => {
+    background.add(promise);
+    void promise.catch(error => console.error(formatTelegramErrorLog("inbox", error))).finally(() => background.delete(promise));
+  };
   const pendingBatches = new Map<string, InboxItem[][]>();
   const pendingDuplicateDecisions = new Map<number, { group: InboxItem[]; previousTicketId: number }>();
   const pendingJiraPosts = new Set<number>();
-  let nextBatchId = 1;
-  let nextDuplicateDecisionId = 1;
+  let nextBatchId = Date.now();
+  let nextDuplicateDecisionId = Date.now();
+  for (const [key, value] of provisioning.store.listPending<any>()) {
+    if (key.startsWith("batch:")) { nextBatchId = Math.max(nextBatchId, Number(key.slice(6)) + 1); if (!value.choice) pendingBatches.set(key.slice(6), value.groups); }
+    if (key.startsWith("duplicate:")) { nextDuplicateDecisionId = Math.max(nextDuplicateDecisionId, Number(key.slice(10)) + 1); if (!value.choice) pendingDuplicateDecisions.set(Number(key.slice(10)), value); }
+  }
 
   const ticketKeyboard = (ticket: Pick<Ticket, "id" | "startedAt" | "resolvedAt">): InlineKeyboard => {
     const keyboard = new InlineKeyboard();
@@ -147,7 +156,7 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
     skipDuplicateCheck?: boolean;
     supersedesId?: number;
     continueTicketId?: number;
-  } = {}, progress: InboxProgress): Promise<void> => {
+  } = {}, progress: InboxAttemptProgress): Promise<void> => {
     const first = group[0];
     if (!first) return;
     const settings = inbox.get(first.contextKey);
@@ -155,14 +164,21 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
     const text = ticketTextOf(group);
     const source = describeSource(first.message);
     const externalKey = extractTicketKey(text);
-    if (externalKey && !options.skipDuplicateCheck) {
+    const operationId = `inbox:${first.contextKey}:${group.map(item => item.messageId).sort((a,b) => a-b).join(",")}`;
+    const previousOperation = provisioning.store.get(operationId);
+    if (previousOperation?.state === "ready") return;
+    if (externalKey && !options.skipDuplicateCheck && !previousOperation) {
       const candidates = inbox.listTicketsByKey(first.contextKey, externalKey);
       for (const candidate of candidates) {
         if (candidate.resolvedAt !== undefined || !candidate.workTopicId) continue;
         if (await deps.topicIsAlive(first.chatId, candidate.workTopicId)) {
           progress.outcome = "topic_exists";
           progress.workTopicId = candidate.workTopicId;
-          await appendToTicket(candidate, group, text, source);
+          provisioning.store.accept({ operationId, sourceContextKey: first.contextKey, sourceMessageIds: group.map(item => item.messageId), title: ticketTopicName(candidate.id, text, candidate.externalKey), workspace: settings.workspace, launchProfileId: settings.launchProfileId, kind: "inbox", metadata: { ticketId: candidate.id } });
+          provisioning.store.patch(operationId, { state: "bound", messageThreadId: candidate.workTopicId });
+          try { await appendToTicket(candidate, group, text, source); }
+          catch (error) { provisioning.store.patch(operationId, { state: "failed", failureStage: "ready" }); throw error; }
+          provisioning.store.patch(operationId, { state: "ready" });
           return;
         }
       }
@@ -170,6 +186,7 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
       if (previous) {
         const decisionId = nextDuplicateDecisionId++;
         pendingDuplicateDecisions.set(decisionId, { group, previousTicketId: previous.id });
+        provisioning.store.setPending(`duplicate:${decisionId}`, { group, previousTicketId: previous.id });
         const message = `Нашёл ${ticketHeading(previous)}, но активного рабочего топика у него нет.\nПродолжить старый тикет или завести новый?`;
         await deps.sendText(first.chatId, escapeHTML(message), {
           messageThreadId: parseContextKey(first.contextKey).messageThreadId,
@@ -182,7 +199,8 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
     const prompt = buildTicketPrompt(settings.template, { source, message: text, projectContext: projectContextForTicket(settings) });
     const continued = options.continueTicketId ? inbox.getTicket(options.continueTicketId) : undefined;
     if (options.continueTicketId && !continued) throw new Error(`Ticket ${options.continueTicketId} no longer exists`);
-    const pending = continued ?? inbox.createTicket({
+    const existingTicket = previousOperation?.metadata?.ticketId ? inbox.getTicket(Number(previousOperation.metadata.ticketId)) : undefined;
+    const pending = existingTicket ?? continued ?? inbox.createTicket({
       inboxContextKey: first.contextKey,
       externalKey,
       workTopicId: 0,
@@ -193,47 +211,61 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
       supersedesId: options.supersedesId,
     });
     const topicName = ticketTopicName(pending.id, text, pending.externalKey);
-    let topic;
-    progress.outcome = "creation_unknown";
-    try {
-      topic = await bot.api.createForumTopic(first.chatId, topicName, settings.iconCustomEmojiId ? { icon_custom_emoji_id: settings.iconCustomEmojiId } : undefined);
-    } catch (error) {
-      if (!continued) inbox.removeUnattachedTicket(pending.id);
-      throw error;
+    let ticket = pending;
+    const result = await provisioning.provision({
+      operationId, sourceContextKey: first.contextKey, sourceMessageIds: group.map(item => item.messageId),
+      title: topicName, workspace: settings.workspace, launchProfileId: settings.launchProfileId,
+      kind: "inbox", metadata: { ticketId: pending.id },
+    }, {
+      createTopic: async () => {
+        progress.outcome = "creation_unknown";
+        const topic = await bot.api.createForumTopic(first.chatId, topicName, settings.iconCustomEmojiId ? { icon_custom_emoji_id: settings.iconCustomEmojiId } : undefined);
+        return topic.message_thread_id;
+      },
+      bind: (record) => {
+        const threadId = record.messageThreadId!;
+        progress.outcome = "topic_exists";
+        progress.workTopicId = threadId;
+        topicActivity.rememberIdleIcon(first.chatId, threadId, settings.iconCustomEmojiId ?? null);
+        ticket = continued ? inbox.continueTicket(continued.id, { workTopicId: threadId, prompt, source })! : pending;
+        if (!continued) inbox.attachTopic(ticket.id, threadId);
+        (registry.setContextDefaultsDurably ?? registry.setContextDefaults).call(registry, contextKeyFromMessage(first.chatId, threadId), {
+          workspace: settings.workspace, launchProfileId: settings.launchProfileId, topicName,
+        });
+      },
+      ready: async (record) => {
+        const topic = { message_thread_id: record.messageThreadId! };
+        const card = [
+          `🎫 <b>${escapeHTML(ticketHeading(ticket))}</b>`,
+          `Источник: ${escapeHTML(source)}`,
+          `Проект: <code>${escapeHTML(settings.workspace)}</code>`,
+          ticket.supersedesId ? `Предыдущий: ${escapeHTML(ticketHeading(inbox.getTicket(ticket.supersedesId) ?? { id: ticket.supersedesId }))}` : undefined,
+          "",
+          escapeHTML(text || "(без текста, см. пересланные сообщения ниже)"),
+        ].filter((line): line is string => line !== undefined).join("\n");
+        await deps.sendText(first.chatId, card, { messageThreadId: topic.message_thread_id, fallbackText: `${ticketHeading(ticket)}. Источник: ${source}`, replyMarkup: ticketKeyboard(ticket) });
+        await forwardAttachments(group, topic.message_thread_id);
+        const url = topicUrl(first.chatId, topic.message_thread_id);
+        await deps.sendText(first.chatId, `${continued ? "Тикет продолжен" : "Заведён тикет"} <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a>.`, {
+          messageThreadId: parseContextKey(first.contextKey).messageThreadId,
+          fallbackText: `${ticketHeading(ticket)}: ${url}`,
+        });
+      },
+    });
+    if (result.state !== "ready") {
+      progress.outcome = result.messageThreadId ? "topic_exists" : result.state === "unknown" ? "creation_unknown" : "processing_failed";
+      progress.workTopicId = result.messageThreadId;
+      progress.category = result.failureCategory;
+      throw new Error(`Provisioning ${result.state} at ${result.failureStage ?? "create"}`);
     }
-    progress.outcome = "topic_exists";
-    progress.workTopicId = topic.message_thread_id;
-    topicActivity.rememberIdleIcon(first.chatId, topic.message_thread_id, settings.iconCustomEmojiId ?? null);
-    const ticket = continued
-      ? inbox.continueTicket(continued.id, { workTopicId: topic.message_thread_id, prompt, source })!
-      : pending;
-    if (!continued) inbox.attachTopic(ticket.id, topic.message_thread_id);
-    registry.setContextDefaults(contextKeyFromMessage(first.chatId, topic.message_thread_id), {
-      workspace: settings.workspace,
-      launchProfileId: settings.launchProfileId,
-      topicName,
-    });
-    const card = [
-      `🎫 <b>${escapeHTML(ticketHeading(ticket))}</b>`,
-      `Источник: ${escapeHTML(source)}`,
-      `Проект: <code>${escapeHTML(settings.workspace)}</code>`,
-      ticket.supersedesId ? `Предыдущий: ${escapeHTML(ticketHeading(inbox.getTicket(ticket.supersedesId) ?? { id: ticket.supersedesId }))}` : undefined,
-      "",
-      escapeHTML(text || "(без текста, см. пересланные сообщения ниже)"),
-    ].filter((line): line is string => line !== undefined).join("\n");
-    await deps.sendText(first.chatId, card, { messageThreadId: topic.message_thread_id, fallbackText: `${ticketHeading(ticket)}. Источник: ${source}`, replyMarkup: ticketKeyboard(ticket) });
-    await forwardAttachments(group, topic.message_thread_id);
-    const url = topicUrl(first.chatId, topic.message_thread_id);
-    await deps.sendText(first.chatId, `${continued ? "Тикет продолжен" : "Заведён тикет"} <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a>.`, {
-      messageThreadId: parseContextKey(first.contextKey).messageThreadId,
-      fallbackText: `${ticketHeading(ticket)}: ${url}`,
-    });
+
   };
-  const reportFailure = async (group: InboxItem[], error: unknown, progress: InboxProgress = { outcome: "processing_failed" }): Promise<void> => {
+  const reportFailure = async (group: InboxItem[], error: unknown, progress: InboxAttemptProgress = { outcome: "processing_failed" }): Promise<void> => {
     console.error(formatTelegramErrorLog("inbox", error));
     const first = group[0];
     if (!first) return;
     const failure = makeInboxFailure(first.contextKey, group.map(item => item.messageId), progress, error);
+    if (progress.category) failure.category = progress.category;
     const persisted = inbox.recordFailure(failure);
     const text = inboxFailureText(failure) + (persisted === false ? "\nНе удалось сохранить запись ошибки. Сохрани номера сообщений для проверки после перезапуска." : "");
     try {
@@ -243,9 +275,10 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
     } catch (noticeError) { console.error(formatTelegramErrorLog("inbox", noticeError)); }
   };
   const createTicket = async (group: InboxItem[], options: Parameters<typeof createTicketAttempt>[1] = {}): Promise<void> => {
-    const progress: InboxProgress = { outcome: "processing_failed" };
+    const progress: InboxAttemptProgress = { outcome: "processing_failed" };
     try { await createTicketAttempt(group, options, progress); }
     catch (error) { await reportFailure(group, error, progress); }
+    finally { for (const item of group) provisioning.store.setPending(`message:${item.contextKey}:${item.messageId}`, { item, buffered: false }); }
   };
   const createTicketsSequentially = async (groups: InboxItem[][]): Promise<void> => {
     for (const [index, group] of groups.entries()) {
@@ -258,41 +291,72 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
     if (!first) return;
     const batchId = String(nextBatchId++);
     pendingBatches.set(batchId, groups);
+    provisioning.store.setPending(`batch:${batchId}`, { groups });
+    for (const item of groups.flat()) provisioning.store.setPending(`message:${item.contextKey}:${item.messageId}`, { item, buffered: false });
     const keyboard = new InlineKeyboard().text("Одним тикетом", `inbox_batch:${batchId}:one`).row().text(`По отдельности (${groups.length})`, `inbox_batch:${batchId}:each`).row().text("Отмена", `inbox_batch:${batchId}:cancel`);
     const text = `Переслано сообщений: ${groups.length}. Как их разобрать?`;
     await deps.sendText(first.chatId, escapeHTML(text), { messageThreadId: parseContextKey(first.contextKey).messageThreadId, fallbackText: text, replyMarkup: keyboard });
   };
   const inboxBuffer = new BurstBuffer<InboxItem>(INBOX_QUIET_MS, (items) => {
     const groups = groupBurst(items);
-    void (groups.length === 1 ? createTicket(groups[0]) : askHowToSplit(groups)).catch((error) => reportFailure(items, error));
+    track((groups.length === 1 ? createTicket(groups[0]) : askHowToSplit(groups)).catch((error) => reportFailure(items, error)));
   });
 
+  const decisionMessages = new Set<string>();
+  for (const [key, value] of provisioning.store.listPending<any>()) {
+    if (key.startsWith("batch:") || key.startsWith("duplicate:")) {
+      for (const item of (value.groups?.flat() ?? value.group ?? []) as InboxItem[]) decisionMessages.add(`message:${item.contextKey}:${item.messageId}`);
+    }
+  }
+  for (const [key, value] of provisioning.store.listPending<{ item?: InboxItem; buffered?: boolean }>()) {
+    if (key.startsWith("message:") && value.buffered && value.item && !decisionMessages.has(key)) inboxBuffer.add(value.item.contextKey, value.item);
+  }
+  for (const [key, value] of provisioning.store.listPending<any>()) {
+    if (key.startsWith("batch:") && !value.completed && ["one", "each"].includes(value.choice)) {
+      track(createTicketsSequentially(value.choice === "one" ? [value.groups.flat()] : value.groups).then(() => provisioning.store.setPending(key, { ...value, completed: true })));
+    }
+    if (key.startsWith("duplicate:") && !value.completed && ["reuse", "new"].includes(value.choice)) {
+      track(createTicket(value.group, { skipDuplicateCheck: true, ...(value.choice === "reuse" ? { continueTicketId: value.previousTicketId } : { supersedesId: value.previousTicketId }) }).then(() => provisioning.store.setPending(key, { ...value, completed: true })));
+    }
+  }
   registerInboxCommands(deps);
   bot.callbackQuery(/^inbox_batch:(\d+):(one|each|cancel)$/, async (ctx) => {
     const batchId = ctx.match?.[1];
     const choice = ctx.match?.[2];
     const groups = batchId ? pendingBatches.get(batchId) : undefined;
     if (!groups) { await ctx.answerCallbackQuery({ text: "Выбор устарел. Проверь /inbox status и список топиков." }); return; }
+    const first = groups[0]?.[0];
+    if (!first || ctx.chat?.id !== first.chatId || ctx.callbackQuery.message?.message_thread_id !== parseContextKey(first.contextKey).messageThreadId) { await ctx.answerCallbackQuery({ text: "Выбор относится к другому Inbox." }); return; }
+    provisioning.store.setPending(`batch:${batchId}`, { groups, choice });
     pendingBatches.delete(batchId!);
     const batches = choice === "one" ? [groups.flat()] : groups;
+    if (choice === "cancel") {
+      await ctx.answerCallbackQuery({ text: "Отменено" }).catch(() => {});
+      await ctx.editMessageText("Отменено, тикеты не заводились.").catch(() => {});
+      return;
+    }
     try {
-      if (choice === "cancel") { await ctx.answerCallbackQuery({ text: "Отменено" }); await ctx.editMessageText("Отменено, тикеты не заводились."); return; }
       await ctx.answerCallbackQuery({ text: "Завожу тикеты..." });
       await ctx.editMessageText(choice === "one" ? "Завожу один тикет..." : `Завожу тикетов: ${batches.length}...`);
-    } catch (error) { await reportFailure(groups.flat(), error); return; }
+    } catch (error) { await reportFailure(groups.flat(), error); }
     await createTicketsSequentially(batches);
+    provisioning.store.setPending(`batch:${batchId}`, { groups, choice, completed: true });
   });
   bot.callbackQuery(/^ticket_dup:(\d+):(reuse|new)$/, async (ctx) => {
     const decisionId = Number.parseInt(ctx.match?.[1] ?? "", 10);
     const choice = ctx.match?.[2];
     const pending = Number.isNaN(decisionId) ? undefined : pendingDuplicateDecisions.get(decisionId);
     if (!pending || (choice !== "reuse" && choice !== "new")) { await ctx.answerCallbackQuery({ text: "Выбор устарел. Проверь /inbox status и список топиков." }); return; }
+    const first = pending.group[0];
+    if (!first || ctx.chat?.id !== first.chatId || ctx.callbackQuery.message?.message_thread_id !== parseContextKey(first.contextKey).messageThreadId) { await ctx.answerCallbackQuery({ text: "Выбор относится к другому Inbox." }); return; }
+    provisioning.store.setPending(`duplicate:${decisionId}`, { ...pending, choice });
     pendingDuplicateDecisions.delete(decisionId);
     try {
       await ctx.answerCallbackQuery({ text: choice === "reuse" ? "Продолжаю тикет..." : "Создаю новый тикет..." });
-    } catch (error) { await reportFailure(pending.group, error); return; }
+    } catch (error) { await reportFailure(pending.group, error); }
     await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
     await createTicket(pending.group, { skipDuplicateCheck: true, ...(choice === "reuse" ? { continueTicketId: pending.previousTicketId } : { supersedesId: pending.previousTicketId }) });
+    provisioning.store.setPending(`duplicate:${decisionId}`, { ...pending, choice, completed: true });
   });
   bot.callbackQuery(/^ticket_start:(\d+)$/, async (ctx) => {
     const ticketId = Number.parseInt(ctx.match?.[1] ?? "", 10);
@@ -381,8 +445,10 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
   bot.on("message", async (ctx, next) => {
     const contextKey = contextKeyFromCtx(ctx);
     const message = ctx.message;
-    if (!contextKey || !message || !inbox.get(contextKey) || (message.text ?? "").startsWith("/")) return next();
-    inboxBuffer.add(contextKey, {
+    if (stopping || !contextKey || !message || !inbox.get(contextKey) || (message.text ?? "").startsWith("/")) return next();
+    const ingressId = `message:${contextKey}:${message.message_id}`;
+    if (provisioning.store.pending(ingressId)) return;
+    const item: InboxItem = {
       contextKey,
       chatId: ctx.chat.id,
       messageId: message.message_id,
@@ -390,114 +456,9 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
       hasAttachment: hasAttachment(message as unknown as Record<string, unknown>),
       text: (message.text ?? message.caption ?? "").trim(),
       message,
-    });
+    };
+    provisioning.store.setPending(ingressId, { item, buffered: true });
+    inboxBuffer.add(contextKey, item);
   });
-}
-
-function registerInboxCommands(deps: RegisterInboxHandlersDeps): void {
-  const { bot, config, registry, inbox } = deps;
-  const usage = [
-    "Использование:", "/inbox on [путь] — сделать этот топик инбоксом", "/inbox off — выключить",
-    "/inbox status — показать настройки", "/inbox template — показать шаблон", "/inbox template set <текст> — изменить шаблон",
-    "/inbox template reset — вернуть шаблон по умолчанию", "/inbox context — показать контекст проекта",
-    "/inbox context set <текст> — изменить контекст", "/inbox context reset — очистить контекст",
-    "/inbox realm <имя|off> — подключить безопасный контекст dofbox",
-  ].join("\n");
-  bot.command("inbox", async (ctx) => {
-    const contextKey = contextKeyFromCtx(ctx);
-    if (!contextKey) return;
-    const args = (ctx.message?.text ?? "").replace(/^\/inbox(?:@\w+)?\s*/, "").trim();
-    const [action, ...rest] = args.split(/\s+/);
-    const settings = inbox.get(contextKey);
-    const templateCommand = parseInboxTemplateCommand(args);
-    if (templateCommand) {
-      if (!settings) { await deps.safeReply(ctx, escapeHTML("Сначала включи этот инбокс: /inbox on [путь]")); return; }
-      if (templateCommand.action === "show") { await deps.safeReply(ctx, `<b>Шаблон тикета:</b>\n<pre>${escapeHTML(settings.template)}</pre>`, { fallbackText: `Шаблон тикета:\n${settings.template}` }); return; }
-      const template = templateCommand.action === "reset" ? DEFAULT_TICKET_TEMPLATE : templateCommand.template;
-      const validationError = validateTicketTemplate(template);
-      if (validationError) { await deps.safeReply(ctx, escapeHTML(validationError), { fallbackText: validationError }); return; }
-      inbox.setTemplate(contextKey, template);
-      const text = templateCommand.action === "reset" ? "Шаблон тикета сброшен." : "Шаблон тикета обновлён.";
-      await deps.safeReply(ctx, escapeHTML(text), { fallbackText: text }); return;
-    }
-    if (action === "context") {
-      if (!settings) { await deps.safeReply(ctx, escapeHTML("Сначала включи этот инбокс: /inbox on [путь]")); return; }
-      const contextSet = /^context\s+set(?:\s+([\s\S]*))?$/.exec(args);
-      if (contextSet) {
-        const projectContext = (contextSet[1] ?? "").replaceAll("\\n", "\n").trim();
-        if (!isSafeProjectContext(projectContext)) { await deps.safeReply(ctx, escapeHTML("Контекст пуст или содержит секретные данные.")); return; }
-        inbox.setProjectContext(contextKey, projectContext);
-        await deps.safeReply(ctx, escapeHTML("Контекст проекта обновлён.")); return;
-      }
-      if (rest[0] === "reset") { inbox.setProjectContext(contextKey, undefined); await deps.safeReply(ctx, escapeHTML("Контекст проекта очищен.")); return; }
-      if (rest.length === 0) { const projectContext = settings.projectContext ?? "(не задан)"; await deps.safeReply(ctx, `<b>Контекст проекта:</b>\n<pre>${escapeHTML(projectContext)}</pre>`, { fallbackText: `Контекст проекта:\n${projectContext}` }); return; }
-      await deps.safeReply(ctx, escapeHTML(usage), { fallbackText: usage }); return;
-    }
-    if (action === "realm") {
-      if (!settings) { await deps.safeReply(ctx, escapeHTML("Сначала включи этот инбокс: /inbox on [путь]")); return; }
-      const realmName = rest[0];
-      if (realmName === "off") { inbox.setRealm(contextKey, undefined); await deps.safeReply(ctx, escapeHTML("Dofbox realm отключён.")); return; }
-      if (!realmName || rest.length !== 1) { await deps.safeReply(ctx, escapeHTML(usage), { fallbackText: usage }); return; }
-      try {
-        const preview = loadDofboxRealmContext(realmName);
-        inbox.setRealm(contextKey, realmName);
-        await deps.safeReply(ctx, `<b>Dofbox realm:</b> <code>${escapeHTML(realmName)}</code>\n<pre>${escapeHTML(preview)}</pre>`, { fallbackText: `Dofbox realm: ${realmName}\n${preview}` });
-      } catch (error) { const text = `Не удалось загрузить realm ${realmName}: ${friendlyErrorText(error)}`; await deps.safeReply(ctx, escapeHTML(text), { fallbackText: text }); }
-      return;
-    }
-    if (action === "off") { const text = inbox.disable(contextKey) ? "Инбокс выключен, сообщения снова идут в сессию этого топика." : "Этот топик и так не инбокс."; await deps.safeReply(ctx, escapeHTML(text), { fallbackText: text }); return; }
-    if (action === "on") {
-      const workspace = rest.join(" ").trim() || registry.listContexts().find((entry) => entry.contextKey === contextKey)?.workspace || config.workspace;
-      let projectContext = settings?.projectContext;
-      try {
-        const contextFile = (await readFile(path.join(workspace, ".telecodex", "context.md"), "utf8")).trim();
-        if (contextFile && isSafeProjectContext(contextFile)) projectContext = contextFile;
-        else if (contextFile) console.warn("Skipped secret-bearing project context");
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.warn(formatTelegramErrorLog("inbox", error)); }
-      inbox.enable(contextKey, { workspace, launchProfileId: config.defaultLaunchProfileId, template: settings?.template ?? DEFAULT_TICKET_TEMPLATE, iconCustomEmojiId: settings?.iconCustomEmojiId, projectContext, realm: settings?.realm });
-      const html = ["<b>Инбокс включён.</b>", `Проект: <code>${escapeHTML(workspace)}</code>`, `Профиль запуска тикетов: <code>${escapeHTML(config.defaultLaunchProfileId)}</code>`, "", "Пересылай сюда обращения — на каждое заведу отдельный топик."].join("\n");
-      await deps.safeReply(ctx, html, { fallbackText: "Инбокс включён." }); return;
-    }
-    if (action === "status" || action === "") {
-      if (!settings) { const text = `Этот топик не инбокс.\n\n${usage}`; await deps.safeReply(ctx, escapeHTML(text), { fallbackText: text }); return; }
-      const failures = inbox.listFailures(contextKey).slice(0, 3).map(inboxFailureText).join("\n\n");
-      const html = ["<b>Инбокс включён.</b>", `Проект: <code>${escapeHTML(settings.workspace)}</code>`, `Профиль: <code>${escapeHTML(settings.launchProfileId ?? "по умолчанию")}</code>`, failures ? `\nПоследние ошибки (требуют проверки):\n${escapeHTML(failures)}` : ""].filter(Boolean).join("\n");
-      await deps.safeReply(ctx, html, { fallbackText: ["Инбокс включён.", failures].filter(Boolean).join("\n") }); return;
-    }
-    await deps.safeReply(ctx, escapeHTML(usage), { fallbackText: usage });
-  });
-  bot.command("tickets", async (ctx) => {
-    const unresolved = inbox.listUnresolved();
-    if (!unresolved.length) { await deps.safeReply(ctx, escapeHTML("Открытых тикетов нет."), { fallbackText: "Открытых тикетов нет." }); return; }
-    const lines = ["<b>Открытые тикеты</b>"];
-    for (const group of groupTicketsByWorkspace(unresolved)) {
-      lines.push("", `📁 <code>${escapeHTML(group.workspace)}</code>`);
-      for (const ticket of group.tickets) {
-        const chatId = parseContextKey(ticket.inboxContextKey).chatId;
-        const label = escapeHTML(ticketHeading(ticket));
-        const started = ticket.startedAt === undefined ? "" : " · разбор запущен";
-        lines.push(ticket.workTopicId ? `• <a href="${topicUrl(chatId, ticket.workTopicId)}">${label}</a>${started}` : `• ${label}${started}`);
-      }
-    }
-    await deps.safeReply(ctx, lines.join("\n"), { fallbackText: unresolved.map((ticket) => ticketHeading(ticket)).join("\n") });
-  });
-  bot.command("title", async (ctx) => {
-    const chatId = ctx.chat?.id;
-    const threadId = ctx.message?.message_thread_id;
-    const ticket = threadId ? inbox.findTicketByTopic(threadId) : undefined;
-    if (!chatId || !threadId || !ticket) { await deps.safeReply(ctx, escapeHTML("Команда /title работает только внутри топика тикета.")); return; }
-    const requested = (ctx.message?.text ?? "").replace(/^\/title(?:@\w+)?\s*/, "").trim();
-    const extracted = extractTopicRename(`TOPIC: ${requested}\n\n`);
-    if (!extracted) { await deps.safeReply(ctx, escapeHTML("Укажи безопасное непустое название: /title <текст>")); return; }
-    const topicName = renamedTicketTopic(ticket, extracted.title);
-    try {
-      if (deps.renameTopicManually) await deps.renameTopicManually(chatId, threadId, topicName);
-      else await bot.api.editForumTopic(chatId, threadId, { name: topicName });
-    }
-    catch (error) { if (!isTelegramTopicNotModified(error)) throw error; }
-    inbox.setTopicTitle(ticket.id, extracted.title);
-    await deps.onManualTopicTitle?.(chatId, threadId, topicName);
-    const text = `Топик переименован: ${topicName}`;
-    await deps.safeReply(ctx, escapeHTML(text), { fallbackText: text });
-  });
+  return { dispose: async () => { stopping = true; inboxBuffer.dispose(); await Promise.allSettled([...background]); } };
 }

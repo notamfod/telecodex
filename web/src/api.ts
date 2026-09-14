@@ -33,6 +33,8 @@ export function loadDashboard(
     offset: String(query.offset),
     limit: String(query.limit),
   });
+  if (query.search) params.set("search", query.search);
+  if (query.project) params.set("project", query.project);
   return requestJson<DashboardPayload>(`/api/dashboard?${params}`, {
     headers: { "x-telegram-init-data": initData },
     ...(signal ? { signal } : {}),
@@ -46,6 +48,7 @@ export async function loadDashboardWindow(
   count: number,
   fetcher: Fetcher = fetch,
   signal?: AbortSignal,
+  filters: Pick<DashboardQuery, "search" | "project"> = {},
 ): Promise<{ payload: DashboardPayload; nextOffset: number }> {
   const size = Math.max(30, count);
   const rows = new Map<string, DashboardSession>();
@@ -53,7 +56,7 @@ export async function loadDashboardWindow(
   let payload: DashboardPayload;
   do {
     payload = await loadDashboard(initData, {
-      view, offset, limit: Math.min(100, size - offset),
+      ...filters, view, offset, limit: Math.min(100, size - offset),
     }, fetcher, signal);
     for (const row of payload.sessions) rows.set(row.id, row);
     offset += payload.sessions.length;

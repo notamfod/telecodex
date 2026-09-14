@@ -290,7 +290,7 @@ describe("registerInboxHandlers", () => {
     }, vi.fn(async () => undefined));
     await vi.advanceTimersByTimeAsync(2_000);
 
-    expect(removeUnattachedTicket).toHaveBeenCalledWith(12);
+    expect(removeUnattachedTicket).not.toHaveBeenCalled();
     expect(logged).toHaveBeenCalledOnce();
     expect(logged.mock.calls[0]).toHaveLength(1);
     expect(logged.mock.calls[0]![0]).toMatch(/^telegram event=inbox category=/);

@@ -1,10 +1,12 @@
 export type WaitingOn = "approval" | "input";
-export type DashboardView = "active" | "recent" | "attention";
-export type DashboardSessionState = "active" | "recent" | "waiting" | "stalled";
+export type DashboardView = "active" | "recent" | "attention" | "completed";
+export type DashboardSessionState = "active" | "recent" | "waiting" | "stalled" | "queued" | "completed";
 export type ThreadSwipeAction = "codex" | "telegram";
 export type ThreadGestureAxis = "horizontal" | "vertical";
 
 export interface DashboardQuery {
+  search?: string;
+  project?: string;
   view: DashboardView;
   offset: number;
   limit: number;
@@ -13,6 +15,10 @@ export interface DashboardQuery {
 export interface DashboardSession {
   readonly taskLinks?: readonly { label: string; url: string }[];
   taskActions?: readonly { label: string; action: Record<string, unknown> }[];
+  threadId?: string | null;
+  projectId?: string;
+  ticketKey?: string;
+  taskContext?: { stateLabel: string; confirmedAt: number | null; resultStatus: "available" | "pending" | "missing"; resultUrl?: string; waitingLabel?: string };
   id: string;
   label: string;
   workspace: string;
@@ -21,11 +27,13 @@ export interface DashboardSession {
   waitingOn?: WaitingOn;
   timestamp: number;
   telegramUrl?: string;
-  codexUrl: string;
+  codexUrl?: string;
   canCreateTopic: boolean;
 }
 
 export interface DashboardPayload {
+  preferencesNamespace?: string;
+  projects?: readonly { id: string; label: string }[];
   generatedAt: number;
   counts: Record<DashboardView, number>;
   page: DashboardQuery & { total: number; hasMore: boolean };

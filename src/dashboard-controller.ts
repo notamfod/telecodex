@@ -1,3 +1,4 @@
+import type { DashboardTask } from "./dashboard-task-model.js";
 import type { TopicTaskAction } from "./topic-task-actions.js";
 import type { CodexThreadRecord } from "./codex-state.js";
 import {
@@ -12,6 +13,7 @@ import type { StatusSnapshot } from "./status-board.js";
 import type { TelegramStatusAction } from "./telegram-status-projection.js";
 
 export interface DashboardController {
+  readonly boardChatId?: number;
   loadDashboard(query?: DashboardQuery): Promise<DashboardPayload>;
   ensureTopic(threadId: string): Promise<{ created: boolean; url: string }>;
   runTaskAction?(action: TopicTaskAction): Promise<void>;
@@ -19,6 +21,9 @@ export interface DashboardController {
 }
 
 export interface DashboardControllerOptions {
+  loadTasks?(): Promise<readonly DashboardTask[]>;
+  taskRowLinks?(task: DashboardTask): Promise<{ label: string; url: string }[]>;
+  taskRowActions?(task: DashboardTask): Promise<{ action: TopicTaskAction; label: string }[]>;
   taskLinks?(threadId: string): Promise<{ label: string; url: string }[]>;
   taskActions?(threadId: string): Promise<{ action: TopicTaskAction; label: string }[]>;
   runTaskAction?(action: TopicTaskAction): Promise<void>;
@@ -76,16 +81,25 @@ export function createDashboardController(
   options: DashboardControllerOptions,
 ): DashboardController {
   return {
+    boardChatId: options.chatId,
     ...(options.runTaskAction ? { runTaskAction: options.runTaskAction } : {}),
     loadDashboard: async (query = { view: "active", offset: 0, limit: 30 }) => {
-      const [snapshot, statuses] = await Promise.all([
+      const [snapshot, statuses, tasks] = await Promise.all([
         options.collect(),
         options.loadSessionStatuses?.() ?? [],
+        options.loadTasks?.() ?? [],
       ]);
-      const payload = buildDashboardPayload(snapshot, options.chatId, statuses, query);
-      return { ...payload, sessions: await Promise.all(payload.sessions.map(async session => ({ ...session,
-        ...(options.taskActions ? { taskActions: await options.taskActions(session.id) } : {}),
-        ...(options.taskLinks ? { taskLinks: await options.taskLinks(session.id) } : {}) }))) };
+      const payload = buildDashboardPayload(snapshot, options.chatId, statuses, query, tasks);
+      const byId = new Map(tasks.map(task => [`task:${task.taskId}`, task]));
+      return { ...payload, sessions: await Promise.all(payload.sessions.map(async session => {
+        const task = byId.get(session.id);
+        const taskLinks = task ? await options.taskRowLinks?.(task)
+          : session.threadId ? await options.taskLinks?.(session.threadId) : undefined;
+        const taskActions = task ? await options.taskRowActions?.(task)
+          : session.threadId ? await options.taskActions?.(session.threadId) : undefined;
+        return { ...session, ...(taskLinks ? { taskLinks } : {}), ...(taskActions ? { taskActions } : {}) };
+      })) };
+
     },
     ensureTopic: async (threadId) => {
       const thread = options.getThread(threadId);

@@ -3,6 +3,9 @@ import path from "node:path";
 import { listUserThreads as readUserThreads, type CodexThreadRecord } from "./codex-state.js";
 import { contextKeyFromMessage, type TelegramContextKey } from "./context-key.js";
 
+import { telegramRetryAfterMs } from "./telegram-rate-limit.js";
+import { matchesTopicSyncPolicy, type TopicSyncPolicy } from "./topic-sync-policy.js";
+
 const MAX_TOPIC_NAME_LENGTH = 128;
 const TELEGRAM_BOT_TOKEN_PATTERN = /\b\d{6,12}:[A-Za-z0-9_-]{30,}\b/;
 const API_KEY_PATTERN = /\b(?:sk|ghp|github_pat)-?[A-Za-z0-9_-]{16,}\b/i;
@@ -27,6 +30,9 @@ export type TopicSynchronizerOptions = {
   createForumTopic(chatId: number, name: string): Promise<{ message_thread_id: number }>;
   listUserThreads?: () => CodexThreadRecord[];
   logger?: TopicSyncLogger;
+  getPolicy?: () => TopicSyncPolicy;
+  provisionThread?: (thread: CodexThreadRecord) => Promise<"created" | "skipped">;
+  maxCreatesPerSync?: number;
 };
 
 export function threadLabel(thread: CodexThreadRecord): string {
@@ -52,6 +58,8 @@ export class TopicSynchronizer {
   private readonly logger: TopicSyncLogger;
   private timer: NodeJS.Timeout | undefined;
   private running = false;
+  private cooldownUntil = 0;
+  private inFlight = false;
 
   constructor(private readonly options: TopicSynchronizerOptions) {
     this.listUserThreads = options.listUserThreads ?? (() => readUserThreads(1000));
@@ -61,28 +69,47 @@ export class TopicSynchronizer {
   async syncOnce(): Promise<TopicSyncResult> {
     const result: TopicSyncResult = { created: 0, skipped: 0, failed: 0 };
 
-    for (const thread of this.listUserThreads()) {
-      if (this.options.registry.isThreadBoundInChat(thread.id, this.options.chatId)) {
-        result.skipped += 1;
-        continue;
+    if (this.inFlight || Date.now() < this.cooldownUntil) return result;
+    this.inFlight = true;
+    try {
+      for (const thread of this.listUserThreads()) {
+        if (result.created + result.failed >= (this.options.maxCreatesPerSync ?? 10)) break;
+        if (!matchesTopicSyncPolicy(this.options.getPolicy?.() ?? { mode: "all", projects: [] }, thread.cwd)) {
+          result.skipped += 1;
+          continue;
+        }
+        if (this.options.registry.isThreadBoundInChat(thread.id, this.options.chatId)) {
+          result.skipped += 1;
+          continue;
+        }
+
+        try {
+          if (this.options.provisionThread) {
+            result[await this.options.provisionThread(thread)] += 1;
+            continue;
+          }
+          const topic = await this.options.createForumTopic(
+            this.options.chatId,
+            buildTopicName(thread),
+          );
+          const contextKey = contextKeyFromMessage(this.options.chatId, topic.message_thread_id);
+          this.options.registry.bindThread(contextKey, thread);
+          result.created += 1;
+        } catch (error) {
+          result.failed += 1;
+          const message = error instanceof Error ? error.message : String(error);
+          const retryAfterMs = telegramRetryAfterMs(error);
+          if (retryAfterMs !== undefined) {
+            this.cooldownUntil = Date.now() + retryAfterMs;
+            this.logger.warn("Topic sync paused by Telegram rate limit");
+            break;
+          }
+          this.logger.warn(`Failed to create Telegram topic for Codex thread ${thread.id}: ${message}`);
+        }
       }
 
-      try {
-        const topic = await this.options.createForumTopic(
-          this.options.chatId,
-          buildTopicName(thread),
-        );
-        const contextKey = contextKeyFromMessage(this.options.chatId, topic.message_thread_id);
-        this.options.registry.bindThread(contextKey, thread);
-        result.created += 1;
-      } catch (error) {
-        result.failed += 1;
-        const message = error instanceof Error ? error.message : String(error);
-        this.logger.warn(`Failed to create Telegram topic for Codex thread ${thread.id}: ${message}`);
-      }
-    }
-
-    return result;
+      return result;
+    } finally { this.inFlight = false; }
   }
 
   start(): void {

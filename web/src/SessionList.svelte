@@ -1,11 +1,13 @@
 <script lang="ts">
   import { createVirtualizer } from "@tanstack/svelte-virtual";
+  import { onDestroy } from "svelte";
   import { get } from "svelte/store";
   import { Button, InlineLoading } from "carbon-components-svelte";
   import type { DashboardSession, ThreadSwipeAction } from "./model.js";
   import ThreadRow from "./ThreadRow.svelte";
 
   export let onTaskAction: ((action: Record<string, unknown>) => Promise<void>) | undefined = undefined;
+  export let onScroll: () => void = () => {};
   export let sessions: DashboardSession[];
   export let total: number;
   export let hasMore: boolean;
@@ -21,6 +23,12 @@
 
   let viewport: HTMLDivElement | undefined;
   let now = Date.now();
+  let scrollFrame: number | undefined;
+  function persistAfterScroll(): void {
+    if (scrollFrame !== undefined) cancelAnimationFrame(scrollFrame);
+    scrollFrame = requestAnimationFrame(() => { scrollFrame = undefined; onScroll(); });
+  }
+  onDestroy(() => { if (scrollFrame !== undefined) cancelAnimationFrame(scrollFrame); });
 
   const rowVirtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
     count: sessions.length,
@@ -65,7 +73,7 @@
     await loadMore();
   }
 
-  export function captureAnchor(): { ids: string[]; offset: number } | undefined {
+  export function captureAnchor(): { ids: string[]; offset: number; index?: number } | undefined {
     if (!viewport) return;
     const first = get(rowVirtualizer).getVirtualItems().find((item) => item.end > viewport!.scrollTop);
     if (!first) return;
@@ -76,16 +84,18 @@
     }
     return {
       ids,
+      index: first.index,
       offset: viewport.scrollTop - first.start,
     };
   }
 
-  export function restoreAnchor(anchor: { ids: string[]; offset: number }): void {
+  export function restoreAnchor(anchor: { ids: string[]; offset: number; index?: number }): void {
     const indices = new Map(sessions.map((row, index) => [row.id, index]));
     const id = anchor.ids.find((candidate) => indices.has(candidate));
-    if (!id) return;
+    if (!sessions.length) return;
+    const index = id ? indices.get(id)! : Math.min(anchor.index ?? 0, sessions.length - 1);
     const virtualizer = get(rowVirtualizer);
-    const position = virtualizer.getOffsetForIndex(indices.get(id)!, "start");
+    const position = virtualizer.getOffsetForIndex(index, "start");
     if (position) virtualizer.scrollToOffset(position[0] + anchor.offset);
   }
 </script>
@@ -93,6 +103,7 @@
 <div
   class="session-list__viewport"
   bind:this={viewport}
+  on:scroll={persistAfterScroll}
   role="list"
   aria-label="Сессии Codex"
   aria-busy={loadingNext}

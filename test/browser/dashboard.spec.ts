@@ -7,7 +7,7 @@ test("refresh removes a completed session instead of contradicting the count", a
   await expect(page.getByRole("heading", { name: "Открыть топик: Задача 0", exact: true })).toBeVisible();
   data.rows.active = [];
   await page.getByRole("button", { name: "Обновить", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Активные: 0" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "В работе: 0" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Открыть топик: Задача 0", exact: true })).toHaveCount(0);
   await expect(page.getByText("В этом разделе нет сессий")).toBeVisible();
 });
@@ -91,7 +91,7 @@ test("refreshing loaded pages retains a visible session when a preceding row dis
   const before = await row.boundingBox();
   data.rows.active = data.rows.active.slice(1);
   await page.getByRole("button", { name: "Обновить", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Активные: 199" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "В работе: 199" })).toBeVisible();
   await expect(row).toBeVisible();
   const after = await row.boundingBox();
   expect(Math.abs(after!.y - before!.y)).toBeLessThan(3);
@@ -114,7 +114,7 @@ test("pending topic opens once and never navigates after leaving and returning t
   await page.keyboard.press("Enter");
   expect(data.topicRequests).toBe(1);
   await page.getByRole("button", { name: "Недавние: 0" }).click();
-  await page.getByRole("button", { name: "Активные: 1" }).click();
+  await page.getByRole("button", { name: "В работе: 1" }).click();
   await expect(title).toBeDisabled();
   finish();
   await expect(title).toBeEnabled();
@@ -190,7 +190,7 @@ test("if an anchor and following rows disappear the nearest preceding row is kep
   expect(anchor.index).toBeGreaterThan(0);
   data.rows.active = data.rows.active.filter((_, i) => i < anchor.index || i > anchor.index + 20);
   await page.getByRole("button", { name: "Обновить", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Активные: 179" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "В работе: 179" })).toBeVisible();
   const previous = page.getByRole("button", { name: `Открыть топик: Задача ${anchor.index - 1}`, exact: true });
   await expect(previous).toBeVisible();
   const row = previous.locator("xpath=ancestor::div[contains(@class,'session-list__row')]");

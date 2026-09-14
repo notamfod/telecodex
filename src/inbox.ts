@@ -1,3 +1,5 @@
+import { TaskProvisioningService, TaskProvisioningStore } from "./task-provisioning.js";
+
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import path from "node:path";
@@ -355,6 +357,11 @@ export class BurstBuffer<T> {
     });
   }
 
+  dispose(): void {
+    for (const burst of this.bursts.values()) clearTimeout(burst.timer);
+    this.bursts.clear();
+  }
+
   private flush(key: string): void {
     const burst = this.bursts.get(key);
     if (!burst) {
@@ -414,6 +421,12 @@ export class InboxStore {
 
   constructor(private readonly filePath: string) {
     this.load();
+  }
+
+  private provisioningService?: TaskProvisioningService;
+
+  getProvisioningService(): TaskProvisioningService {
+    return this.provisioningService ??= new TaskProvisioningService(new TaskProvisioningStore(`${this.filePath}.provisioning.sqlite`));
   }
 
   get(contextKey: string): InboxSettings | undefined {
@@ -489,7 +502,7 @@ export class InboxStore {
     const ticket: Ticket = { ...input, id: this.data.nextTicketId, createdAt: now };
     this.data.nextTicketId += 1;
     this.data.tickets[String(ticket.id)] = ticket;
-    this.save();
+    if (!this.save()) { delete this.data.tickets[String(ticket.id)]; this.data.nextTicketId -= 1; throw new Error("Inbox ticket persistence failed"); }
     return ticket;
   }
 
@@ -499,8 +512,9 @@ export class InboxStore {
     if (!ticket) {
       return;
     }
+    const previous = ticket.workTopicId;
     ticket.workTopicId = workTopicId;
-    this.save();
+    if (!this.save()) { ticket.workTopicId = previous; throw new Error("Inbox binding persistence failed"); }
   }
 
   removeUnattachedTicket(id: number): boolean {
@@ -521,12 +535,14 @@ export class InboxStore {
     if (!ticket) {
       return undefined;
     }
+    if (ticket.workTopicId === input.workTopicId) return structuredClone(ticket);
+    const previous = structuredClone(ticket);
     ticket.workTopicId = input.workTopicId;
     ticket.prompt = [ticket.prompt, "", "--- продолжение обращения ---", input.prompt].join("\n");
     ticket.source = input.source;
     delete ticket.startedAt;
     delete ticket.resolvedAt;
-    this.save();
+    if (!this.save()) { this.data.tickets[String(id)] = previous; throw new Error("Inbox continuation persistence failed"); }
     return structuredClone(ticket);
   }
 

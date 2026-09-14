@@ -12,11 +12,12 @@ export function session(index: number, state: DashboardSession["state"] = "activ
 
 export async function dashboardFixture(page: Page, theme: "light" | "dark" = "dark") {
   const state = {
-    rows: { active: [session(0)], recent: [] as DashboardSession[], attention: [] as DashboardSession[] },
-    requests: [] as { view: string; offset: number; limit: number }[],
+    namespace: "telecodex:tasks:v1:1:123",
+    rows: { completed: [] as DashboardSession[], active: [session(0)], recent: [] as DashboardSession[], attention: [] as DashboardSession[] },
+    requests: [] as { view: string; offset: number; limit: number; search?: string; project?: string }[],
     topicRequests: 0,
     respondTopic: undefined as undefined | ((route: Route) => Promise<void>),
-    respond: undefined as undefined | ((route: Route, query: { view: string; offset: number; limit: number }) => Promise<boolean>),
+    respond: undefined as undefined | ((route: Route, query: { view: string; offset: number; limit: number; search?: string; project?: string }) => Promise<boolean>),
   };
   await page.route("**/telegram-web-app.js", (route) => route.fulfill({
     contentType: "application/javascript",
@@ -30,14 +31,18 @@ export async function dashboardFixture(page: Page, theme: "light" | "dark" = "da
     const url = new URL(route.request().url());
     if (url.pathname === "/api/dashboard") {
       const query = {
+        ...(url.searchParams.has("search") ? { search: url.searchParams.get("search")! } : {}),
+        ...(url.searchParams.has("project") ? { project: url.searchParams.get("project")! } : {}),
         view: url.searchParams.get("view") ?? "active",
         offset: Number(url.searchParams.get("offset")),
         limit: Number(url.searchParams.get("limit")),
       };
       state.requests.push(query);
       if (await state.respond?.(route, query)) return;
-      const rows = state.rows[query.view as DashboardView];
+      const rows = state.rows[query.view as DashboardView].filter(row => (!query.search || row.label.toLowerCase().includes(query.search.toLowerCase())) && (!query.project || row.projectId === query.project));
       await route.fulfill({ json: {
+        preferencesNamespace: state.namespace,
+        projects: [...new Map(Object.values(state.rows).flat().filter(row => row.projectId).map(row => [row.projectId, { id: row.projectId, label: row.workspace }])).values()],
         generatedAt: Date.now(),
         counts: Object.fromEntries(Object.entries(state.rows).map(([key, value]) => [key, value.length])),
         page: { ...query, total: rows.length, hasMore: query.offset + query.limit < rows.length },

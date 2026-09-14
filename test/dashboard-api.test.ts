@@ -63,7 +63,7 @@ describe("buildDashboardPayload", () => {
       recentThreadCount: 1,
     }), CHAT_ID, statuses([]), { view: "active", offset: 0, limit: 30 });
 
-    expect(payload.counts).toEqual({ active: 1, recent: 1, attention: 1 });
+    expect(payload.counts).toEqual({ active: 1, recent: 1, attention: 1, completed: 0 });
     expect(payload.page).toEqual({ view: "active", offset: 0, limit: 30, total: 1, hasMore: false });
     expect(payload.sessions).toEqual([expect.objectContaining({
       id: ACTIVE_ID,
@@ -96,7 +96,7 @@ describe("buildDashboardPayload", () => {
       state: "stalled",
       waitingOn: "approval",
     })]);
-    expect(payload.counts).toEqual({ active: 0, recent: 0, attention: 1 });
+    expect(payload.counts).toEqual({ active: 0, recent: 0, attention: 1, completed: 0 });
   });
 
   it("sorts recent sessions newest first and paginates after classification", () => {

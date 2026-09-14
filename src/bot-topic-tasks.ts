@@ -118,6 +118,17 @@ export function createBotTopicTasks(options: Options) {
     await getService()?.update(key(destination), { title: safeTaskText(title), titleSource: "manual" });
   };
   return {
+    registerTask(destination: TaskDestination, title: string): void {
+      if (!eligible(destination)) return;
+      const metadata = options.metadata(destination) ?? { workspace: options.workspace, threadId: null };
+      getService(true)!.store.ensure({ ...destination, ...metadata, title: safeTaskText(title) });
+    },
+    dashboardTasks(): import("./dashboard-task-model.js").DashboardTask[] {
+      return (getService()?.store.list() ?? []).filter(eligible).map(task => {
+        const ticketKey = options.metadata(task)?.ticketKey;
+        return { ...task, ...(ticketKey ? { ticketKey } : {}) };
+      });
+    },
     canAcceptTaskWork(destination: TaskDestination): boolean {
       const store = getService()?.store;
       const task = store?.get(key(destination));

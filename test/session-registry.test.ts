@@ -116,6 +116,34 @@ vi.mock("../src/codex-session.js", () => ({
 import { SessionRegistry } from "../src/session-registry.js";
 
 describe("SessionRegistry", () => {
+  it("preserves removed topic bindings for automatic sync across restart", () => {
+    const registry = new SessionRegistry(createConfig());
+    registry.bindThread("-100123:42", { id: "deleted-topic-thread", cwd: "/project", title: "old", firstUserMessage: "", createdAt: new Date(), updatedAt: new Date(), model: null });
+    registry.remove("-100123:42");
+    expect(registry.listContexts()).toEqual([]);
+    expect(registry.isThreadBoundInChat("deleted-topic-thread", -100123)).toBe(true);
+    const restored = new SessionRegistry(createConfig());
+    expect(restored.isThreadBoundInChat("deleted-topic-thread", -100123)).toBe(true);
+    expect(restored.isThreadBoundInChat("deleted-topic-thread", -100999)).toBe(false);
+  });
+
+  it("durably stores context defaults and rolls back a failed replacement", () => {
+    const registry = new SessionRegistry(createConfig());
+    registry.setContextDefaultsDurably("-100123:42", { workspace: "/first" });
+    mockFsState.failNextRename(new Error("disk unavailable"));
+    expect(() => registry.setContextDefaultsDurably("-100123:42", { workspace: "/second" })).toThrow("disk unavailable");
+    expect(registry.listContexts()[0].workspace).toBe("/first");
+    expect(new SessionRegistry(createConfig()).listContexts()[0].workspace).toBe("/first");
+  });
+
+  it("does not expose a thread binding when durable replacement fails", () => {
+    const registry = new SessionRegistry(createConfig());
+    mockFsState.failNextRename(new Error("disk full"));
+    expect(() => registry.bindThreadDurably("-100123:42", { id: "fresh", cwd: "/project", title: "old", firstUserMessage: "", createdAt: new Date(), updatedAt: new Date(), model: null })).toThrow("disk full");
+    expect(registry.isThreadBoundInChat("fresh", -100123)).toBe(false);
+    expect(new SessionRegistry(createConfig()).isThreadBoundInChat("fresh", -100123)).toBe(false);
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
   });

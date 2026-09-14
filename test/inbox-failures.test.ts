@@ -38,18 +38,21 @@ function harness() {
   const deliver = (id: number, attachment = false, text = "A support request") => message({ chat: { id: -1001 }, message: {
     photo: attachment ? [{}] : undefined, message_id: id, message_thread_id: 7, text,
   } }, vi.fn());
-  return { file, inbox, commands, callbacks, createForumTopic, sendText, safeReply, deliver };
+  return { file, inbox, commands, callbacks, createForumTopic, sendText, safeReply, deliver,
+    decision: (kind: "batch" | "duplicate") => inbox.getProvisioningService().store.listPending().find(([id]) => id.startsWith(`${kind}:`))![0].split(":")[1],
+  };
 }
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })); });
 
 describe("Inbox asynchronous failure feedback", () => {
-  it("persists source references without raw errors or phantom tickets and does not retry uncertain creation", async () => {
+  it("persists source references without raw errors and retains its pending ticket and does not retry uncertain creation", async () => {
     const h = harness();
     await h.deliver(77);
     await vi.advanceTimersByTimeAsync(2_000);
     const reloaded = new InboxStore(h.file);
-    expect(reloaded.listUnresolved()).toEqual([]);
+    expect(reloaded.listUnresolved()).toEqual([expect.objectContaining({ id: 1, workTopicId: 0 })]);
+    expect(h.inbox.getProvisioningService().store.list()[0]).toMatchObject({ state: "unknown", metadata: { ticketId: 1 }, sourceMessageIds: [77] });
     expect(JSON.parse(readFileSync(h.file, "utf8")).failures).toEqual([expect.objectContaining({
       contextKey: "-1001:7", messageIds: [77], outcome: "creation_unknown", category: "acceptance_unknown",
     })]);
@@ -102,29 +105,36 @@ describe("Inbox asynchronous failure feedback", () => {
     expect(h.createForumTopic).not.toHaveBeenCalled();
   });
 
-  it.each(["answerCallbackQuery", "editMessageText"])("retains batch sources if %s fails before creation", async (method) => {
+  it.each(["answerCallbackQuery", "editMessageText"])("retains batch sources and executes the durable choice once if %s fails", async (method) => {
     const h = harness();
     await h.deliver(84); await h.deliver(85);
     await vi.advanceTimersByTimeAsync(2_000);
-    const ctx = { match: ["", "1", "each"], answerCallbackQuery: vi.fn(), editMessageText: vi.fn() };
+    const ctx = { match: ["", h.decision("batch"), "each"], chat: { id: -1001 }, callbackQuery: { message: { message_thread_id: 7 } }, answerCallbackQuery: vi.fn(), editMessageText: vi.fn() };
     ctx[method as "answerCallbackQuery" | "editMessageText"].mockRejectedValue(new Error("callback SECRET_PAYLOAD"));
-    await expect(h.callbacks.get("^inbox_batch:(\\d+):(one|each|cancel)$")!(ctx)).resolves.toBeUndefined();
-    expect(new InboxStore(h.file).listFailures("-1001:7")[0]).toMatchObject({ messageIds: [84, 85], outcome: "processing_failed" });
-    expect(h.createForumTopic).not.toHaveBeenCalled();
+    const run = h.callbacks.get("^inbox_batch:(\\d+):(one|each|cancel)$")!(ctx);
+    await vi.advanceTimersByTimeAsync(3_000);
+    await expect(run).resolves.toBeUndefined();
+    expect(new InboxStore(h.file).listFailures("-1001:7")).toEqual(expect.arrayContaining([expect.objectContaining({ messageIds: [84, 85], outcome: "processing_failed" })]));
+    expect(h.createForumTopic).toHaveBeenCalledTimes(2);
+    expect(h.inbox.getProvisioningService().store.list().map(record => record.state)).toEqual(["unknown", "unknown"]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.createForumTopic).toHaveBeenCalledTimes(2);
     expect(h.sendText.mock.calls.at(-1)![1]).not.toContain("SECRET_PAYLOAD");
   });
 
-  it("retains duplicate source if answering its callback fails before creation", async () => {
+  it("retains duplicate source and executes its durable choice once if acknowledgement fails", async () => {
     const h = harness();
     h.inbox.createTicket({ inboxContextKey: "-1001:7", externalKey: "MIR-123", workTopicId: 0,
       workspace: "/work", prompt: "Investigate", source: "telegram" });
     await h.deliver(86, false, "MIR-123 repeated request");
     await vi.advanceTimersByTimeAsync(2_000);
     await expect(h.callbacks.get("^ticket_dup:(\\d+):(reuse|new)$")!({
-      match: ["", "1", "reuse"], answerCallbackQuery: vi.fn().mockRejectedValue(new Error("callback SECRET_PAYLOAD")),
+      match: ["", h.decision("duplicate"), "reuse"], chat: { id: -1001 }, callbackQuery: { message: { message_thread_id: 7 } }, editMessageReplyMarkup: vi.fn().mockResolvedValue(undefined), answerCallbackQuery: vi.fn().mockRejectedValue(new Error("callback SECRET_PAYLOAD")),
     })).resolves.toBeUndefined();
-    expect(new InboxStore(h.file).listFailures("-1001:7")[0]).toMatchObject({ messageIds: [86], outcome: "processing_failed" });
-    expect(h.createForumTopic).not.toHaveBeenCalled();
+    expect(new InboxStore(h.file).listFailures("-1001:7")).toEqual(expect.arrayContaining([expect.objectContaining({ messageIds: [86], outcome: "processing_failed" }), expect.objectContaining({ messageIds: [86], outcome: "creation_unknown" })]));
+    expect(h.createForumTopic).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.createForumTopic).toHaveBeenCalledOnce();
   });
 
   it("retains both sequential batch failures and does not retry either create", async () => {
@@ -132,7 +142,7 @@ describe("Inbox asynchronous failure feedback", () => {
     await h.deliver(80); await h.deliver(81);
     await vi.advanceTimersByTimeAsync(2_000);
     const run = h.callbacks.get("^inbox_batch:(\\d+):(one|each|cancel)$")!({
-      match: ["", "1", "each"], answerCallbackQuery: vi.fn(), editMessageText: vi.fn(),
+      match: ["", h.decision("batch"), "each"], chat: { id: -1001 }, callbackQuery: { message: { message_thread_id: 7 } }, answerCallbackQuery: vi.fn(), editMessageText: vi.fn(),
     });
     await vi.advanceTimersByTimeAsync(3_000); await run;
     expect(h.inbox.listFailures("-1001:7").map(f => f.messageIds)).toEqual([[81], [80]]);

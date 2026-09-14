@@ -242,3 +242,14 @@ function reliabilityWithAction(action: TelegramStatusAction) {
     telegram: { deliveryHealth: "healthy" as const, reasonCode: null },
   };
 }
+it("decorates duplicate task bindings using exact task context and never task IDs as thread IDs", async () => {
+  const tasks = [1, 2].map(i => ({ taskId: `task-${i}`, chatId: -100123, messageThreadId: i + 10, threadId: THREAD_ID, title: 'Persisted', workspace: '/work/project', agentState: 'running', lifecycle: 'open', lastEventAt: NOW, updatedAt: NOW }));
+  const taskLinks = vi.fn(async () => []);
+  const taskRowLinks = vi.fn(async task => [{ label: 'Topic', url: `https://t.me/c/123/${task.messageThreadId}` }]);
+  const ensure = vi.fn();
+  const controller = createDashboardController({ chatId: -100123, collect: async () => emptySnapshot, loadTasks: async () => tasks as never, taskLinks, taskRowLinks, getThread: () => undefined, ensureThreadTopic: ensure });
+  const result = await controller.loadDashboard();
+  expect(result.sessions).toHaveLength(2);
+  expect(taskRowLinks.mock.calls.map(([task]) => task.messageThreadId)).toEqual([11, 12]);
+  expect(taskLinks).not.toHaveBeenCalled(); expect(ensure).not.toHaveBeenCalled();
+});

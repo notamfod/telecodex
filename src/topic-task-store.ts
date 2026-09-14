@@ -211,8 +211,12 @@ export class TopicTaskStore {
     }).immediate();
   }
 
+  list(): TopicTaskRecord[] {
+    return (this.database.prepare("SELECT context_key, version, payload FROM topic_tasks ORDER BY context_key").all() as Row[]).map(decode);
+  }
+
   listEnabled(): TopicTaskRecord[] {
-    return (this.database.prepare("SELECT context_key, version, payload FROM topic_tasks ORDER BY context_key").all() as Row[]).map(decode).filter((task) => task.enabled);
+    return this.list().filter(task => task.enabled);
   }
 
   getLifecycleIntent(contextKey: string): TopicTaskLifecycleIntent | null {

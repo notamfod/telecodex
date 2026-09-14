@@ -30,6 +30,8 @@ export class SessionRegistry {
   private readonly sessionCreations = new Map<TelegramContextKey, Promise<CodexSessionService>>();
   private readonly metadata = new Map<TelegramContextKey, ContextMetadata>();
   private readonly persistPath: string;
+  private readonly syncTombstones = new Set<string>();
+  private readonly syncTombstonesPath: string;
   private readonly sessionDependencies: CodexSessionDependencies;
   private onRemoveCallback?: (contextKey: TelegramContextKey) => void;
 
@@ -38,6 +40,12 @@ export class SessionRegistry {
     sessionDependencies?: CodexSessionDependencies,
   ) {
     this.persistPath = path.join(config.workspace, ".telecodex", "contexts.json");
+    this.syncTombstonesPath = path.join(config.workspace, ".telecodex", "topic-sync-tombstones.json");
+    if (existsSync(this.syncTombstonesPath)) {
+      const values: unknown = JSON.parse(readFileSync(this.syncTombstonesPath, "utf8"));
+      if (!Array.isArray(values) || values.some(value => typeof value !== "string" || !/^-?\d+:.+$/u.test(value))) throw new Error("Invalid topic sync tombstones");
+      for (const value of values) this.syncTombstones.add(value);
+    }
     this.sessionDependencies = sessionDependencies ?? createCodexSessionDependencies(
       config.telegramMaxActiveTopics,
       config.reliabilityTimeouts,
@@ -138,6 +146,7 @@ export class SessionRegistry {
   }
 
   isThreadBoundInChat(threadId: string, chatId: number): boolean {
+    if (this.syncTombstones.has(`${chatId}:${threadId}`)) return true;
     return [...this.metadata.values()].some((entry) => {
       const context = parseContextKey(entry.contextKey);
       return (
@@ -169,6 +178,38 @@ export class SessionRegistry {
       updatedAt: Date.now(),
     });
     this.persistMetadata();
+  }
+
+  /** Persist provisioning defaults before exposing a context to the runtime. */
+  setContextDefaultsDurably(
+    contextKey: TelegramContextKey,
+    defaults: { workspace: string; launchProfileId?: string; topicName?: string },
+  ): void {
+    const cached = this.sessions.get(contextKey);
+    if (cached && (cached.getInfo().threadId || cached.isProcessing())) throw new Error("Cannot change defaults for an active Codex thread");
+    if (defaults.launchProfileId && !findLaunchProfile(this.config.launchProfiles, defaults.launchProfileId)) throw new Error("Unknown launch profile");
+    const previous = this.metadata.get(contextKey);
+    this.metadata.set(contextKey, {
+      contextKey, threadId: null, ...defaults, updatedAt: Date.now(),
+    });
+    try { this.persistMetadataReplaceSafe(); }
+    catch (error) {
+      if (previous) this.metadata.set(contextKey, previous);
+      else this.metadata.delete(contextKey);
+      throw error;
+    }
+    this.sessions.get(contextKey)?.applyDeferredDefaults(defaults);
+  }
+
+  bindThreadDurably(contextKey: TelegramContextKey, thread: CodexThreadRecord): void {
+    const previous = this.metadata.get(contextKey);
+    this.metadata.set(contextKey, this.threadMetadata(contextKey, thread));
+    try { this.persistMetadataReplaceSafe(); }
+    catch (error) {
+      if (previous) this.metadata.set(contextKey, previous);
+      else this.metadata.delete(contextKey);
+      throw error;
+    }
   }
 
   bindThread(contextKey: TelegramContextKey, thread: CodexThreadRecord): void {
@@ -216,6 +257,17 @@ export class SessionRegistry {
   }
 
   remove(contextKey: TelegramContextKey): void {
+    const entry = this.metadata.get(contextKey);
+    const context = parseContextKey(contextKey);
+    if (entry?.threadId && context.messageThreadId !== undefined) {
+      const key = `${context.chatId}:${entry.threadId}`;
+      const next = new Set([...this.syncTombstones, key]);
+      mkdirSync(path.dirname(this.syncTombstonesPath), { recursive: true });
+      const temporary = `${this.syncTombstonesPath}.${randomUUID()}.tmp`;
+      writeFileSync(temporary, JSON.stringify([...next]), { mode: 0o600 });
+      renameSync(temporary, this.syncTombstonesPath);
+      this.syncTombstones.add(key);
+    }
     const session = this.sessions.get(contextKey);
     session?.dispose();
     this.sessions.delete(contextKey);

@@ -36,6 +36,8 @@ describe("loadConfig", () => {
     delete process.env.ENABLE_TELEGRAM_REACTIONS;
     delete process.env.TELEGRAM_FORUM_CHAT_ID;
     delete process.env.TOPIC_SYNC_INTERVAL_SECONDS;
+    delete process.env.TOPIC_SYNC_MODE;
+    delete process.env.TOPIC_SYNC_PROJECTS;
     delete process.env.TELEGRAM_MAX_ACTIVE_TOPICS;
     delete process.env.TELEGRAM_PROGRESS_HEARTBEAT_SECONDS;
     delete process.env.TELEGRAM_TOPIC_RECOVERY_ENABLED;
@@ -73,6 +75,18 @@ describe("loadConfig", () => {
     rmSync(tempDir, { recursive: true, force: true });
     process.env = originalEnv;
     vi.restoreAllMocks();
+  });
+
+  it("validates explicit selected project roots and preserves legacy defaults", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    expect(loadConfig().topicSyncPolicy).toEqual({ mode: "onrequest", projects: [] });
+    process.env.TOPIC_SYNC_MODE = "selectedprojects";
+    expect(() => loadConfig()).toThrow();
+    process.env.TOPIC_SYNC_PROJECTS = "/srv/a/;/srv/b";
+    expect(loadConfig().topicSyncPolicy).toEqual({ mode: "selectedprojects", projects: ["/srv/a", "/srv/b"] });
+    process.env.TOPIC_SYNC_MODE = "typo";
+    expect(() => loadConfig()).toThrow();
   });
 
   it("throws when TELEGRAM_BOT_TOKEN is missing", () => {
@@ -160,6 +174,7 @@ describe("loadConfig", () => {
       telegramForumChatId: -1001234567890,
       topicSyncIntervalMs: 15_000,
       topicSyncEnabled: true,
+      topicSyncPolicy: { mode: "all", projects: [] },
       telegramMaxActiveTopics: 4,
       telegramProgressHeartbeatMs: 120_000,
       statusBoardIntervalMs: 5_000,

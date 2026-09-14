@@ -7,6 +7,7 @@ export type TeleCodexCleanupStep =
   | "retention-runtime"
   | "reliability-runtime"
   | "background-write-gate"
+  | "task-provisioning"
   | "task-cards"
   | "sqlite-job-store"
   | "session-registry";
@@ -19,6 +20,7 @@ export interface TeleCodexLifecycleResources {
   retentionRuntime?: { dispose(): Promise<void> };
   reliabilityRuntime?: { dispose(): Promise<void> };
   backgroundWriteGate?: { dispose(): void };
+  taskProvisioning?: { dispose(): Promise<void> };
   taskCards?: { dispose(): Promise<void> };
   sqliteJobStore?: { close(): void };
   registry?: { disposeAll(): void };
@@ -125,6 +127,8 @@ export function createTeleCodexLifecycle(
       "retention-runtime",
       resources.retentionRuntime?.dispose.bind(resources.retentionRuntime),
     );
+
+    await runAsync("task-provisioning", resources.taskProvisioning?.dispose.bind(resources.taskProvisioning));
 
     let reliabilityDrain: Promise<void> | undefined;
     if (resources.reliabilityRuntime) {

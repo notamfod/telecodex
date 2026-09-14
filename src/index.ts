@@ -1,3 +1,6 @@
+import { TelegramBackgroundWriteGateAdmissionCancelledError } from "./telegram-background-write-gate.js";
+import { provisionSyncedTopic } from "./topic-sync-provisioning.js";
+import { matchesTopicSyncPolicy, TopicSyncPolicyStore } from "./topic-sync-policy.js";
 import path from "node:path";
 
 import { createBot, registerCommands } from "./bot.js";
@@ -94,6 +97,7 @@ const lifecycle = createTeleCodexLifecycle({
     retentionRuntime,
     reliabilityRuntime,
     backgroundWriteGate,
+    taskProvisioning: bot?.disposeTaskProvisioning ? { dispose: () => bot!.disposeTaskProvisioning!() } : undefined,
     taskCards: bot?.taskCards,
     sqliteJobStore,
     registry,
@@ -161,7 +165,11 @@ try {
     windowMs: 60_000,
     burst: 3,
   });
-  bot = createBot(config, registry, reliabilityFacade, { backgroundWriteGate });
+  const topicSyncPolicy = new TopicSyncPolicyStore(
+    path.join(config.workspace, ".telecodex", "topic-sync-policy.json"),
+    config.topicSyncPolicy ?? { mode: config.topicSyncEnabled ? "all" : "onrequest", projects: [] },
+  );
+  bot = createBot(config, registry, reliabilityFacade, { backgroundWriteGate, topicSyncPolicy });
   if (canonical) {
     const canonicalJobStore = requireSqliteJobStore();
     const materializationRoot = path.join(config.workspace, ".telecodex", "materialized");
@@ -304,16 +312,24 @@ try {
     }
   }
   console.log("Session mode: per Telegram context");
-  if (config.telegramForumChatId && config.topicSyncEnabled) {
+  if (config.telegramForumChatId) {
     topicSynchronizer = new TopicSynchronizer({
       chatId: config.telegramForumChatId,
       intervalMs: config.topicSyncIntervalMs ?? 30_000,
       registry,
-      createForumTopic: (chatId, name) => bot!.api.createForumTopic(chatId, name),
+      getPolicy: () => topicSyncPolicy.get(),
+      provisionThread: thread => provisionSyncedTopic(bot!.getTaskProvisioning!(), config.telegramForumChatId!, thread,
+        (chatId, name) => backgroundWriteGate!.run(chatId, "ordinary", () => {
+          if (!matchesTopicSyncPolicy(topicSyncPolicy.get(), thread.cwd)) throw new TelegramBackgroundWriteGateAdmissionCancelledError();
+          return bot!.api.createForumTopic(chatId, name, {}, AbortSignal.timeout(15_000) as never);
+        }, AbortSignal.timeout(15_000)),
+        (contextKey, value) => registry!.bindThreadDurably(contextKey, value)),
+      createForumTopic: (chatId, name) => backgroundWriteGate!.run(chatId, "ordinary",
+        () => bot!.api.createForumTopic(chatId, name)),
     });
     topicSynchronizer.start();
     console.log(
-      `Topic sync: enabled for ${config.telegramForumChatId} every ${(config.topicSyncIntervalMs ?? 30_000) / 1000}s`,
+      `Topic sync: ${topicSyncPolicy.get().mode} for ${config.telegramForumChatId} every ${(config.topicSyncIntervalMs ?? 30_000) / 1000}s`,
     );
   }
 

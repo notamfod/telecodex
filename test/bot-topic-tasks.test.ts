@@ -136,3 +136,40 @@ it("keeps callback handles stable and skips identical keyboard writes", async ()
  expect((await tasks.actions({ chatId: -100123, messageThreadId: 5 })).map(action => action.kind)).toEqual(["reopen"]);
  expect(api.editMessageReplyMarkup).toHaveBeenCalledTimes(first + 1);
 });
+it("lists existing off tasks for Dashboard without creating or delivering anything", async () => {
+ const { tasks, ctx, api, workspace } = harness();
+ expect(tasks.dashboardTasks()).toEqual([]);
+ expect(existsSync(path.join(workspace, ".telecodex", "topic-tasks.sqlite"))).toBe(false);
+ await tasks.command(ctx);
+ await tasks.command({ ...ctx as object, message: { message_thread_id: 5, text: "/task off" } } as never);
+ for (const call of Object.values(api)) call.mockClear();
+ expect(tasks.dashboardTasks()).toEqual([expect.objectContaining({ enabled: false, chatId: -100123 })]);
+ for (const call of Object.values(api)) expect(call).not.toHaveBeenCalled();
+});
+it("filters stored service and foreign-chat tasks and reads ticket metadata without activating tasks", async () => {
+ const { workspace, api } = harness();
+ const { TopicTaskStore } = await import("../src/topic-task-store.js");
+ const store = new TopicTaskStore(path.join(workspace, ".telecodex", "topic-tasks.sqlite"));
+ for (const [chatId, messageThreadId] of [[-100123, 5], [-100123, 6], [-100999, 5]]) {
+  store.ensure({ chatId, messageThreadId, title: "Persisted", workspace });
+ }
+ store.close();
+ const tasks = createBotTopicTasks({ api: api as never, workspace, forumChatId: -100123,
+  metadata: () => ({ workspace, threadId: null, ticketKey: "MIR-123" }),
+  isExcluded: destination => destination.messageThreadId === 6, report: vi.fn() });
+ try {
+  expect(tasks.dashboardTasks()).toEqual([expect.objectContaining({ chatId: -100123, messageThreadId: 5, ticketKey: "MIR-123" })]);
+  for (const call of Object.values(api)) expect(call).not.toHaveBeenCalled();
+ } finally { await tasks.dispose(); }
+});
+
+it("registers an explicitly created task without an implicit Telegram send", async () => {
+  const { tasks, api } = harness();
+  const destination = { chatId: -100123, messageThreadId: 55 };
+  tasks.registerTask(destination, "Новая работа");
+  tasks.registerTask(destination, "Повтор");
+  const rows = await tasks.dashboardTasks();
+  expect(rows.filter(row => row.messageThreadId === 55)).toHaveLength(1);
+  expect(rows.find(row => row.messageThreadId === 55)?.title).toBe("Новая работа");
+  expect(api.sendMessage).not.toHaveBeenCalled();
+});

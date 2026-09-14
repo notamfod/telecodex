@@ -124,6 +124,7 @@ export interface MiniAppTopicResult {
 }
 
 export interface MiniAppServerOptions {
+  boardChatId?: number;
   host: string;
   port: number;
   staticDir: string;
@@ -206,15 +207,22 @@ async function handleRequest(
     return;
   }
   if (url.pathname === "/api/dashboard" && request.method === "GET") {
-    authenticate(request, options);
+    const authenticated = authenticate(request, options);
+    const search = dashboardFilter(url.searchParams, "search");
+    const project = dashboardFilter(url.searchParams, "project");
     const rawView = url.searchParams.get("view") ?? "active";
     if (!isDashboardView(rawView)) throw httpError(400, "Invalid view");
     const query: DashboardQuery = {
+      ...(search ? { search } : {}),
+      ...(project ? { project } : {}),
       view: rawView,
       offset: boundedQueryInteger(url.searchParams, "offset", 0, 0, 1_000_000),
       limit: boundedQueryInteger(url.searchParams, "limit", 30, 1, 100),
     };
-    sendJson(response, 200, await options.loadDashboard(query));
+    const payload = await options.loadDashboard(query);
+    sendJson(response, 200, { ...(payload as object),
+      ...(Number.isSafeInteger(options.boardChatId) && options.boardChatId !== 0
+        ? { preferencesNamespace: `telecodex:tasks:v1:${authenticated.user.id}:${options.boardChatId}` } : {}) });
     return;
   }
 
@@ -431,11 +439,11 @@ function parseJobAction(
   };
 }
 
-function authenticate(request: IncomingMessage, options: MiniAppServerOptions): void {
+function authenticate(request: IncomingMessage, options: MiniAppServerOptions): ReturnType<typeof validateTelegramInitData> {
   const header = request.headers["x-telegram-init-data"];
   const initData = Array.isArray(header) ? header[0] : header;
   try {
-    validateTelegramInitData(initData ?? "", {
+    return validateTelegramInitData(initData ?? "", {
       botToken: options.botToken,
       allowedUserIds: options.allowedUserIds,
       maxAgeSeconds: options.authMaxAgeSeconds,
@@ -543,5 +551,15 @@ function boundedQueryInteger(
 }
 
 function isDashboardView(value: string): value is DashboardView {
-  return value === "active" || value === "recent" || value === "attention";
+  return value === "active" || value === "recent" || value === "attention" || value === "completed";
+}
+
+function dashboardFilter(params: URLSearchParams, name: "search" | "project"): string | undefined {
+  const values = params.getAll(name);
+  if (values.length > 1) throw httpError(400, `Invalid ${name}`);
+  const raw = values[0] ?? "";
+  if (raw.length > 160 || /[\u0000-\u001f\u007f-\u009f]/u.test(raw)) throw httpError(400, `Invalid ${name}`);
+  const value = raw.trim();
+  if (name === "project" && value && !/^project:[a-f0-9]{24}$/u.test(value)) throw httpError(400, "Invalid project");
+  return value || undefined;
 }

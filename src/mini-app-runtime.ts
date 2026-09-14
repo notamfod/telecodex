@@ -99,6 +99,7 @@ export function startConfiguredMiniApp(
   start: MiniAppStarter = startMiniAppServer,
 ): Promise<RunningMiniAppServer> {
   return start({
+    boardChatId: options.dashboard.boardChatId,
     host: options.config.host,
     port: options.config.port,
     staticDir: options.config.staticDir,

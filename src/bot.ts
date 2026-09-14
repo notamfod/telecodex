@@ -1,3 +1,8 @@
+import { isSyncedTopicAttemptBlocked } from "./topic-sync-provisioning.js";
+import { TaskProvisioningService, TaskProvisioningStore } from "./task-provisioning.js";
+import { registerTaskCreationCommands } from "./task-creation-commands.js";
+import { registerTopicSyncPolicyCommands } from "./bot-topic-sync-policy.js";
+import type { TopicSyncPolicyStore } from "./topic-sync-policy.js";
 import { taskActionLabel } from "./topic-task-controls.js";
 import { createBotTopicTasks, type BotTopicTasks } from "./bot-topic-tasks.js";
 import { existsSync } from "node:fs";
@@ -46,7 +51,7 @@ import {
   formatLaunchProfileBehavior,
   formatLaunchProfileLabel,
 } from "./codex-launch.js";
-import { getThread, listRecentRootThreads, listUserThreads } from "./codex-state.js";
+import { getThread, listRecentRootThreads, listUserThreads, listWorkspaces } from "./codex-state.js";
 import { threadLabel } from "./topic-sync.js";
 import {
   GitLabClient,
@@ -177,6 +182,7 @@ import {
 } from "./topic-activity.js";
 import { extractTopicRename, renamedTicketTopic } from "./topic-naming.js";
 import {
+  buildCodexThreadKeyboard,
   finalChunkThreadKeyboard,
   parseCodexThreadCallback,
 } from "./thread-links.js";
@@ -391,6 +397,8 @@ type RenderedChunk = RenderedText & {
 
 export interface TeleCodexBot extends Bot<Context> {
   taskCards?: BotTopicTasks;
+  disposeTaskProvisioning?: () => Promise<void>;
+  getTaskProvisioning?: () => TaskProvisioningService;
   recoverPendingJobs(): Promise<void>;
   statusBoard?: StatusBoard;
   dashboard?: DashboardController;
@@ -399,6 +407,7 @@ export interface TeleCodexBot extends Bot<Context> {
 }
 
 export interface TeleCodexBotOptions {
+  readonly topicSyncPolicy?: TopicSyncPolicyStore;
   readonly backgroundWriteGate?: Pick<TelegramBackgroundWriteGate, "run">;
   readonly topicLivenessApi?: TelegramTopicLivenessApi;
 }
@@ -626,7 +635,19 @@ export function createBot(
         () => reliability.loadDashboardReliability!(STATUS_BOARD_BUTTON_LIMIT),
       )
     : undefined;
-  if (!reliability) bot.api.config.use(autoRetry(TELEGRAM_RETRY_OPTIONS));
+  if (!reliability) {
+    const retry = autoRetry(TELEGRAM_RETRY_OPTIONS);
+    bot.api.config.use((previous, method, payload, signal) =>
+      ["createForumTopic", "sendMessage", "copyMessage", "forwardMessage"].includes(method)
+        ? previous(method, payload, signal) : retry(previous, method, payload, signal));
+  }
+  let provisioning: TaskProvisioningService | undefined;
+  let disposeInbox: (() => Promise<void>) | undefined;
+  const getProvisioning = () => provisioning ??= new TaskProvisioningService(
+    new TaskProvisioningStore(path.join(config.workspace, ".telecodex", "task-provisioning.sqlite")),
+  );
+  bot.getTaskProvisioning = getProvisioning;
+  bot.disposeTaskProvisioning = async () => { await disposeInbox?.(); await provisioning?.dispose(); };
   // JSON storage is a rollback-only compatibility path. Canonical mode must not
   // construct a second correctness owner beside the SQLite ledger.
   const jobStore = reliability
@@ -1026,17 +1047,27 @@ export function createBot(
     const busyState = getBusyState(contextKey);
     busyState.switching = true;
     try {
+      const previousId = session.getInfo().threadId;
+      if (previousId) {
+        const store = getProvisioning().store;
+        const key = `conversation-history:${contextKey}`;
+        const history = store.pending<Array<{ threadId: string; workspace: string; recordedAt: number }>>(key) ?? [];
+        store.setPending(key, [...history.filter(item => item.threadId !== previousId),
+          { threadId: previousId, workspace: session.getCurrentWorkspace(), recordedAt: Date.now() }]);
+      }
       const info = await session.newThread(workspace);
       updateSessionMetadata(contextKey, session);
       const label = isTopicContext(contextKey)
         ? "New OpenAI thread created for this topic."
         : "New OpenAI thread created.";
-      const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
-      const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
+      const previous = previousId ? `\n\nПредыдущий разговор: codex://threads/${previousId}` : "";
+      const previousKeyboard = previousId ? buildCodexThreadKeyboard(`[Предыдущий разговор](codex://threads/${previousId})`) : undefined;
+      const plainText = `${label}\n\n${renderSessionInfoPlain(info)}${previous}`;
+      const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}${escapeHTML(previous)}`;
       if (messageId) {
-        await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plainText });
+        await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plainText, replyMarkup: previousKeyboard });
       } else {
-        await safeReply(ctx, html, { fallbackText: plainText });
+        await safeReply(ctx, html, { fallbackText: plainText, replyMarkup: previousKeyboard });
       }
     } catch (error) {
       await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
@@ -1681,6 +1712,20 @@ export function createBot(
     }
   });
 
+  registerTaskCreationCommands(bot, {
+    config, registry, provisioning: getProvisioning, listWorkspaces,
+    registerTask: (destination, title) => bot.taskCards?.registerTask(destination, title),
+  });
+  if (options.topicSyncPolicy && config.telegramForumChatId) {
+    registerTopicSyncPolicyCommands(bot, {
+      store: options.topicSyncPolicy, chatId: config.telegramForumChatId,
+      registry: { isThreadBoundInChat: (id, chatId) => registry.isThreadBoundInChat(id, chatId)
+        || isSyncedTopicAttemptBlocked(getProvisioning().store.get(`sync:${chatId}:${id}`)) },
+      listUserThreads: () => listUserThreads(1000),
+      isAllowed: ctx => config.telegramAllowedUserIdSet.has(ctx.from?.id ?? 0),
+    });
+  }
+
   bot.callbackQuery(/^task_action:/, async ctx => { await bot.taskCards?.callback(ctx); });
   bot.command("task", async (ctx) => {
     if (bot.taskCards) await bot.taskCards.command(ctx);
@@ -1948,7 +1993,7 @@ export function createBot(
     });
   });
 
-  bot.command("new", async (ctx) => {
+  bot.command(["new", "newchat"], async (ctx) => {
     const chatId = ctx.chat?.id;
     if (!chatId) {
       return;
@@ -3765,7 +3810,8 @@ export function createBot(
     });
   });
 
-  registerInboxHandlers({
+  const inboxHandlers = registerInboxHandlers({
+    provisioning: getProvisioning,
     renameTopicManually: bot.taskCards ? (chatId, messageThreadId, title) => bot.taskCards!.renameManually({ chatId, messageThreadId }, title).then(() => {}) : undefined,
     onManualTopicTitle: (chatId, messageThreadId, title) => bot.taskCards?.manualTitle({ chatId, messageThreadId }, title).catch((error) => console.warn(formatTelegramErrorLog("topic", error))) ?? Promise.resolve(),
     bot,
@@ -3804,6 +3850,7 @@ export function createBot(
     sendText: (chatId, text, options) => sendTextMessage(bot.api, chatId, text, options),
     safeReply,
   });
+  disposeInbox = () => inboxHandlers.dispose();
 
   bot.on("message:text", async (ctx) => {
     const userText = ctx.message.text.trim();
@@ -4285,6 +4332,11 @@ export function createBot(
     });
     if (config.miniApp) {
       bot.dashboard = createDashboardController({
+        loadTasks: async () => bot.taskCards?.dashboardTasks() ?? [],
+        taskRowLinks: async task => bot.taskCards?.links(task) ?? [],
+        taskRowActions: async task => (await bot.taskCards?.actions(task) ?? [])
+          .filter(action => action.kind !== "job" || !["details", "inspect"].includes(action.action.kind))
+          .map(action => ({ action, label: taskActionLabel(action) })),
         taskLinks: async threadId => {
           const bindings = registry.listContexts().filter(entry => entry.threadId === threadId && parseContextKey(entry.contextKey).chatId === boardChatId);
           if (bindings.length !== 1) return [];
@@ -4471,6 +4523,10 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "task", description: "Карточка задачи в этом топике" },
     { command: "start", description: "Приветствие и состояние" },
     { command: "help", description: "Справка по командам" },
+    { command: "newtask", description: "Новая задача в отдельном топике" },
+    { command: "extract", description: "Сообщение в отдельную задачу (ответом)" },
+    { command: "newchat", description: "Новый разговор в текущем топике" },
+    { command: "topicsync", description: "Настроить появление топиков" },
     { command: "new", description: "Новая сессия в текущем топике" },
     { command: "session", description: "Текущая сессия" },
     { command: "sessions", description: "Выбрать сессию" },

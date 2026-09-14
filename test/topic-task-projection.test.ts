@@ -12,7 +12,7 @@ it("distinguishes waiting from stalled and incomplete delivery from a result", (
 it.each([
   ["accepted", "accepted"], ["queued", "queued"], ["dispatching_not_sent", "queued"],
   ["dispatching_unknown", "unknown"], ["running", "running"], ["stalled", "stalled"],
-  ["delivering", "delivering"], ["delivery_failed", "failed"], ["delivery_uncertain", "unknown"],
+  ["delivering", "delivering"], ["delivery_failed", "unknown"], ["delivery_uncertain", "unknown"],
   ["terminal_failed", "failed"], ["terminal_aborted", "idle"], ["terminal_recovery_interrupted", "unknown"],
 ])("maps %s to %s", (state, expected) => expect(taskAgentState(projection(state))).toBe(expected));
 it("normalizes names, prefixes project or ticket and rejects secrets", () => {
@@ -31,4 +31,21 @@ it("escapes text, exposes pin restriction and keeps task open after delivered ru
   expect(card.html).toContain("https://t.me/c/123/99");
   expect(card.plain).toContain("закрепить вручную");
   expect(renderTopicTask({ ...task, lastResultMessageId: null }).html).not.toContain("https://t.me");
+});
+
+it("puts state first and omits missing-result and missing-event placeholders", () => {
+  const task = { title: "Проверка", workspace: "mircli", lifecycle: "open", agentState: "running", presence: "open",
+    chatId: -100123, lastResultMessageId: null, lastEventAt: null, pinState: "pinned" } as TopicTaskRecord;
+  const card = renderTopicTask(task);
+  expect(card.plain.split("\n")[0]).toBe("В работе");
+  expect(card.plain).not.toContain("пока нет");
+  expect(card.html).not.toContain("пока нет");
+  const waiting = renderTopicTask({ ...task, agentState: "needs_approval" });
+  expect(waiting.plain).toContain("Открой запрос");
+  expect(waiting.plain.split("\n")[0]).toBe("Нужно твоё разрешение");
+});
+it("does not rewrite normal cards for timestamp-only observations", () => {
+  const task = { title: "Проверка", workspace: "mircli", lifecycle: "open", agentState: "running", presence: "open",
+    chatId: -100123, lastResultMessageId: null, lastEventAt: 1000, pinState: "pinned" } as TopicTaskRecord;
+  expect(renderTopicTask({ ...task, lastEventAt: 2000 })).toEqual(renderTopicTask(task));
 });

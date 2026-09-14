@@ -41,11 +41,11 @@ describe("forum topic liveness", () => {
     })).not.toThrow();
   });
 
-  it("classifies a successful probe as live", async () => {
+  it("does not mistake successful typing for proof that a topic exists", async () => {
     const sendChatAction = vi.fn(async () => true);
     const classify = createForumTopicLivenessClassifier({ sendChatAction });
 
-    await expect(classify(destination)).resolves.toBe("live");
+    await expect(classify(destination)).resolves.toBe("unknown");
   });
 
   it("classifies a closed topic as closed", async () => {
@@ -77,7 +77,7 @@ describe("forum topic liveness", () => {
     const sendChatAction = vi.fn(async () => true);
     const probe = createForumTopicLivenessProbe({ sendChatAction });
 
-    await expect(probe(destination)).resolves.toBe(true);
+    await expect(probe(destination)).rejects.toThrow("Telegram topic availability is unknown");
 
     expect(sendChatAction).toHaveBeenCalledWith(
       destination.chatId,
@@ -130,13 +130,16 @@ describe("forum topic liveness", () => {
     const concurrent = probe(destination);
     expect(sendChatAction).toHaveBeenCalledOnce();
     release();
-    await expect(Promise.all([first, concurrent])).resolves.toEqual([true, true]);
+    await expect(Promise.allSettled([first, concurrent])).resolves.toEqual([
+      { status: "rejected", reason: expect.objectContaining({ message: "Telegram topic availability is unknown" }) },
+      { status: "rejected", reason: expect.objectContaining({ message: "Telegram topic availability is unknown" }) },
+    ]);
 
-    await expect(probe(destination)).resolves.toBe(true);
+    await expect(probe(destination)).rejects.toThrow("Telegram topic availability is unknown");
     expect(sendChatAction).toHaveBeenCalledOnce();
     now += 5_001;
     sendChatAction.mockResolvedValueOnce(true);
-    await expect(probe(destination)).resolves.toBe(true);
+    await expect(probe(destination)).rejects.toThrow("Telegram topic availability is unknown");
     expect(sendChatAction).toHaveBeenCalledTimes(2);
   });
 
@@ -147,7 +150,7 @@ describe("forum topic liveness", () => {
     const probe = createForumTopicLivenessProbe({ sendChatAction });
 
     await expect(probe(destination)).rejects.toThrow("network failed");
-    await expect(probe(destination)).resolves.toBe(true);
+    await expect(probe(destination)).rejects.toThrow("Telegram topic availability is unknown");
     expect(sendChatAction).toHaveBeenCalledTimes(2);
   });
 
@@ -162,7 +165,7 @@ describe("forum topic liveness", () => {
     } catch {
       // The next call must not observe the failed request's stale single-flight entry.
     }
-    await expect(probe(destination)).resolves.toBe(true);
+    await expect(probe(destination)).rejects.toThrow("Telegram topic availability is unknown");
     expect(sendChatAction).toHaveBeenCalledTimes(2);
   });
 
@@ -183,7 +186,7 @@ describe("forum topic liveness", () => {
     await expect(joiner).rejects.toThrow("Telegram topic probe aborted");
     expect(requestSignal?.aborted).toBe(false);
     release();
-    await expect(first).resolves.toBe(true);
+    await expect(first).rejects.toThrow("Telegram topic availability is unknown");
     expect(sendChatAction).toHaveBeenCalledOnce();
   });
 
@@ -204,7 +207,7 @@ describe("forum topic liveness", () => {
     await expect(first).rejects.toThrow("Telegram topic probe aborted");
     expect(requestSignal?.aborted).toBe(false);
     release();
-    await expect(second).resolves.toBe(true);
+    await expect(second).rejects.toThrow("Telegram topic availability is unknown");
     expect(sendChatAction).toHaveBeenCalledOnce();
   });
 
@@ -218,7 +221,7 @@ describe("forum topic liveness", () => {
     expect(sendChatAction).not.toHaveBeenCalled();
   });
 
-  it("caches a missing result and expires that negative cache", async () => {
+  it("does not replace definitive deletion evidence with later typing success", async () => {
     let now = 1_000;
     const sendChatAction = vi.fn().mockRejectedValue(new Error("TOPIC_DELETED"));
     const probe = createForumTopicLivenessProbe({ sendChatAction, now: () => now });
@@ -227,8 +230,9 @@ describe("forum topic liveness", () => {
     await expect(probe(destination)).resolves.toBe(false);
     expect(sendChatAction).toHaveBeenCalledOnce();
     now += 5_001;
+    sendChatAction.mockResolvedValue(true);
     await expect(probe(destination)).resolves.toBe(false);
-    expect(sendChatAction).toHaveBeenCalledTimes(2);
+    expect(sendChatAction).toHaveBeenCalledOnce();
   });
 
   it("aborts and rejects a probe after its deadline", async () => {

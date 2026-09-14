@@ -84,7 +84,7 @@ describe("TelegramDeliveryOutbox rich fallback and recovery", () => {
       if (payload.operation === "send_rich") {
         throw new TelegramDeliveryApiError("rich_rejected", undefined, "format");
       }
-      return { messageId: payload.operation === "send_text" && payload.text === "Response follows." ? 800 : 801 };
+      return { messageId: payload.operation === "send_text" && payload.text === "Ответ будет отправлен ниже." ? 800 : 801 };
     };
 
     await worker.pump();
@@ -569,7 +569,7 @@ describe("TelegramDeliveryOutbox rich fallback and recovery", () => {
         });
         throw new TelegramDeliveryApiError("rich_rejected", undefined, "format");
       }
-      return { messageId: payload.operation === "send_text" && payload.text === "Response follows." ? 800 : 801 };
+      return { messageId: payload.operation === "send_text" && payload.text === "Ответ будет отправлен ниже." ? 800 : 801 };
     };
 
     await worker.pump();

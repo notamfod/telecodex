@@ -1,3 +1,4 @@
+import { ForumTopicAvailabilityUnknownError } from "./telegram-topic-liveness.js";
 import path from "node:path";
 
 import type { CodexThreadRecord } from "./codex-state.js";
@@ -145,6 +146,7 @@ export interface EnsureThreadTopicOptions {
 }
 
 export interface EnsuredThreadTopic {
+  availability?: "unknown";
   created: boolean;
   messageThreadId: number;
   name: string;
@@ -156,15 +158,25 @@ export async function ensureThreadTopic(
   options: EnsureThreadTopicOptions,
 ): Promise<EnsuredThreadTopic> {
   const name = buildTopicName(thread);
+  let availability: "unknown" | undefined;
   const bound = await findLiveBoundTopic(
     options.contexts,
     options.chatId,
     thread.id,
-    options.topicIsAlive,
+    async messageThreadId => {
+      try { return await options.topicIsAlive(messageThreadId); }
+      catch (error) {
+        if (!(error instanceof ForumTopicAvailabilityUnknownError)) throw error;
+        // Navigation may reuse a recorded destination, but must not call it live.
+        availability = "unknown";
+        return true;
+      }
+    },
   );
   if (bound !== undefined) {
     return {
       created: false,
+      ...(availability ? { availability } : {}),
       messageThreadId: bound,
       name,
       url: topicUrl(options.chatId, bound),

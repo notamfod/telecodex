@@ -22,7 +22,7 @@ export const DESTINATION = { chatId: -1001, messageThreadId: 41 } as const;
 type DeliveryOutcome = "pending" | "failed" | "uncertain" | "complete";
 
 export function createHarness(settings: {
-  liveness?: "live" | "closed" | "missing";
+  liveness?: "live" | "closed" | "missing" | "unknown";
   classifyResults?: readonly unknown[];
   reopenResults?: readonly unknown[];
   initialState?: TelegramTopicResumeState;
@@ -266,7 +266,7 @@ export function createHarness(settings: {
     classifySignal = signal;
     if (settings.classifyNeverSettles) return new Promise<never>(() => {});
     const result = classifyQueue.shift() ?? settings.liveness ?? "live";
-    if (result === "live" || result === "closed" || result === "missing") return result;
+    if (result === "live" || result === "closed" || result === "missing" || result === "unknown") return result;
     throw result;
   });
   const reopenQueue = [...(settings.reopenResults ?? [true])];

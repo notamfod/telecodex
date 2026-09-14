@@ -54,7 +54,7 @@ describe("Telegram topic resume adapter", () => {
     await expect(adapter.classifyForumTopic(destination, signal)).resolves.toBe("closed");
     adapter.invalidateForumTopicLiveness(destination);
     await expect(adapter.reopenForumTopic(destination, signal)).resolves.toBe(true);
-    await expect(adapter.classifyForumTopic(destination, signal)).resolves.toBe("live");
+    await expect(adapter.classifyForumTopic(destination, signal)).resolves.toBe("unknown");
 
     expect(fetch).toHaveBeenCalledTimes(3);
     expect(new URL(fetch.mock.calls[0]![0]).pathname.endsWith("/sendChatAction")).toBe(true);

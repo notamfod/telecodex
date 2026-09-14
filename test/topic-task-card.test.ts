@@ -138,3 +138,55 @@ it("commits an already-applied edit after its first acknowledgement was lost", a
  expect(store.get(key)?.cardMessageId).toBe(42);
  expect(transport.send).toHaveBeenCalledTimes(1);
 });
+
+it("sends the requested card on unknown availability and records the actual success", async () => {
+ const { service, transport } = harness(); transport.probe.mockResolvedValue("unknown" as never);
+ await service.activate(identity);
+ expect(transport.send).toHaveBeenCalledOnce();
+ expect(store.get(key)).toMatchObject({ presence: "open", cardState: "ready", cardMessageId: 42 });
+});
+it("keeps definitive missing presence when later typing is inconclusive", async () => {
+ const { service, transport } = harness(); transport.probe.mockResolvedValue("unknown" as never);
+ transport.send.mockRejectedValue({ error_code: 400, description: "Bad Request: message thread not found" });
+ await service.activate(identity);
+ expect(store.get(key)).toMatchObject({ presence: "missing", cardState: "none" });
+ await service.activate(identity);
+ expect(transport.send).toHaveBeenCalledOnce();
+ expect(store.get(key)?.presence).toBe("missing");
+});
+it("keeps an unknown send fenced even when the availability probe succeeds", async () => {
+ const { service, transport } = harness(); transport.probe.mockResolvedValue("unknown" as never);
+ transport.send.mockRejectedValue(new Error("network failed"));
+ await service.activate(identity); await service.activate(identity);
+ expect(transport.send).toHaveBeenCalledOnce();
+ expect(store.get(key)).toMatchObject({ presence: "unknown", cardState: "unknown" });
+});
+it.each(["send_text", "send_rich"])("links a confirmed replacement final anchor using %s", operation => {
+ const job = { id: "j", phase: "terminal", outcome: "completed", responsePlan: [],
+   turnResult: { content: [{ kind: "text", phase: "final_answer", text: "Результат" }] } };
+ const delivery = { jobId: "j", partKey: "status-anchor", state: "delivered", telegramMessageId: 6, payload: { operation } };
+ expect(confirmedResultMessage(job as never, { isDone: true } as never, [delivery] as never)).toBe(6);
+});
+it.each([false, true])("replaces a definitively missing card despite unknown topic availability with send fence (ambiguous=%s)", async ambiguous => {
+ const { service, transport } = harness(); await service.activate(identity);
+ transport.probe.mockResolvedValue("unknown" as never);
+ transport.edit.mockRejectedValueOnce({ error_code: 400, description: "Bad Request: message to edit not found" });
+ transport.send.mockImplementation(async () => {
+   expect(store.get(key)?.cardState).toBe("sending");
+   if (ambiguous) throw new Error("lost send response");
+   return 43;
+ });
+ await service.update(key, { title: "Изменено" });
+ await service.refresh(key, true);
+ expect(transport.send).toHaveBeenCalledTimes(2);
+ expect(store.get(key)).toMatchObject(ambiguous
+   ? { cardState: "unknown", presence: "unknown", cardMessageId: null }
+   : { cardState: "ready", presence: "open", cardMessageId: 43 });
+});
+it("does not dispatch a card send after a rate-limited availability probe", async () => {
+ const { service, transport } = harness();
+ transport.probe.mockRejectedValue({ error_code: 429, description: "Too Many Requests", parameters: { retry_after: 30 } });
+ await service.activate(identity);
+ expect(transport.send).not.toHaveBeenCalled();
+ expect(store.get(key)?.cardState).toBe("none");
+});

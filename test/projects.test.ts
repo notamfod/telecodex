@@ -1,3 +1,4 @@
+import { ForumTopicAvailabilityUnknownError } from "../src/telegram-topic-liveness.js";
 import { describe, expect, it, vi } from "vitest";
 
 import type { CodexThreadRecord } from "../src/codex-state.js";
@@ -165,6 +166,18 @@ describe("findBoundTopic", () => {
 });
 
 describe("ensureThreadTopic", () => {
+  it("returns the recorded destination with unknown availability without creating a duplicate", async () => {
+    const createForumTopic = vi.fn(); const sendWelcome = vi.fn();
+    const result = await ensureThreadTopic(thread(), {
+      chatId: FORUM_CHAT_ID,
+      contexts: [{ contextKey: `${FORUM_CHAT_ID}:154`, threadId: thread().id }],
+      topicIsAlive: vi.fn().mockRejectedValue(new ForumTopicAvailabilityUnknownError()),
+      createForumTopic, bindThread: vi.fn(), sendWelcome,
+    });
+    expect(result).toMatchObject({ created: false, messageThreadId: 154, availability: "unknown" });
+    expect(createForumTopic).not.toHaveBeenCalled(); expect(sendWelcome).not.toHaveBeenCalled();
+  });
+
   const FORUM_CHAT_ID = -1001234567890;
 
   it("returns an existing live topic without creating another one", async () => {

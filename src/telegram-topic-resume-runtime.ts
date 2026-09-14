@@ -54,7 +54,7 @@ export interface TelegramTopicResumeRuntimeOptions {
   readonly store: TopicResumeStore;
   readonly forumChatId: number;
   readonly classifyForumTopic: (destination: TelegramTopicDestination, signal: AbortSignal) =>
-    Promise<"live" | "closed" | "missing">;
+    Promise<ForumTopicLiveness>;
   readonly reopenForumTopic: (destination: TelegramTopicDestination, signal: AbortSignal) =>
     Promise<true>;
   readonly invalidateForumTopicLiveness?: (destination: TelegramTopicDestination) => void;
@@ -359,8 +359,10 @@ export function createTelegramTopicResumeRuntime(
     } else if (liveness === "closed") {
       const reopening = transition(resume, "reopen_in_flight");
       await reopen(reopening);
-    } else {
+    } else if (liveness === "live") {
       await enterHandoff(resume, "TOPIC_RESUME_SOURCE_MISSING");
+    } else {
+      transition(resume, "failed", "TOPIC_RESUME_PROBE_UNKNOWN");
     }
   };
 

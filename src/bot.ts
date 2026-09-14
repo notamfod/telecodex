@@ -3308,6 +3308,7 @@ export function createBot(
 
   /** Telegram sends no update when a forum topic is deleted. */
   const probeTopicLiveness = createForumTopicLivenessProbe({
+    requireDefinitiveErrors: true,
     sendChatAction: (options.topicLivenessApi
       ?? createTelegramTopicLivenessApi(config.telegramBotToken)).sendChatAction,
   });
@@ -3424,9 +3425,9 @@ export function createBot(
       });
 
       await ctx.answerCallbackQuery({
-        text: result.created ? "Тред создан" : "Тред уже существует",
+        text: result.created ? "Тред создан" : result.availability === "unknown" ? "Доступность записанного топика не подтверждена" : "Тред уже существует",
       }).catch(() => undefined);
-      const label = result.created ? "Тред заведён" : "Тред уже был заведён";
+      const label = result.created ? "Тред заведён" : result.availability === "unknown" ? "Записанный топик (доступность не подтверждена)" : "Тред уже был заведён";
       await safeReply(ctx, `${label}: <a href="${result.url}">${escapeHTML(result.topicName)}</a>`, {
         fallbackText: `${label}: ${result.url}`,
       });
@@ -3485,16 +3486,16 @@ export function createBot(
 
       if (fromDashboard) {
         await ctx.answerCallbackQuery({
-          text: result.created ? "Топик создан" : "Топик уже существует",
+          text: result.created ? "Топик создан" : result.availability === "unknown" ? "Доступность записанного топика не подтверждена" : "Топик уже существует",
         });
         await bot.statusBoard?.refreshSafely();
         return;
       }
 
       await ctx.answerCallbackQuery({
-        text: result.created ? "Topic created" : "This session already has a topic",
+        text: result.created ? "Топик создан" : result.availability === "unknown" ? "Доступность записанного топика не подтверждена" : "У сессии уже есть топик",
       });
-      const prefix = result.created ? "Topic created" : "Already open";
+      const prefix = result.created ? "Топик создан" : result.availability === "unknown" ? "Записанный топик (доступность не подтверждена)" : "Топик сессии";
       await safeReply(ctx, `${prefix}: <a href="${result.url}">${escapeHTML(result.name)}</a>`, {
         fallbackText: `${prefix}: ${result.url}`,
       });

@@ -16,7 +16,12 @@ export interface ForumTopicLivenessOptions {
   readonly requireDefinitiveErrors?: boolean;
 }
 
-export type ForumTopicLiveness = "live" | "closed" | "missing";
+/** A typing acknowledgement does not establish topic existence or openness. */
+export type ForumTopicLiveness = "live" | "closed" | "missing" | "unknown";
+
+export class ForumTopicAvailabilityUnknownError extends Error {
+  constructor() { super("Telegram topic availability is unknown"); }
+}
 
 const DEFAULT_TIMEOUT_MS = 3_000;
 const DEFAULT_CACHE_TTL_MS = 5_000;
@@ -87,7 +92,10 @@ export function createForumTopicLivenessProbe(
   const classify = createForumTopicLivenessClassifier(options);
   return (destination, signal) => {
     const probe = classify(destination, signal)
-      .then((liveness) => liveness !== "missing");
+      .then((liveness) => {
+        if (liveness === "unknown") throw new ForumTopicAvailabilityUnknownError();
+        return liveness !== "missing";
+      });
     void probe.catch(() => {});
     return probe;
   };
@@ -151,7 +159,7 @@ function createSharedRequest(
           { message_thread_id: destination.messageThreadId },
           controller.signal,
         );
-        return "live" as const;
+        return "unknown" as const;
       } catch (error) {
         const description = requireDefinitiveErrors ? definitiveDescription(error) : error;
         if (description !== undefined && isClosedForumTopicError(description)) return "closed" as const;
@@ -163,7 +171,9 @@ function createSharedRequest(
       (value) => {
         clearTimeout(timer);
         finish(() => {
-          cache.set(key, { value, expiresAt: now() + cacheTtlMs });
+          // Deleted topic IDs cannot become live again. Keep that definitive evidence;
+          // the short TTL only throttles closed/unknown checks, never grants confidence.
+          cache.set(key, { value, expiresAt: value === "missing" ? Infinity : now() + cacheTtlMs });
           resolveRequest(value);
         });
       },

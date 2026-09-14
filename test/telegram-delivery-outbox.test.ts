@@ -832,7 +832,7 @@ describe("TelegramDeliveryOutbox", () => {
       "edit_text", "send_text", "send_text", "send_text",
     ]);
     expect(telegram.calls[1]).toEqual({
-      operation: "send_text", chatId: -1001, messageThreadId: 7, text: "Response follows.",
+      operation: "send_text", chatId: -1001, messageThreadId: 7, text: "Ответ будет отправлен ниже.",
     });
     expect(store.get(job.id)).toMatchObject({ phase: "terminal", outcome: "completed" });
     expect(store.listDeliveries(job.id)).toEqual(expect.arrayContaining([
@@ -884,7 +884,7 @@ describe("TelegramDeliveryOutbox", () => {
       "edit_text", "edit_text", "send_text", "send_text", "send_text",
     ]);
     expect(telegram.calls.filter((payload) =>
-      payload.operation === "send_text" && payload.text === "Response follows.")).toHaveLength(1);
+      payload.operation === "send_text" && payload.text === "Ответ будет отправлен ниже.")).toHaveLength(1);
     expect(store.get(job.id)).toMatchObject({ phase: "terminal", outcome: "completed" });
   });
 
@@ -933,7 +933,7 @@ describe("TelegramDeliveryOutbox", () => {
       "edit_text", "send_text", "send_text", "send_text",
     ]);
     expect(telegram.calls.filter((payload) =>
-      payload.operation === "send_text" && payload.text === "Response follows.")).toHaveLength(1);
+      payload.operation === "send_text" && payload.text === "Ответ будет отправлен ниже.")).toHaveLength(1);
     expect(store.get(job.id)).toMatchObject({ phase: "terminal", outcome: "completed" });
   });
 
@@ -1094,7 +1094,7 @@ describe("TelegramDeliveryOutbox", () => {
     await worker.retryFailed(job.id, "status-anchor");
 
     expect(telegram.calls[1]).toEqual({
-      operation: "send_text", chatId: -1001, messageThreadId: null, text: "Response follows.",
+      operation: "send_text", chatId: -1001, messageThreadId: null, text: "Ответ будет отправлен ниже.",
     });
     expect(store.get(job.id)).toMatchObject({ phase: "terminal", outcome: "completed" });
   });

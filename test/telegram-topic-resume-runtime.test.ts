@@ -86,6 +86,16 @@ describe("TelegramTopicResumeRuntime", () => {
     expect(harness.outboxRetryFailed).toHaveBeenCalledOnce();
   });
 
+  it("does not hand off delivery on unknown topic availability", async () => {
+    const harness = createHarness({ liveness: "unknown" });
+    const runtime = createTelegramTopicResumeRuntime(harness.options);
+    await runtime.resume(harness.action);
+    expect(harness.resume()).toMatchObject({ state: "failed", reasonCode: "TOPIC_RESUME_PROBE_UNKNOWN" });
+    expect(harness.reopenForumTopic).not.toHaveBeenCalled();
+    expect(harness.outboxRetryFailed).not.toHaveBeenCalled();
+    runtime.dispose();
+  });
+
   it("fails a missing topic without reopening or handing off delivery", async () => {
     const harness = createHarness({ liveness: "missing" });
     const runtime = createTelegramTopicResumeRuntime(harness.options);
@@ -256,7 +266,7 @@ describe("TelegramTopicResumeRuntime", () => {
     expect(harness.outboxRetryFailed).toHaveBeenCalledOnce();
   });
 
-  it.each(["closed", "missing"] as const)(
+  it.each(["closed", "missing", "unknown"] as const)(
     "keeps inherited reopen_unknown stopped after a confirmed %s probe",
     async (liveness) => {
       const harness = createHarness({ initialState: "reopen_unknown", liveness });

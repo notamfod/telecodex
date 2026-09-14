@@ -12,7 +12,7 @@ export interface TopicTaskTransport {
   edit(destination: TaskDestination, messageId: number, html: string): Promise<void>;
   syncActions?(task: TopicTaskRecord): Promise<void>;
   pin(destination: TaskDestination, messageId: number): Promise<void>;
-  probe(destination: TaskDestination): Promise<"live" | "closed" | "missing">;
+  probe(destination: TaskDestination): Promise<"live" | "closed" | "missing" | "unknown">;
 }
 
 /** Per-topic serialization; sending intent is never leased or retried after uncertainty. */
@@ -87,10 +87,18 @@ export class TopicTaskCardService {
     return updated;
   }
 
-  private async presence(task: TopicTaskRecord): Promise<TopicTaskRecord> {
+  private async presence(task: TopicTaskRecord, requireResponse = false): Promise<TopicTaskRecord> {
     let presence: TopicTaskRecord["presence"];
     try { const result = await this.transport.probe(task); presence = result === "live" ? "open" : result; }
-    catch { presence = "unknown"; }
+    catch (error) {
+      presence = "unknown";
+      if (requireResponse) {
+        if (task.presence !== "missing" && task.presence !== "closed") this.patch(task, { presence });
+        throw error;
+      }
+    }
+    // Inconclusive typing cannot erase a definitive deletion/closure observation.
+    if (presence === "unknown" && (task.presence === "missing" || task.presence === "closed")) return task;
     return this.patch(task, { presence });
   }
 
@@ -100,8 +108,8 @@ export class TopicTaskCardService {
     if (recheckPresence && task.cardState === "ready" && task.presence !== "open") task = await this.presence(task);
     if (task.cardState === "sending" || task.cardState === "unknown") return;
     if (task.cardState === "none") {
-      task = await this.presence(task);
-      if (task.presence !== "open") return;
+      try { task = await this.presence(task, true); } catch { return; }
+      if (task.presence === "missing" || task.presence === "closed") return;
       const rendered = renderTopicTask(task);
       const hash = digest(rendered.html);
       task = this.patch(task, { cardState: "sending", cardAttemptId: randomUUID() });
@@ -112,11 +120,14 @@ export class TopicTaskCardService {
         const rejected = error instanceof TelegramBackgroundWriteGateAdmissionCancelledError
           || error instanceof TelegramBackgroundWriteGateDisposedError
           || (typeof code === "number" && code >= 400 && code < 500);
-        this.patch(task, rejected ? { cardState: "none", cardAttemptId: null, enabled: false } : { cardState: "unknown" });
+        const description = (error as { description?: string })?.description ?? "";
+        const presence = code === 400 && /message thread not found|TOPIC_ID_INVALID|TOPIC_DELETED/iu.test(description) ? "missing"
+          : code === 400 && /TOPIC_CLOSED|topic is closed/iu.test(description) ? "closed" : task.presence;
+        this.patch(task, rejected ? { cardState: "none", cardAttemptId: null, enabled: false, presence } : { cardState: "unknown" });
         return;
       }
       // If committing the ID fails the durable 'sending' intent still blocks duplicate creation.
-      task = this.patch(task, { cardState: "ready", cardMessageId: messageId, contentHash: hash });
+      task = this.patch(task, { cardState: "ready", cardMessageId: messageId, contentHash: hash, presence: "open" });
     }
     if (!task.cardMessageId) return;
     if (task.presence === "missing") return;
@@ -145,8 +156,10 @@ export class TopicTaskCardService {
       }
       const classification = classifyTelegramStatusError("edit", error);
       if (classification.disposition !== "message_missing") return;
-      task = await this.presence(task);
-      if (task.presence !== "open") return;
+      try { task = await this.presence(task, true); } catch { return; }
+      if (task.presence === "missing" || task.presence === "closed") return;
+      // The old message is definitively absent. An intended replacement send may
+      // proceed on inconclusive typing; its durable intent fences any ambiguity.
       this.patch(task, { cardState: "none", cardMessageId: null, cardAttemptId: null, contentHash: null, pinState: "none" });
       await this.render(key);
     }
@@ -164,7 +177,7 @@ export function confirmedResultMessage(job: TelegramJob, projection: TelegramJob
   const hasAnswer = job.turnResult?.content.some((part) => part.kind === "text" && part.phase !== "commentary" && part.text.trim());
   if (job.responsePlan.some((part) => part.kind === "final") || !hasAnswer) return null;
   const anchor = deliveries.find((part) => part.jobId === job.id && part.partKey === "status-anchor" && part.state === "delivered"
-    && ["edit_text", "edit_rich"].includes((part.payload as { operation?: string })?.operation ?? ""));
+    && ["edit_text", "edit_rich", "send_text", "send_rich"].includes((part.payload as { operation?: string })?.operation ?? ""));
   return anchor?.telegramMessageId ?? null;
 }
 

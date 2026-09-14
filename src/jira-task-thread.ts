@@ -1,3 +1,4 @@
+import { ForumTopicAvailabilityUnknownError } from "./telegram-topic-liveness.js";
 import type { InboxStore, Ticket } from "./inbox.js";
 import type { JiraIssue } from "./jira-client.js";
 import { escapeHTML } from "./format.js";
@@ -31,6 +32,7 @@ export interface JiraTaskThreadDependencies {
 }
 
 export interface JiraTaskThreadResult {
+  availability?: "unknown";
   created: boolean;
   topicId: number;
   topicName: string;
@@ -100,8 +102,15 @@ async function createJiraTaskThread(
     input.sourceContextKey,
     input.issue.key,
   );
-  if (existing?.workTopicId && await dependencies.topicIsAlive(existing.workTopicId)) {
-    return makeResult(false, input.chatId, existing, jiraTaskTopicName(input.issue));
+  if (existing?.workTopicId) {
+    try {
+      if (await dependencies.topicIsAlive(existing.workTopicId)) {
+        return makeResult(false, input.chatId, existing, jiraTaskTopicName(input.issue));
+      }
+    } catch (error) {
+      if (!(error instanceof ForumTopicAvailabilityUnknownError)) throw error;
+      return { ...makeResult(false, input.chatId, existing, jiraTaskTopicName(input.issue)), availability: "unknown" };
+    }
   }
 
   const topicName = jiraTaskTopicName(input.issue);

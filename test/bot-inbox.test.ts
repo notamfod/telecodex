@@ -1,3 +1,5 @@
+import { ForumTopicAvailabilityUnknownError } from "../src/telegram-topic-liveness.js";
+import { TaskProvisioningService, TaskProvisioningStore } from "../src/task-provisioning.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { registerInboxHandlers } from "../src/bot-inbox.js";
@@ -237,6 +239,39 @@ describe("registerInboxHandlers", () => {
     expect(error.mock.calls[0]![0]).toMatch(/^telegram event=inbox category=/);
   });
 
+
+  it.each([false, true])("appends once to an unconfirmed binding with durable replay fence (ambiguous=%s)", async ambiguous => {
+    vi.useFakeTimers();
+    let messageHandler!: (ctx: any, next: () => Promise<void>) => Promise<void>;
+    const createForumTopic = vi.fn();
+    const provisioning = new TaskProvisioningService(new TaskProvisioningStore(":memory:"));
+    const previous = { id: 7, externalKey: "MIR-123", inboxContextKey: "-1001:7", workTopicId: 41,
+      workspace: "/work", prompt: "Investigate", source: "telegram", createdAt: 1 };
+    const sendText = vi.fn(async (_chat, _text, options) => {
+      if (options?.messageThreadId !== 41) return;
+      expect(provisioning.store.get("inbox:-1001:7:10")).toMatchObject({ state: "bound", messageThreadId: 41 });
+      if (ambiguous) throw new Error("network failed");
+    });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const handlers = registerInboxHandlers({
+      provisioning,
+      bot: { command: vi.fn(), callbackQuery: vi.fn(), on: (event, handler) => { if (event === "message") messageHandler = handler; }, api: { createForumTopic } } as never,
+      config: { workspace: "/work", defaultLaunchProfileId: "default" } as never,
+      registry: {} as never,
+      inbox: { get: () => ({ workspace: "/work", template: "{message}" }), recordFailure: vi.fn(),
+        listTicketsByKey: () => [previous], getTicket: () => previous } as never,
+      topicActivity: { rememberIdleIcon: vi.fn() }, getContextSession: vi.fn(), isBusy: vi.fn(), handleTicketPrompt: vi.fn(),
+      topicIsAlive: vi.fn().mockRejectedValue(new ForumTopicAvailabilityUnknownError()), sendText, safeReply: vi.fn(),
+    });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await messageHandler({ chat: { id: -1001 }, message: { message_id: 10, message_thread_id: 7, text: "MIR-123 дополнение" } }, vi.fn());
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
+    expect(sendText.mock.calls.filter(([, , options]) => options?.messageThreadId === 41)).toHaveLength(1);
+    expect(createForumTopic).not.toHaveBeenCalled();
+    expect(provisioning.store.get("inbox:-1001:7:10")?.state).toBe(ambiguous ? "unknown" : "ready");
+    await handlers.dispose();
+  });
   it("sanitizes Inbox topic creation failures as one console argument", async () => {
     vi.useFakeTimers();
     let messageHandler!: (ctx: any, next: () => Promise<void>) => Promise<void>;

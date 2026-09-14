@@ -59,7 +59,7 @@ describe("buildTelegramResponsePlan", () => {
     });
 
     expect(plan.anchor.payload).toEqual({
-      operation: "edit_text", chatId: -1001, messageId: 501, text: "Response follows.",
+      operation: "edit_text", chatId: -1001, messageId: 501, text: "Ответ будет отправлен ниже.",
     });
     expect(plan.responsePlan).toEqual([
       { partId: "summary:0000:0000", kind: "summary" },
@@ -93,7 +93,7 @@ describe("buildTelegramResponsePlan", () => {
     });
 
     expect(plan.anchor.payload).toEqual({
-      operation: "edit_text", chatId: -1001, messageId: 501, text: "Response follows.",
+      operation: "edit_text", chatId: -1001, messageId: 501, text: "Ответ будет отправлен ниже несколькими сообщениями.",
     });
     expect(plan.parts.map((part) => part.payload.operation)).toEqual(["send_rich", "send_media"]);
     expect(plan.parts.map((part) => part.partKey)).toEqual(["final:0000", "attachment:0000"]);
@@ -177,8 +177,10 @@ describe("buildTelegramResponsePlan", () => {
     const text = `${"a".repeat(2_047)}😀${"b".repeat(2_047)}`;
     const plan = buildTelegramResponsePlan({ result: result([{ kind: "text", text }]), destination });
 
-    expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text: "Response follows." });
+    expect(plan.anchor.payload).toMatchObject({ operation: "edit_text" });
     expect(plan.parts.length).toBeGreaterThan(1);
+    expect(plan.anchor.payload).toMatchObject({ text: "Ответ будет отправлен ниже несколькими сообщениями." });
+    expect(plan.parts[0]?.payload).toMatchObject({ text: expect.stringMatching(/^<b>Часть 1 из \d+<\/b>\n\n/) });
     expect(plan.parts.every((part) => part.payload.operation === "send_text")).toBe(true);
     expect(plan.parts.every((part) => part.payload.operation !== "send_text"
       || [...part.payload.text].length <= 4_096)).toBe(true);
@@ -237,13 +239,13 @@ describe("buildTelegramResponsePlan", () => {
 
     expect(plan.parts.map((part) => part.partKey)).toEqual(["final:0000", "notice:failure"]);
     expect(plan.parts.map((part) => part.ordinal)).toEqual([0, 1]);
-    expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text: "Response follows." });
+    expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text: "Ответ будет отправлен ниже." });
     expect(plan.parts[0]).toMatchObject({
       kind: "final", payload: { operation: "send_text", text: "partial answer" },
     });
     expect(plan.parts[1]).toMatchObject({
       kind: "notice",
-      payload: { operation: "send_text", text: "codex_turn_failed: The turn stopped before completion." },
+      payload: { operation: "send_text", text: "Не удалось завершить задачу. Код: codex_turn_failed. The turn stopped before completion." },
     });
   });
 
@@ -269,7 +271,7 @@ describe("buildTelegramResponsePlan", () => {
     });
     expect(plan.anchor).toMatchObject({
       partKey: "status-anchor",
-      payload: { operation: "send_text", chatId: -1001, messageThreadId: null, text: "Response follows." },
+      payload: { operation: "send_text", chatId: -1001, messageThreadId: null, text: "Ответ будет отправлен ниже." },
     });
     expect(plan.parts).toEqual([expect.objectContaining({
       partKey: "final:0000",
@@ -281,7 +283,7 @@ describe("buildTelegramResponsePlan", () => {
   it("pins empty completed output to a deterministic non-response anchor", () => {
     const plan = buildTelegramResponsePlan({ result: result([]), destination });
 
-    expect(plan.anchor.payload).toEqual({ operation: "edit_text", chatId: -1001, messageId: 501, text: "Completed." });
+    expect(plan.anchor.payload).toEqual({ operation: "edit_text", chatId: -1001, messageId: 501, text: "Готово." });
     expect(plan.responsePlan).toEqual([]);
     expect(plan.parts).toEqual([]);
   });
@@ -333,7 +335,7 @@ describe("buildTelegramResponsePlan", () => {
       supplementalParts: [confirmation],
     });
 
-    expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text: "Response follows." });
+    expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text: "Ответ будет отправлен ниже." });
     expect(plan.parts.map((part) => part.partKey)).toEqual(["final:0000", "jira-confirm"]);
     expect(plan.parts[0]).toMatchObject({ ordinal: 0, kind: "final", payload: { operation: "send_text" } });
     expect(plan.parts[1]).toEqual(expect.objectContaining({
@@ -401,7 +403,7 @@ describe("buildTelegramResponsePlan", () => {
       destination,
     });
 
-    expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text: "Response follows." });
+    expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text: "Ответ будет отправлен ниже." });
     expect(plan.parts).toEqual([expect.objectContaining({
       partKey: "final:0000", ordinal: 0, kind: "final",
       payload: { operation: "send_text", chatId: -1001, messageThreadId: 77, text: "&lt;b&gt;unclosed" },
@@ -418,7 +420,7 @@ describe("buildTelegramResponsePlan", () => {
       destination,
     });
 
-    expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text: "Response follows." });
+    expect(plan.anchor.payload).toMatchObject({ operation: "edit_text", text: "Ответ будет отправлен ниже несколькими сообщениями." });
     expect(plan.parts.map((part) => [part.partKey, part.payload.operation])).toEqual([
       ["final:0000", "send_text"],
       ["attachment:0000", "send_media"],

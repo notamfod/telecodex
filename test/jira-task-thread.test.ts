@@ -1,3 +1,4 @@
+import { ForumTopicAvailabilityUnknownError } from "../src/telegram-topic-liveness.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -88,6 +89,20 @@ describe("openJiraTaskThread", () => {
     }
   });
 
+
+  it("returns an unconfirmed existing binding without creating another topic", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "telecodex-jira-task-"));
+    const inbox = new InboxStore(path.join(dir, "inbox.json"));
+    const createTopic = vi.fn().mockResolvedValue(321);
+    const initializeTopic = vi.fn();
+    try {
+      await openJiraTaskThread(input, { inbox, topicIsAlive: vi.fn(), createTopic, initializeTopic });
+      const result = await openJiraTaskThread(input, { inbox,
+        topicIsAlive: vi.fn().mockRejectedValue(new ForumTopicAvailabilityUnknownError()), createTopic, initializeTopic });
+      expect(result).toMatchObject({ created: false, topicId: 321, availability: "unknown" });
+      expect(createTopic).toHaveBeenCalledOnce(); expect(initializeTopic).toHaveBeenCalledOnce();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it("returns the existing live topic for repeated clicks", async () => {
     const dir = mkdtempSync(path.join(tmpdir(), "telecodex-jira-task-"));
     const inbox = new InboxStore(path.join(dir, "inbox.json"));

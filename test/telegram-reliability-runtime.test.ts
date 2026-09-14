@@ -294,7 +294,7 @@ describe("Telegram reliability runtime", () => {
       jobId: current.id,
       eventId: "explicit-refresh-activity",
       expectedVersion: current.version,
-      event: { schemaVersion: 1, type: "activity.observed", eventAt: NOW, health: "quiet" },
+      event: { schemaVersion: 1, type: "activity.observed", eventAt: NOW, health: "checking" },
     });
     await runtime.refresh(queued.id);
     current = store.get(queued.id)!;
@@ -302,7 +302,7 @@ describe("Telegram reliability runtime", () => {
       jobId: current.id,
       eventId: "dashboard-refresh-activity",
       expectedVersion: current.version,
-      event: { schemaVersion: 1, type: "activity.observed", eventAt: NOW, health: "checking" },
+      event: { schemaVersion: 1, type: "activity.observed", eventAt: NOW, health: "healthy" },
     });
     await runtime.runDashboardAction({
       kind: "refresh",
@@ -374,7 +374,7 @@ describe("Telegram reliability runtime", () => {
       { partId: "jira-confirm", kind: "notice" },
     ]);
     expect(harness.delivery.deliver.mock.calls.map(([payload]) => payload)).toEqual([
-      { operation: "edit_text", chatId: -1001, messageId: 501, text: "Response follows." },
+      { operation: "edit_text", chatId: -1001, messageId: 501, text: "Ответ будет отправлен ниже." },
       {
         operation: "send_text", chatId: -1001, messageThreadId: 7,
         text: "answer without topic marker",
@@ -535,6 +535,10 @@ describe("Telegram reliability runtime", () => {
     runtime = createTelegramReliabilityRuntime(harness.options);
     await runtime.refresh(queued.id);
     harness.status.edit.mockRejectedValueOnce(heartbeatError);
+    store.transition({
+      jobId: queued.id, eventId: "heartbeat-health-changed", expectedVersion: store.get(queued.id)!.version,
+      event: { schemaVersion: 1, type: "activity.observed", eventAt: currentTime, health: "checking" },
+    });
 
     currentTime += 10_000;
     await vi.advanceTimersByTimeAsync(10_000);

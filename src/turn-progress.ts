@@ -411,27 +411,31 @@ function renderProjection(projection: TelegramJobStatusProjection): ProgressMess
     terminal_delivered: "Ответ доставлен", terminal_failed: "Запрос завершился ошибкой",
     terminal_aborted: "Запрос остановлен", terminal_recovery_interrupted: "Запрос прерван при восстановлении",
   };
-  const health: Record<TelegramJobStatusProjection["health"], string> = {
-    healthy: "Работает", quiet: "Нет новых событий", checking: "Проверяю состояние",
-    stalled: "Нет прогресса", unavailable: "Состояние недоступно",
-  };
-  const activity = { model: "Модель", tool: "Инструмент", subagent: "Помощник",
-    waiting: "Ожидание", unknown: "Нет данных об активности" };
-  const facts = [
-    health[projection.health],
-    projection.activity
-      ? `${activity[projection.activity.kind]} · ${formatElapsed(projection.activity.ageMs)} назад`
-      : undefined,
-    projection.guardian.availability === "unavailable" ? "Проверка сессии недоступна" : undefined,
-    `Доставлено: ${projection.delivery.delivered}/${projection.delivery.total}`,
-    projection.attention.kind === "required" ? "Требуется ваше внимание" : undefined,
-    projection.state === "delivery_uncertain" || projection.state === "dispatching_unknown"
-      ? "Повтор может создать дубль. Сначала проверьте подробности." : undefined,
-  ].filter((value): value is string => value !== undefined);
-  const title = `${icon} ${states[projection.state]}`;
+  const waiting = projection.phase !== "terminal" && projection.state === "running"
+    && projection.activity?.kind === "waiting";
+  const facts: string[] = [];
+  if (projection.phase !== "terminal") {
+    if (projection.health === "quiet" && projection.activity && !waiting) {
+      const minutes = Math.floor(projection.activity.ageMs / 60_000);
+      facts.push(`Нет новых событий ${minutes < 1 ? "меньше минуты" : `${minutes} мин`}`);
+    } else if (projection.health === "checking") facts.push("Проверяю состояние");
+    else if (projection.health === "unavailable") facts.push("Проверка состояния недоступна");
+  }
+  let nextAction: string | undefined;
+  if (projection.state === "delivery_uncertain" || projection.state === "dispatching_unknown") {
+    nextAction = "Открой подробности и проверь переписку перед повтором: возможен дубль.";
+  } else if (projection.state === "delivery_failed") {
+    nextAction = "Открой подробности доставки и проверь доступные действия.";
+  } else if (projection.state === "stalled" || projection.state === "terminal_failed"
+    || projection.state === "terminal_recovery_interrupted" || projection.attention.kind === "required") {
+    nextAction = "Открой подробности и выбери доступное действие для продолжения.";
+  }
+  const title = `${icon} ${waiting ? "Ожидаю продолжения" : states[projection.state]}`;
+  const body = facts.length ? `\n${facts.join("\n")}` : "";
+  const action = nextAction ? `\n\n${nextAction}` : "";
   return {
-    html: `<b>${escapeHTML(title)}</b>\n${escapeHTML(facts.join(" · "))}`,
-    plain: `${title}\n${facts.join(" · ")}`,
+    html: `<b>${escapeHTML(title)}</b>${escapeHTML(body + action)}`,
+    plain: `${title}${body}${action}`,
     projection,
     actions: projection.actions,
   };

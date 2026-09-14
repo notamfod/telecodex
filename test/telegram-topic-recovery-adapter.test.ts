@@ -35,7 +35,7 @@ describe("Telegram topic recovery adapter", () => {
     const signal = new AbortController().signal;
 
     expect(adapter.hasThreadTopicBinding(thread.id, destination)).toBe(true);
-    await expect(adapter.probeForumTopic(destination, signal)).resolves.toBe(true);
+    await expect(adapter.probeForumTopic(destination, signal)).rejects.toThrow("Telegram topic availability is unknown");
     await expect(adapter.createForumTopic({
       chatId: destination.chatId,
       topicName: "Replacement",

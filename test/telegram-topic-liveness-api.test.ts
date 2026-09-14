@@ -33,7 +33,7 @@ describe("retry-free topic liveness API", () => {
       chat_id: -1001, action: "typing", message_thread_id: 41,
     });
     // A later explicit probe can succeed; the failed request was never retried or cached.
-    await expect(probe({ chatId: -1001, messageThreadId: 41 })).resolves.toBe(true);
+    await expect(probe({ chatId: -1001, messageThreadId: 41 })).rejects.toThrow("Telegram topic availability is unknown");
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 });

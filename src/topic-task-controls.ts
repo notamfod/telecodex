@@ -29,7 +29,8 @@ export class TopicTaskControls {
   async actions(key: string): Promise<TopicTaskAction[]> {
     const task = this.options.store.get(key);
     if (!task || !this.options.eligible(task)) return [];
-    const state = await this.options.read(task);
+    const state = await this.options.read(task).catch(() => null);
+    if (!state) return [];
     return projectTopicTaskActions({ task, canonicalActions: state.projection?.actions ?? [],
       guardSafe: state.safe && (state.projection?.jobId ?? null) === task.latestJobId && (state.projection?.expectedVersion ?? 0) === task.latestJobVersion,
       intent: this.options.store.getLifecycleIntent(key) });
@@ -39,11 +40,17 @@ export class TopicTaskControls {
     if (!task?.enabled || !this.options.eligible(task) || !String(task.chatId).startsWith("-100")) return [];
     const base = `https://t.me/c/${String(task.chatId).slice(4)}/`;
     const links: { label: string; url: string }[] = [];
-    if (task.lastResultMessageId) links.push({ label: "Открыть результат", url: `${base}${task.lastResultMessageId}` });
-    if (["needs_input", "needs_approval"].includes(task.agentState)) links.push({ label: "Открыть переписку с запросом", url: `${base}${task.messageThreadId}` });
-    const state = await this.options.read(task);
-    if (state.projection?.jobId === task.latestJobId && state.projection.delivery.anchorMessageId) {
-      links.push({ label: "Подробности прогона", url: `${base}${state.projection.delivery.anchorMessageId}` });
+    if (task.presence !== "missing" && ["needs_input", "needs_approval"].includes(task.agentState)) {
+      links.push({ label: task.agentState === "needs_input" ? "Ответить в топике" : "Открыть переписку",
+        url: `${base}${task.messageThreadId}` });
+    }
+    if (task.lastResultMessageId) links.push({ label: "Последний результат", url: `${base}${task.lastResultMessageId}` });
+    // A failed live inspection must not hide a previously confirmed result.
+    const state = await this.options.read(task).catch(() => null);
+    if (state?.projection?.jobId === task.latestJobId
+      && state.projection.expectedVersion === task.latestJobVersion && state.projection.delivery.anchorMessageId) {
+      const url = `${base}${state.projection.delivery.anchorMessageId}`;
+      if (!links.some(link => link.url === url)) links.push({ label: "Подробности прогона", url });
     }
     return links;
   }

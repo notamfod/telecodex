@@ -417,6 +417,7 @@ describe("TelegramDurableStatusService", () => {
       ({ disposition: error === retryable ? "retryable" : "permanent" }) });
 
     await service.refresh(accepted.id);
+    checking(accepted.id);
     await expect(service.refresh(accepted.id, "urgent")).rejects.toBe(retryable);
     expect(store.listDeliveries(accepted.id)[0]).toMatchObject({
       state: "pending", telegramMessageId: 501, attemptCount: 2,
@@ -483,6 +484,7 @@ describe("TelegramDurableStatusService", () => {
       },
     });
 
+    checking(accepted.id);
     now += 10_000;
     await service.refresh(accepted.id, "urgent");
 
@@ -581,6 +583,7 @@ describe("TelegramDurableStatusService", () => {
       throw retryable;
     });
 
+    checking(accepted.id);
     await expect(service.refresh(accepted.id, "urgent")).rejects.toThrow("message target changed");
 
     expect(store.listDeliveries(accepted.id)[0]).toMatchObject({
@@ -647,11 +650,12 @@ describe("TelegramDurableStatusService", () => {
   it("refreshes active jobs at ten seconds and disposes owned timers", async () => {
     vi.useFakeTimers();
     const accepted = await accept(7);
-    const initialEvents = store.listEvents(accepted.id);
     const service = status();
 
     await service.refresh(accepted.id, "urgent");
     expect(service.activePresenterCount).toBe(1);
+    checking(accepted.id);
+    const initialEvents = store.listEvents(accepted.id);
     now += 9_999;
     await vi.advanceTimersByTimeAsync(9_999);
     expect(edit).not.toHaveBeenCalled();
@@ -671,6 +675,28 @@ describe("TelegramDurableStatusService", () => {
     expect(service.activePresenterCount).toBe(0);
   });
 
+  it("checks a running job on heartbeat without writing age-only status revisions", async () => {
+    vi.useFakeTimers();
+    const accepted = await accept(117);
+    running(accepted.id);
+    const service = status();
+    await service.refresh(accepted.id);
+    const inspectionsBefore = inspectThread.mock.calls.length;
+    for (let tick = 0; tick < 3; tick++) {
+      now += 10_000;
+      await vi.advanceTimersByTimeAsync(10_000);
+    }
+    expect(inspectThread).toHaveBeenCalledTimes(inspectionsBefore + 3);
+    expect(send).toHaveBeenCalledOnce();
+    expect(edit).not.toHaveBeenCalled();
+    checking(accepted.id);
+    await service.refresh(accepted.id, "urgent");
+    expect(edit).toHaveBeenCalledOnce();
+    expect(edit.mock.calls[0]![0]).toMatchObject({
+      priority: "urgent", projection: { expectedVersion: store.get(accepted.id)!.version },
+    });
+  });
+
   it("reports a detached heartbeat failure once and retires its blocked presenter", async () => {
     vi.useFakeTimers();
     const accepted = await accept(70);
@@ -683,6 +709,7 @@ describe("TelegramDurableStatusService", () => {
     });
     await service.refresh(accepted.id, "urgent");
     edit.mockRejectedValueOnce(heartbeatError);
+    checking(accepted.id);
 
     now += 10_000;
     await vi.advanceTimersByTimeAsync(10_000);
@@ -740,7 +767,7 @@ describe("TelegramDurableStatusService", () => {
       jobId: current.id,
       eventId: `latest-${current.id}`,
       expectedVersion: current.version,
-      event: { schemaVersion: 1, type: "activity.observed", eventAt: now, activity: "tool" },
+      event: { schemaVersion: 1, type: "activity.observed", eventAt: now, health: "checking" },
     });
     release();
 
@@ -777,7 +804,7 @@ describe("TelegramDurableStatusService", () => {
       jobId: current.id,
       eventId: `first-trailing-${current.id}`,
       expectedVersion: current.version,
-      event: { schemaVersion: 1, type: "activity.observed", eventAt: now, activity: "tool" },
+      event: { schemaVersion: 1, type: "activity.observed", eventAt: now, health: "checking" },
     });
     edit.mockImplementationOnce(async () => {
       current = store.get(accepted.id)!;
@@ -785,7 +812,7 @@ describe("TelegramDurableStatusService", () => {
         jobId: current.id,
         eventId: `second-trailing-${current.id}`,
         expectedVersion: current.version,
-        event: { schemaVersion: 1, type: "activity.observed", eventAt: now, health: "quiet" },
+        event: { schemaVersion: 1, type: "activity.observed", eventAt: now, health: "healthy" },
       });
       now += 10_000;
     }).mockRejectedValueOnce(trailingError);
@@ -806,6 +833,7 @@ describe("TelegramDurableStatusService", () => {
     const service = status();
     await service.refresh(accepted.id);
     let resolved = false;
+    checking(accepted.id);
 
     const future = service.refresh(accepted.id).then(() => { resolved = true; });
     await Promise.resolve();
@@ -879,6 +907,7 @@ describe("TelegramDurableStatusService", () => {
     edit.mockClear();
 
     await service.disposeJob(first.id);
+    checking(second.id);
 
     expect(service.activePresenterCount).toBe(1);
     expect(edit).not.toHaveBeenCalled();
@@ -910,6 +939,12 @@ describe("TelegramDurableStatusService", () => {
     const result = ingress.accept(source);
     await ingress.materialize(result.job.id);
     return result.job;
+  }
+
+  function checking(jobId: string): void {
+    const job = store.get(jobId)!;
+    store.transition({ jobId, eventId: `checking-${jobId}-${job.version}`, expectedVersion: job.version,
+      event: { schemaVersion: 1, type: "activity.observed", eventAt: now, health: "checking" } });
   }
 
   function queue(jobId: string): void {

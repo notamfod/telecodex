@@ -1,3 +1,4 @@
+import { ForumTopicAvailabilityUnknownError } from "./telegram-topic-liveness.js";
 import { registerInboxCommands } from "./bot-inbox-commands.js";
 import { TaskProvisioningService, TaskProvisioningStore } from "./task-provisioning.js";
 
@@ -171,13 +172,26 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): { dispos
       const candidates = inbox.listTicketsByKey(first.contextKey, externalKey);
       for (const candidate of candidates) {
         if (candidate.resolvedAt !== undefined || !candidate.workTopicId) continue;
-        if (await deps.topicIsAlive(first.chatId, candidate.workTopicId)) {
+        let reusable: boolean;
+        try { reusable = await deps.topicIsAlive(first.chatId, candidate.workTopicId); }
+        catch (error) {
+          if (!(error instanceof ForumTopicAvailabilityUnknownError)) throw error;
+          // The binding chooses the destination; the requested append establishes delivery.
+          // Its durable bound intent below prevents replay after an ambiguous response.
+          reusable = true;
+        }
+        if (reusable) {
           progress.outcome = "topic_exists";
           progress.workTopicId = candidate.workTopicId;
           provisioning.store.accept({ operationId, sourceContextKey: first.contextKey, sourceMessageIds: group.map(item => item.messageId), title: ticketTopicName(candidate.id, text, candidate.externalKey), workspace: settings.workspace, launchProfileId: settings.launchProfileId, kind: "inbox", metadata: { ticketId: candidate.id } });
           provisioning.store.patch(operationId, { state: "bound", messageThreadId: candidate.workTopicId });
           try { await appendToTicket(candidate, group, text, source); }
-          catch (error) { provisioning.store.patch(operationId, { state: "failed", failureStage: "ready" }); throw error; }
+          catch (error) {
+            // Several sends may already have succeeded, even if a later one was rejected.
+            provisioning.store.patch(operationId, { state: "unknown", failureStage: "ready" });
+            progress.outcome = "processing_failed";
+            throw error;
+          }
           provisioning.store.patch(operationId, { state: "ready" });
           return;
         }

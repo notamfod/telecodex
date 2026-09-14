@@ -64,8 +64,8 @@ it("uses confirmed Telegram result and status links without remote writes", asyn
   const linked = store.update(initial.contextKey, initial.version, { latestJobId: "job", latestJobVersion: 2, lastResultMessageId: 90, agentState: "needs_input" })!;
   read.mockResolvedValue({ safe: false, projection: { ...projection([]), delivery: { anchorMessageId: 80 } } });
   expect(await controls.links(linked.contextKey)).toEqual([
-    { label: "Открыть результат", url: "https://t.me/c/123/90" },
-    { label: "Открыть переписку с запросом", url: "https://t.me/c/123/50" },
+    { label: "Ответить в топике", url: "https://t.me/c/123/50" },
+    { label: "Последний результат", url: "https://t.me/c/123/90" },
     { label: "Подробности прогона", url: "https://t.me/c/123/80" },
   ]);
   expect(close).not.toHaveBeenCalled(); expect(runJob).not.toHaveBeenCalled();
@@ -74,5 +74,35 @@ it("does not acknowledge ineffective details as successful work", async () => {
   bindJob(); read.mockResolvedValue({ safe: false, projection: projection([{ kind: "details", jobId: "job", expectedVersion: 2 }]) });
   const action = (await controls.actions(task.contextKey))[0]!;
   await expect(controls.run(action)).rejects.toThrow("Открой подробности");
+  expect(runJob).not.toHaveBeenCalled();
+});
+
+
+it("keeps the confirmed result accessible when live status is unavailable", async () => {
+  const initial = store.ensure({ chatId: -100123, messageThreadId: 50, title: "Task", workspace: "/srv" });
+  const linked = store.update(initial.contextKey, initial.version, { lastResultMessageId: 90 })!;
+  read.mockRejectedValue(new Error("status unavailable"));
+  expect(await controls.links(linked.contextKey)).toEqual([
+    { label: "Последний результат", url: "https://t.me/c/123/90" },
+  ]);
+  expect(runJob).not.toHaveBeenCalled();
+});
+
+it("does not duplicate result links or use a stale status version", async () => {
+  const initial = store.ensure({ chatId: -100123, messageThreadId: 50, title: "Task", workspace: "/srv" });
+  const linked = store.update(initial.contextKey, initial.version, { latestJobId: "job", latestJobVersion: 2, lastResultMessageId: 90 })!;
+  read.mockResolvedValue({ safe: false, projection: { ...projection([]), delivery: { anchorMessageId: 90 } } });
+  expect(await controls.links(linked.contextKey)).toEqual([{ label: "Последний результат", url: "https://t.me/c/123/90" }]);
+  read.mockResolvedValue({ safe: false, projection: { ...projection([]), expectedVersion: 1, delivery: { anchorMessageId: 80 } } });
+  expect(await controls.links(linked.contextKey)).toEqual([{ label: "Последний результат", url: "https://t.me/c/123/90" }]);
+});
+
+it("fails closed for actions while preserving links when inspection is unavailable", async () => {
+  const legal = (await controls.actions(task.contextKey))[0]!;
+  read.mockRejectedValue(new Error("live status unavailable"));
+  expect(await controls.actions(task.contextKey)).toEqual([]);
+  await expect(controls.run(legal)).rejects.toMatchObject({ statusCode: 409 });
+  expect(close).not.toHaveBeenCalled();
+  expect(reopen).not.toHaveBeenCalled();
   expect(runJob).not.toHaveBeenCalled();
 });

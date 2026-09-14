@@ -18,7 +18,8 @@ export function taskAgentState(projection: TelegramJobStatusProjection, waitingO
     case "delivering": return "delivering";
     case "terminal_delivered": return projection.isDone ? "result_ready" : "unknown";
     case "terminal_aborted": return "idle";
-    case "terminal_failed": case "delivery_failed": return "failed";
+    case "terminal_failed": return "failed";
+    case "delivery_failed": return "unknown";
     default: return "unknown";
   }
 }
@@ -46,14 +47,15 @@ const labels: Record<TopicTaskAgentState, string> = {
 };
 
 export function renderTopicTask(task: TopicTaskRecord): { html: string; plain: string } {
-  const lines = [task.title, `Проект: ${path.basename(task.workspace) || task.workspace}`,
-    task.lifecycle === "completed" ? "Задача завершена" : labels[task.agentState]];
+  const lines = [task.lifecycle === "completed" ? "Задача завершена" : labels[task.agentState],
+    task.title, `Проект: ${path.basename(task.workspace) || task.workspace}`];
   if (task.presence !== "open") lines.push(task.presence === "closed" ? "Топик закрыт для переписки"
     : task.presence === "missing" ? "Топик недоступен" : "Доступность топика не подтверждена");
-  if (task.lastEventAt !== null) lines.push(`Подтверждено: ${new Date(task.lastEventAt).toISOString().replace("T", " ").slice(0, 19)} UTC`);
-  else lines.push("Подтверждённых событий прогона пока нет");
   if (task.agentState === "needs_input" || task.agentState === "needs_approval") {
-    lines.push("Открой запрос агента в переписке или в клиенте, где начат прогон.");
+    lines.push("\nОткрой запрос агента в переписке или в клиенте, где начат прогон.");
+  }
+  if (["failed", "stalled", "unknown"].includes(task.agentState)) {
+    lines.push("\nОткрой подробности прогона и проверь доступные действия.");
   }
   if (task.pinState === "forbidden") lines.push("Не удалось закрепить карточку: её можно закрепить вручную.");
   if (task.pinState === "unknown") lines.push("Закрепление не подтверждено. Проверь закрепы топика.");
@@ -61,6 +63,5 @@ export function renderTopicTask(task: TopicTaskRecord): { html: string; plain: s
     ? `https://t.me/c/${String(task.chatId).slice(4)}/${task.lastResultMessageId}` : null;
   const html = [`<b>${escapeHTML(lines[0])}</b>`, ...lines.slice(1).map(escapeHTML)];
   if (resultUrl) html.push(`<a href="${resultUrl}">Последний подтверждённый результат</a>`);
-  else html.push("Ссылки на подтверждённый результат пока нет");
-  return { html: html.join("\n"), plain: [...lines, resultUrl ? `Последний подтверждённый результат: ${resultUrl}` : "Ссылки на подтверждённый результат пока нет"].join("\n") };
+  return { html: html.join("\n"), plain: [...lines, ...(resultUrl ? [`Последний подтверждённый результат: ${resultUrl}`] : [])].join("\n") };
 }

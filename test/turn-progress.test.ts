@@ -1,4 +1,5 @@
 import { vi } from "vitest";
+import { mapAppServerActivity } from "../src/app-server-activity.js";
 
 import {
   TurnProgressTransportError,
@@ -189,12 +190,80 @@ describe("TurnProgressPresenter", () => {
     const message = send.mock.calls[0]![0];
     for (const text of [message.html, message.plain]) {
       expect(text).toContain(label);
-      expect(text).toContain("Инструмент");
-      expect(text).toContain("Доставлено: 1/1");
+      expect(text).not.toContain("Инструмент");
+      expect(text).not.toContain("Доставлено: 1/1");
       expect(text).not.toContain(state);
       expect(text).not.toContain("TECHNICAL_REASON");
     }
     expect(message).toMatchObject({ projection, actions: projection.actions });
+    await presenter.dispose();
+  });
+
+  it("keeps routine seconds invisible while surfacing waiting and failure immediately", async () => {
+    let current = projected();
+    const messages: string[] = [];
+    const presenter = durablePresenter({
+      projection: () => current,
+      anchor: {
+        prepare: async ({ message }) => { messages.push(message.plain); return { kind: "unchanged", messageId: 501 }; },
+        finish: async () => undefined,
+      },
+    });
+    await presenter.start();
+    current = projected({ activity: { kind: "tool", eventAt: NOW - 12_000, ageMs: 13_000 } });
+    await presenter.refreshStatus();
+    expect(messages[0]).toBe("⏳ Выполняю запрос");
+    expect(messages[1]).toBe(messages[0]);
+    current = projected({ activity: { kind: "waiting", eventAt: NOW, ageMs: 0 } });
+    await presenter.refreshStatus();
+    expect(messages[2]).toContain("Ожидаю продолжения");
+    expect(messages[2]).not.toContain("Проверь запрос агента");
+    current = projected({ state: "delivery_failed" });
+    await presenter.refreshStatus();
+    expect(messages[3]).toContain("Не удалось доставить ответ");
+    expect(messages[3]).toContain("Открой подробности");
+    expect(messages[3]).not.toContain("Запрос завершился ошибкой");
+    await presenter.dispose();
+  });
+
+  it("does not request user input for an ordinary agent sleep", async () => {
+    const activity = mapAppServerActivity("item/started", { item: { type: "sleep" } })!;
+    const projection = projected({ activity: { kind: activity.activity, eventAt: NOW, ageMs: 0 } });
+    let plain = "";
+    const presenter = durablePresenter({ projection: () => projection, anchor: {
+      prepare: async ({ message }) => { plain = message.plain; return { kind: "unchanged", messageId: 501 }; },
+      finish: async () => undefined,
+    } });
+    await presenter.start();
+    expect(plain).toBe("⏳ Ожидаю продолжения");
+    await presenter.dispose();
+  });
+
+  it.each(["checking", "unavailable"] as const)("keeps %s health visible during a sleep", async (health) => {
+    const projection = projected({ health, activity: { kind: "waiting", eventAt: NOW, ageMs: 0 } });
+    let plain = "";
+    const presenter = durablePresenter({ projection: () => projection, anchor: {
+      prepare: async ({ message }) => { plain = message.plain; return { kind: "unchanged", messageId: 501 }; },
+      finish: async () => undefined,
+    } });
+    await presenter.start();
+    expect(plain).toContain(health === "checking" ? "Проверяю состояние" : "Проверка состояния недоступна");
+    await presenter.dispose();
+  });
+
+  it("quantizes quiet activity age to minutes and retains action versions", async () => {
+    let current = projected({ health: "quiet", activity: { kind: "tool", eventAt: NOW - 61_000, ageMs: 61_000 } });
+    const messages: Array<{ plain: string; actions?: readonly unknown[] }> = [];
+    const presenter = durablePresenter({ projection: () => current, anchor: {
+      prepare: async ({ message }) => { messages.push(message); return { kind: "unchanged", messageId: 501 }; },
+      finish: async () => undefined,
+    } });
+    await presenter.start();
+    current = { ...current, activity: { ...current.activity!, ageMs: 62_000 } };
+    await presenter.refreshStatus();
+    expect(messages[0]!.plain).toContain("1 мин");
+    expect(messages[1]!.plain).toBe(messages[0]!.plain);
+    expect(messages[1]!.actions).toBe(current.actions);
     await presenter.dispose();
   });
 

@@ -3,6 +3,9 @@ import { mkdtempSync, existsSync, rmSync, mkdirSync, writeFileSync } from "node:
 import path from "node:path";
 import os from "node:os";
 import { createBotTopicTasks } from "../src/bot-topic-tasks.js";
+import { createDashboardController } from "../src/dashboard-controller.js";
+import { TopicTaskStore } from "../src/topic-task-store.js";
+import { taskActionLabel } from "../src/topic-task-controls.js";
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
 function harness(withControls = false) {
@@ -10,14 +13,15 @@ function harness(withControls = false) {
  const api = { editMessageReplyMarkup: vi.fn(async () => true), closeForumTopic: vi.fn(async () => true), reopenForumTopic: vi.fn(async () => true), sendMessage: vi.fn(async () => ({ message_id: 42 })), editMessageText: vi.fn(async () => true), pinChatMessage: vi.fn(async () => true), sendChatAction: vi.fn(async () => true), editForumTopic: vi.fn(async () => true) };
  const reply = vi.fn(async () => {});
  const gate = { run: vi.fn(async (_chat, _priority, operation) => operation()) };
+ const read = vi.fn(async () => ({ safe: true, projection: null }));
  const metadata = { workspace, topicName: "Проверить оплату", threadId: "thread-1" };
  const tasks = createBotTopicTasks({ api: api as never, workspace, forumChatId: -100123,
   metadata: () => metadata, isExcluded: () => false,
-  ...(withControls ? { controls: { read: async () => ({ safe: true, projection: null }), serialize: async <T>(_key: string, fn: () => Promise<T>) => fn(), syncInbox: async () => {}, runJob: async () => {} } } : {}),
+  ...(withControls ? { controls: { read, serialize: async <T>(_key: string, fn: () => Promise<T>) => fn(), syncInbox: async () => {}, runJob: async () => {} } } : {}),
   gate: gate as never, report: vi.fn() });
  const ctx = { chat: { id: -100123 }, message: { message_thread_id: 5, text: "/task" }, reply } as never;
  cleanups.push(async () => { await tasks.dispose(); rmSync(workspace, { recursive: true, force: true }); });
- return { tasks, ctx, api, reply, workspace, gate, metadata };
+ return { tasks, ctx, api, reply, workspace, gate, metadata, read };
 }
 it("does not create a database or send until explicit activation; commands reuse identity", async () => {
  const { tasks, ctx, api, workspace } = harness();
@@ -57,7 +61,7 @@ it("retains manual title queued before a stale metadata refresh", async () => {
 });
 it("refreshes automatic titles and gates probes as well as card writes", async () => {
  const { tasks, ctx, api, metadata, gate, reply } = harness(); await tasks.command(ctx);
- expect(gate.run).toHaveBeenCalledTimes(3);
+ expect(gate.run).toHaveBeenCalledTimes(4);
  metadata.topicName = "Новое название";
  await tasks.interact({ chatId: -100123, messageThreadId: 5 });
  expect(api.editMessageText).toHaveBeenLastCalledWith(-100123, 42, expect.stringContaining("Новое название"), expect.anything(), expect.anything());
@@ -71,6 +75,7 @@ it("a corrupt optional card database conservatively blocks automatic rename with
 });
 it("bounds an edit waiting for gate admission and never dispatches after cancellation", async () => {
  const { tasks, ctx, metadata, api, gate } = harness(); await tasks.command(ctx);
+ api.editMessageText.mockClear();
  const deadline = new AbortController();
  const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
  let queued = false;
@@ -172,4 +177,65 @@ it("registers an explicitly created task without an implicit Telegram send", asy
   expect(rows.filter(row => row.messageThreadId === 55)).toHaveLength(1);
   expect(rows.find(row => row.messageThreadId === 55)?.title).toBe("Новая работа");
   expect(api.sendMessage).not.toHaveBeenCalled();
+});
+
+function recordConfirmedResult(workspace: string): void {
+  const store = new TopicTaskStore(path.join(workspace, ".telecodex", "topic-tasks.sqlite"));
+  try {
+    const task = store.get("-100123:5")!;
+    store.update(task.contextKey, task.version, { lastResultMessageId: 99 });
+  } finally { store.close(); }
+}
+
+it("keeps the bot result URL and removes lifecycle buttons when inspection fails", async () => {
+  const { tasks, ctx, api, workspace, read } = harness(true);
+  const destination = { chatId: -100123, messageThreadId: 5 };
+  await tasks.command(ctx);
+  const [previousAction] = await tasks.actions(destination);
+  expect(previousAction.kind).toBe("complete");
+  recordConfirmedResult(workspace);
+  read.mockRejectedValue(new Error("session inspection unavailable"));
+  api.editMessageReplyMarkup.mockClear();
+
+  await tasks.command(ctx);
+
+  expect(api.editMessageReplyMarkup).toHaveBeenCalledOnce();
+  expect(api.editMessageReplyMarkup).toHaveBeenLastCalledWith(-100123, 42, {
+    reply_markup: { inline_keyboard: [[{ text: "Последний результат", url: "https://t.me/c/123/99" }]] },
+  }, expect.anything());
+  await expect(tasks.actions(destination)).resolves.toEqual([]);
+  await expect(tasks.runAction(previousAction)).rejects.toThrow("Состояние изменилось");
+  expect(api.closeForumTopic).not.toHaveBeenCalled();
+  expect(api.reopenForumTopic).not.toHaveBeenCalled();
+  expect(api.sendMessage).toHaveBeenCalledOnce();
+});
+
+it("loads the real Dashboard consumer with a confirmed result and no actions after inspection fails", async () => {
+  const { tasks, ctx, api, workspace, read } = harness(true);
+  await tasks.command(ctx);
+  recordConfirmedResult(workspace);
+  read.mockRejectedValue(new Error("session inspection unavailable"));
+  const controller = createDashboardController({
+    chatId: -100123,
+    collect: async () => ({ running: [], queued: [], recent: [], recentThreads: [], recentThreadCount: 0,
+      now: Date.now(), limit: 10, telegramActive: 0, codexAvailable: false, failedJobs24h: 0 }),
+    loadTasks: async () => tasks.dashboardTasks(),
+    taskRowLinks: task => tasks.links(task),
+    taskRowActions: async task => (await tasks.actions(task)).map(action => ({ action, label: taskActionLabel(action) })),
+    getThread: () => null,
+    ensureThreadTopic: vi.fn(),
+  });
+  const before = api.editMessageReplyMarkup.mock.calls.length;
+
+  const dashboard = await controller.loadDashboard({ view: "recent", offset: 0, limit: 30 });
+
+  expect(dashboard.sessions).toHaveLength(1);
+  expect(dashboard.sessions[0]).toMatchObject({
+    taskLinks: [{ label: "Последний результат", url: "https://t.me/c/123/99" }],
+    taskActions: [],
+  });
+  expect(api.editMessageReplyMarkup).toHaveBeenCalledTimes(before);
+  expect(api.closeForumTopic).not.toHaveBeenCalled();
+  expect(api.reopenForumTopic).not.toHaveBeenCalled();
+  expect(api.sendMessage).toHaveBeenCalledOnce();
 });

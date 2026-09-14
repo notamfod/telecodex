@@ -35,6 +35,8 @@ export type {
 
 const TELEGRAM_TEXT_LIMIT = 4_096;
 const TELEGRAM_CAPTION_LIMIT = 1_024;
+// Reserve the longest possible label before re-splitting multipart text.
+const MULTIPART_LABEL_BUDGET = `<b>Часть ${TELEGRAM_RESPONSE_PLAN_MAX_PARTS} из ${TELEGRAM_RESPONSE_PLAN_MAX_PARTS}</b>\n\n`.length;
 const SAFE_FAILURE_CODE_LIMIT = 128;
 const SAFE_FAILURE_DETAIL_LIMIT = 1_024;
 // 512 legacy-sized deliveries at the 3,000 UTF-16 source target bound both fan-out and rendering work.
@@ -130,8 +132,10 @@ export function buildTelegramResponsePlan(input: {
           0,
           "status-anchor",
           anchorPayload(destination, generated.parts.length === 0
-            ? failure === undefined ? "Completed." : failureText(failure)
-            : "Response follows."),
+            ? failure === undefined ? "Готово." : failureText(failure)
+            : generated.parts.length > 1
+              ? "Ответ будет отправлен ниже несколькими сообщениями."
+              : "Ответ будет отправлен ниже."),
         );
   const content = [...summaries, ...(editable === undefined ? generated.parts : [])];
   const notice: TelegramPlannedResponsePart[] = failure === undefined || generated.parts.length === 0
@@ -256,6 +260,23 @@ function buildLegacyContentParts(
       chunks = splitTelegramMarkdown(
         content.text, 3_000, TELEGRAM_TEXT_LIMIT, TELEGRAM_RESPONSE_PLAN_MAX_PARTS - parts.length,
       );
+      if (chunks.length > 1 || chunks.some((chunk) => chunk.html.length > TELEGRAM_TEXT_LIMIT)) {
+        const htmlBudget = TELEGRAM_TEXT_LIMIT - MULTIPART_LABEL_BUDGET;
+        let splitBudget = htmlBudget;
+        // The formatter counts code points; the durable payload also bounds UTF-16 length.
+        // Tighten the split target until both contracts leave room for the label.
+        do {
+          chunks = splitTelegramMarkdown(
+            content.text, 3_000, splitBudget, TELEGRAM_RESPONSE_PLAN_MAX_PARTS - parts.length,
+          );
+          const overflow = Math.max(0, ...chunks.map((chunk) => chunk.html.length - htmlBudget));
+          if (overflow === 0) break;
+          splitBudget -= overflow;
+        } while (true);
+        if (chunks.length > 1) chunks = chunks.map((chunk, index, all) => ({
+          ...chunk, html: `<b>Часть ${index + 1} из ${all.length}</b>\n\n${chunk.html}`,
+        }));
+      }
     } catch (error) {
       if (error instanceof Error && error.message === "Telegram markdown split exceeds chunk budget") {
         deliveryBudgetExceeded();
@@ -540,7 +561,8 @@ function normalizeFailure(value: TelegramResponseFailure): TelegramResponseFailu
 }
 
 function failureText(value: TelegramResponseFailure): string {
-  return value.publicDetail === undefined ? value.code : `${value.code}: ${value.publicDetail}`;
+  const notice = `Не удалось завершить задачу. Код: ${value.code}.`;
+  return value.publicDetail === undefined ? notice : `${notice} ${value.publicDetail}`;
 }
 
 function publicFailureDetail(value: unknown): string {

@@ -40,6 +40,7 @@ export function createTelegramTopicRecoveryAdapter(
   if (!options.enabled) return undefined;
   const getThread = options.getThread ?? readThread;
   const probeForumTopic = createForumTopicLivenessProbe({
+    requireDefinitiveErrors: true,
     sendChatAction: (chatId, action, requestOptions, signal) =>
       options.api.sendChatAction(chatId, action, requestOptions, signal as never),
   });

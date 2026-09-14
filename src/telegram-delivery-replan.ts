@@ -172,14 +172,19 @@ export class TelegramDeliveryReplan {
     primary: NormalizedDelivery,
   ): { readonly responsePlan: readonly TelegramResponsePlanPart[]; readonly deliveries: readonly TelegramDeliveryPart[] } {
     if (primary.kind !== "status-anchor" || primary.ordinal !== 0
-      || primary.payload.operation !== "edit_rich" || primary.telegramMessageId === null
-      || primary.payload.messageId !== primary.telegramMessageId) malformed();
+      || (primary.payload.operation !== "edit_rich" && primary.payload.operation !== "send_rich")) malformed();
+    if (primary.payload.operation === "edit_rich"
+      ? primary.telegramMessageId === null || primary.payload.messageId !== primary.telegramMessageId
+      : primary.telegramMessageId !== null) malformed();
     this.assertProjection(job, rows);
     const fallback = primary.payload.fallbackParts;
     if (fallback.length !== 1 || fallback[0]!.kind !== "final"
-      || fallback[0]!.payload.operation !== "edit_text"
-      || fallback[0]!.payload.chatId !== primary.payload.chatId
-      || fallback[0]!.payload.messageId !== primary.payload.messageId) malformed();
+      || fallback[0]!.payload.chatId !== primary.payload.chatId) malformed();
+    if (primary.payload.operation === "edit_rich"
+      ? fallback[0]!.payload.operation !== "edit_text"
+        || fallback[0]!.payload.messageId !== primary.payload.messageId
+      : fallback[0]!.payload.operation !== "send_text"
+        || fallback[0]!.payload.messageThreadId !== primary.payload.messageThreadId) malformed();
     this.assertFallbackKeys(input.partKey, fallback, rows, false);
     const plan = this.readStatusPlan(input.jobId);
     if (plan.contentHash !== primary.contentHash || !same(plan.payload, primary.payload)) malformed();
@@ -188,7 +193,7 @@ export class TelegramDeliveryReplan {
     const updated = this.host.statement(`UPDATE deliveries SET state = 'pending', payload_json = ?, content_hash = ?,
       attempt_count = 0, next_attempt_at_ms = NULL, last_error_code = NULL, updated_at_ms = ?
       WHERE job_id = ? AND part_key = 'status-anchor' AND state = ?
-        AND attempt_count = ? AND content_hash = ? AND telegram_message_id = ?`).run(
+        AND attempt_count = ? AND content_hash = ? AND telegram_message_id IS ?`).run(
       stringify(replacement), contentHash, input.eventAt, input.jobId,
       input.expectedState, input.expectedAttemptCount, input.expectedContentHash, primary.telegramMessageId,
     );

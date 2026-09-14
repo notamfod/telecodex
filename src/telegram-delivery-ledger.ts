@@ -37,6 +37,20 @@ const JOB_ID_MAX_LENGTH = 128;
 const EVENT_ID_MAX_LENGTH = 128;
 const PART_KEY_MAX_LENGTH = 256;
 const DELIVERY_TEXT_MAX_LENGTH = 128;
+// Only the explicit terminal status retry path records this event shape.
+// Legacy pending/sending status rows must not become a new automatic send queue.
+const TERMINAL_STATUS_RETRY_EVENT_WHERE = `event_type = 'delivery.changed'
+  AND json_extract(payload_json, '$.event.phase') = 'terminal'
+  AND json_type(payload_json, '$.event.responsePlan') IS NULL
+  AND json_type(payload_json, '$.event.deliveries') IS NULL`;
+const AUTHORIZED_TERMINAL_STATUS_WHERE = `(json_extract(jobs.projection_json, '$.phase') = 'terminal'
+  AND json_extract(jobs.projection_json, '$.outcome') IN ('failed', 'aborted', 'recovery_interrupted')
+  AND json_type(jobs.projection_json, '$.responsePlan') IS NULL
+  AND deliveries.part_key = 'status-anchor' AND deliveries.kind = 'status-anchor' AND deliveries.ordinal = 0
+  AND CASE WHEN json_valid(deliveries.payload_json)
+    THEN json_extract(deliveries.payload_json, '$.operation') IN ('edit_text', 'send_text') ELSE 0 END
+  AND EXISTS (SELECT 1 FROM job_events WHERE job_events.job_id = jobs.id
+    AND ${TERMINAL_STATUS_RETRY_EVENT_WHERE}))`;
 
 export interface DeliveryPart {
   readonly jobId: string; readonly partKey: string; readonly ordinal: number; readonly kind: string; readonly state: DeliveryState;
@@ -440,6 +454,28 @@ export class TelegramDeliveryLedger {
         });
         return { delivery, job };
       }
+      if (currentJob.phase === "terminal" && currentJob.responsePlan === undefined
+        && currentJob.outcome !== "completed" && currentPart.partKey === "status-anchor"
+        && currentPart.kind === "status-anchor" && currentPart.ordinal === 0) {
+        const startsExplicitRetry = input.allowFailedRetry === true
+          && input.expectedState === "failed" && input.state === "sending";
+        if (!startsExplicitRetry && !this.host.statement(`SELECT 1 FROM job_events
+          WHERE job_id = ? AND ${TERMINAL_STATUS_RETRY_EVENT_WHERE} LIMIT 1`).get(currentJob.id)) {
+          throw new Error("Telegram delivery conflict");
+        }
+        const payload = normalizeTelegramDeliveryPayload(currentPart.payload);
+        if ((payload.operation !== "edit_text" && payload.operation !== "send_text")
+          || hashTelegramDeliveryPayload(payload) !== currentPart.contentHash) {
+          throw new Error("Telegram delivery conflict");
+        }
+        const delivery = this.update(input, currentPart);
+        // Status delivery must never rewrite a finished task's outcome or attention.
+        const job = this.host.applyTransition({
+          jobId: currentJob.id, eventId: input.eventId, expectedVersion: currentJob.version,
+          event: { schemaVersion: 1, type: "delivery.changed", phase: "terminal", eventAt: input.updatedAt },
+        });
+        return { delivery, job };
+      }
       if (currentJob.phase !== "delivering" || currentJob.responsePlan === undefined) {
         throw new Error("Telegram job version conflict");
       }
@@ -494,7 +530,7 @@ export class TelegramDeliveryLedger {
           AND json_type(jobs.projection_json, '$.responsePlan') = 'array')
         OR (json_extract(jobs.projection_json, '$.phase') = 'running'
           AND json_type(jobs.projection_json, '$.responsePlan') IS NULL
-          AND deliveries.kind = 'summary')) ELSE 0 END
+          AND deliveries.kind = 'summary') OR ${AUTHORIZED_TERMINAL_STATUS_WHERE}) ELSE 0 END
       AND NOT EXISTS (SELECT 1 FROM job_quarantine WHERE job_quarantine.job_id = jobs.id)
       AND NOT EXISTS (SELECT 1 FROM topic_resume_attempts WHERE topic_resume_attempts.job_id = jobs.id
         AND topic_resume_attempts.state != 'delivery_handoff')
@@ -516,7 +552,7 @@ export class TelegramDeliveryLedger {
         json_extract(jobs.projection_json, '$.phase') = 'delivering'
         OR (json_extract(jobs.projection_json, '$.phase') = 'running'
           AND json_type(jobs.projection_json, '$.responsePlan') IS NULL
-          AND deliveries.kind = 'summary')) ELSE 0 END
+          AND deliveries.kind = 'summary') OR ${AUTHORIZED_TERMINAL_STATUS_WHERE}) ELSE 0 END
       AND NOT EXISTS (SELECT 1 FROM job_quarantine WHERE job_quarantine.job_id = jobs.id)
       AND NOT EXISTS (SELECT 1 FROM topic_resume_attempts WHERE topic_resume_attempts.job_id = jobs.id
         AND topic_resume_attempts.state != 'delivery_handoff')
@@ -538,7 +574,7 @@ export class TelegramDeliveryLedger {
         json_extract(jobs.projection_json, '$.phase') = 'delivering'
         OR (json_extract(jobs.projection_json, '$.phase') = 'running'
           AND json_type(jobs.projection_json, '$.responsePlan') IS NULL
-          AND deliveries.kind = 'summary')) ELSE 0 END
+          AND deliveries.kind = 'summary') OR ${AUTHORIZED_TERMINAL_STATUS_WHERE}) ELSE 0 END
       AND NOT EXISTS (SELECT 1 FROM job_quarantine WHERE job_quarantine.job_id = jobs.id)
       AND NOT EXISTS (SELECT 1 FROM topic_resume_attempts WHERE topic_resume_attempts.job_id = jobs.id
         AND topic_resume_attempts.state != 'delivery_handoff')`).get() as { next_at?: unknown };

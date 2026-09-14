@@ -18,6 +18,7 @@ import type { TelegramTopicResumeExternalEligibilitySnapshot } from "./telegram-
 import type { TelegramTopicResumeDeliveryFence } from "./telegram-topic-resume-delivery-guard.js";
 import { exactRichFallbackInstalled } from "./telegram-delivery-outbox-rich.js";
 import { TelegramDeliveryApiError, TelegramDeliveryLocalError } from "./telegram-delivery-error.js";
+import { missingStatusAnchorSendPayload } from "./telegram-status-anchor-ledger.js";
 import {
   assertPayloadMediaAvailable,
   DeliveryMediaUnavailableError,
@@ -387,7 +388,7 @@ export class TelegramDeliveryOutbox {
     } catch (error) {
       if (error instanceof TelegramDeliveryApiError && error.code === "message_missing") {
         if (part.partKey !== "status-anchor" || part.kind !== "status-anchor"
-          || payload.operation !== "edit_text" || part.telegramMessageId !== payload.messageId
+          || !isKnownEdit(payload) || part.telegramMessageId !== payload.messageId
           || part.nextAttemptAt === null) {
           return this.failPermanent(part);
         }
@@ -399,12 +400,7 @@ export class TelegramDeliveryOutbox {
           return this.failPermanent(part);
         }
         if (destination.chatId !== payload.chatId) return this.failPermanent(part);
-        const replacementPayload: TelegramDeliveryPayload = {
-          operation: "send_text",
-          chatId: payload.chatId,
-          messageThreadId: destination.messageThreadId,
-          text: payload.text,
-        };
+        const replacementPayload = missingStatusAnchorSendPayload(payload, destination.messageThreadId);
         const replacement = this.options.store.replaceMissingStatusAnchorEdit({
           jobId: part.jobId,
           expectedAttemptCount: part.attemptCount,

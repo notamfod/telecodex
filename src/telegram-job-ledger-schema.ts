@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 const TABLES_V1 = {
   inbox_updates: `CREATE TABLE inbox_updates (
@@ -111,6 +111,16 @@ const TABLES_V9 = {
   )`,
 } as const;
 
+const TABLES_V10 = {
+  ...TABLES_V9,
+  topic_resume_attempt_history: `CREATE TABLE topic_resume_attempt_history (
+    job_id TEXT NOT NULL, action_token TEXT NOT NULL UNIQUE,
+    snapshot_json TEXT NOT NULL, superseded_by_action_token TEXT NOT NULL UNIQUE,
+    archived_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (job_id, action_token), FOREIGN KEY (job_id) REFERENCES jobs(id)
+  )`,
+} as const;
+
 export function initializeTelegramJobSchema(database: Database.Database): void {
   database.transaction(() => {
     const version = database.pragma("user_version", { simple: true });
@@ -178,7 +188,12 @@ export function initializeTelegramJobSchema(database: Database.Database): void {
       database.exec(TABLES_V9.topic_resume_attempts);
       database.pragma(`user_version = ${SCHEMA_VERSION}`);
     }
-    validateSchema(database, TABLES_V9);
+    if (version < 10) {
+      validateSchema(database, TABLES_V9);
+      database.exec(TABLES_V10.topic_resume_attempt_history);
+      database.pragma(`user_version = ${SCHEMA_VERSION}`);
+    }
+    validateSchema(database, TABLES_V10);
     database.exec(`CREATE INDEX IF NOT EXISTS inbox_updates_queue_order
       ON inbox_updates (accepted_at_ms, job_id)`);
     database.exec(`CREATE INDEX IF NOT EXISTS job_events_job_sequence
@@ -192,7 +207,7 @@ export function validateTelegramJobSchema(database: Database.Database): void {
   const version = database.pragma("user_version", { simple: true });
   if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 0) malformed();
   if (version !== SCHEMA_VERSION) throw new Error("Unsupported telegram job schema version");
-  validateSchema(database, TABLES_V9);
+  validateSchema(database, TABLES_V10);
 }
 
 function migrateStatusAnchorPlans(database: Database.Database): void {

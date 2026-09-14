@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import path from "node:path";
 
+import type { TelegramTopicResumeRecord } from "./telegram-topic-resume-ledger.js";
+
 import type { CodexThreadRecord } from "./codex-state.js";
 import type { TelegramWorkSource } from "./telegram-job-ingress.js";
 import { validateDelivery } from "./telegram-delivery-ledger.js";
@@ -70,6 +72,30 @@ export function planTelegramTopicResume(
   } catch {
     return null;
   }
+}
+
+/** Operator-only: a terminal, definitive anchor failure may start a new fenced attempt. */
+export function planTelegramFailedTopicResume(
+  input: TelegramTopicResumeEligibilityInput,
+  previous: TelegramTopicResumeRecord,
+): TelegramTopicResumeCandidate | null {
+  try {
+    const anchor = input.deliveries.find(row => row.partKey === "status-anchor");
+    if (!input.hasExistingAttempt || previous.jobId !== input.job.id
+      || previous.state !== "failed" || previous.reasonCode !== "TOPIC_RESUME_DELIVERY_FAILED"
+      || previous.nextAttemptAt !== null || previous.currentJobVersion !== input.job.version
+      || previous.recoveryJobVersionBaseline !== input.recovery?.currentJobVersion
+      || input.job.responsePlan?.length !== 2
+      || !anchor || anchor.attemptCount !== previous.anchorAttemptBaseline + 1
+      || anchor.updatedAt > previous.updatedAt || anchor.updatedAt < previous.startedAt
+      || previous.deliveryTopologyHash !== hashTelegramTopicResumeTopology(input.job, input.deliveries)) return null;
+    const candidate = planTelegramTopicResumeWithContract(input, {
+      mode: "warning_replay", allowExistingAttempt: true,
+      expectedAnchorAttemptCount: anchor.attemptCount,
+      expectedRecoveryJobVersion: previous.recoveryJobVersionBaseline,
+    });
+    return candidate && isDeepStrictEqual(candidate.destination, previous.destination) ? candidate : null;
+  } catch { return null; }
 }
 
 export function isTelegramTopicResumeContinuationValid(

@@ -41,3 +41,31 @@ TeleCodex перезапущен 2026-09-14 в 07:03:24 UTC. Новый PID 1917
 Счётчики до/после выпуска одинаковы: delivering=9, attention=10, pending deliveries=2, failed deliveries=13, sending/uncertain=0. Это исторические записи; повтор и восстановление не запускались. Автосинхронизация остаётся выключенной (onrequest), как до выпуска.
 
 Итоговые проверки: 3454 теста в 209 файлах, 23 браузерных сценария, server/web build, Svelte check (0/0), diff check. Реальный телефон/Telegram WebView не использовался как тестовый стенд; клики и мобильная вёрстка проверены через Playwright, работа установленного API проверена отдельно. Восстановление production из резервной копии не выполнялось.
+
+## Дополнительное обслуживание по указанию «делай»
+
+- [x] Освободить общий /tmp без потери данных и настроить собственный TMPDIR/retention TeleCodex.
+- [x] Проверить восстановление резервной копии в изолированном окружении.
+- [x] Проверить реальный Telegram API на отдельном техническом топике.
+- [x] Проверить назначения и причины исторических сбоев, выполнить доступные штатные действия.
+- [x] Исправить восстановление отсутствующего rich anchor и повтор терминального статусного сообщения; проверить сохранность payload, CAS, неопределённых отправок и конечного результата задачи.
+- [x] Добавить отдельную операторскую повторную попытку failed topic resume с сохранением прежней попытки, новым token/version и повторной проверкой source/binding/topology; не ослаблять обычный retry.
+- [ ] Провести review, tests/build, backup, merge/push, обновить работающий сервис и выполнить восстановление через проверенные операции.
+- [ ] Записать конечные счётчики и ограничения.
+
+/tmp: шесть неиспользуемых Go cache каталогов перенесены в /var/cache/codex-relocated-tmp, SHA256 каждого файла проверен, исходные пути сохранены symlink. Свободно 1,3 ГБ вместо полного tmpfs. Исходники других проектов и Snap private tmp не удалялись. Manifest: /var/cache/codex-relocated-tmp/relocation-20260914.json. В telecodex.service применён TMPDIR=/var/cache/telecodex/tmp (0700), tmpfiles retention 7d; глобальная политика /tmp не изменена. После gated restart PID 288479, healthz/readyz ok, Guardian active, NRestarts=0.
+
+Restore drill: /var/tmp/telecodex-restore-drill-42xbgh0m/report.json. Начальный manifest 529/529, архив исходников 477/477 Git blobs, три SQLite integrity/FK проверки успешны. Текущие адаптеры прочитали 1026 jobs, 48422 events, 1217 deliveries; Guardian и миграция legacy guardian проверены. Синтетическая миграция topic task v1→v3 прошла; реальной task DB в резервной копии не было. unshare -n исключил сетевые эффекты, production не восстанавливался. installed-sha256.json относится к установленной новой сборке, а не к старой сборке внутри backup; с текущим runtime совпало 178/178 файлов.
+
+Live API smoke: /var/tmp/telecodex-live-smoke-e3bz6x0f/report.json. Технический топик 5480, карточка 5481. Через текущие TopicTaskCardService и TopicTaskLifecycleService подтверждены 11/11 вызовов: create, send/edit/pin, close/reopen/close. Изолированная task DB целостна, итоговая карточка ready+pinned+current, топик closed, незавершённых intents нет. Это проверка Telegram API, не физического телефона или Mini App WebView.
+
+Delivery audit: 13 failed anchors состоят из восьми сохранённых rich final answers, четырёх терминальных status updates и одного anchor с предыдущим failed resume, блокирующего два pending followers. Все привязки к исходным thread/topic сохранены; живой classifier подтвердил наличие всех шести топиков. У восьми rich anchors пустой responsePlan предусмотрен контрактом: final answer хранится в самом anchor и совпадает с turnResult. Штатный повтор подтвердил permanent failure; retry терминального status воспроизвёл 500 до сетевого вызова из-за отсутствующего terminal перехода в outbox ledger. Исторические состояния не очищаются вручную и не объявляются доставленными без подтверждения Telegram.
+
+Maintenance design: missing edit_rich becomes send_rich only after definitive message_missing, with unchanged Markdown/media and rebound fallback. The existing hash/attempt/lease/message CAS updates delivery and anchor plan atomically. Terminal status retries retain outcome, attention and terminalAt; pending/sending continuation is gated by a durable explicit-retry event, so historical rows are not adopted automatically. Operator retryFailed creates a fresh failed-resume attempt only after exact evidence checks, archives the previous terminal snapshot, and retains the generic retry fences.
+
+Jobs schema advances from v9 to v10 to retain topic_resume_attempt_history. Old v9 binaries cannot read v10; rollback must use compatible code. Restoring a pre-send database after confirmed external messages would discard their receipts and is not an acceptable rollback. Retention removes history only together with its eligible parent job.
+
+Dry-run of the operator method on a current production DB copy completed the one blocked job with three mock-confirmed sends and a new token; this proves state transitions, not live delivery. A separate copy verified all twelve other anchor recoveries: eight final answers completed, four terminal outcomes preserved. No network transport was used for these database-copy exercises. Independent review passed; three new test files independently passed 30 tests. Rollback build directories formerly untracked in the main checkout were moved with hash verification to /var/backups/telecodex/20260914T034000Z-rollback-builds; main checkout is clean.
+
+Maintenance validation: full Vitest suite passed 3484 tests in 212 files (294.84 s), /var/tmp/telecodex-maintenance-full.log. Independent review found no blocking issues. No frontend behavior changed; the earlier 23 browser scenarios remain the browser evidence for this UX release.
+Final maintenance server/web build and Svelte check (0 errors, 0 warnings) passed; logs /var/tmp/telecodex-maintenance-build.log and /var/tmp/telecodex-maintenance-webcheck.log. No separate lint script exists. Diff check passed.

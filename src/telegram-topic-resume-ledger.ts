@@ -17,6 +17,7 @@ import {
   hashTelegramTopicResumeTopology,
   isTelegramTopicResumeContinuationValid,
   planTelegramTopicResume,
+  planTelegramFailedTopicResume,
   type TelegramTopicResumeCandidate,
   type TelegramTopicResumeEligibilityInput,
   type TelegramTopicResumeMode,
@@ -78,6 +79,10 @@ export interface ReserveTopicResumeInput {
   readonly eventId: string;
   readonly actionToken: string;
   readonly eventAt: number;
+}
+
+export interface RetryFailedTopicResumeInput extends ReserveTopicResumeInput {
+  readonly priorActionToken: string;
 }
 
 export interface TransitionTopicResumeInput {
@@ -156,6 +161,39 @@ export class TelegramTopicResumeLedger {
         job.version, advanced.version, input.eventAt, input.eventAt,
       );
       if (inserted.changes !== 1) conflict();
+      return { job: advanced, resume: this.require(job.id) };
+    }).immediate();
+  }
+
+  retryFailed(input: RetryFailedTopicResumeInput): TelegramTopicResumeResult {
+    validateReserveInput(input);
+    actionToken(input.priorActionToken);
+    return this.host.database.transaction(() => {
+      const previous = this.require(input.candidate.jobId);
+      const job = this.host.getJob(previous.jobId);
+      if (!job || job.version !== input.candidate.expectedVersion
+        || previous.actionToken !== input.priorActionToken || previous.actionToken === input.actionToken
+        || input.eventAt < job.updatedAt || input.eventAt < previous.updatedAt
+        || this.host.statement("SELECT 1 FROM topic_resume_attempt_history WHERE action_token = ? OR superseded_by_action_token = ?")
+          .get(input.actionToken, input.actionToken)) conflict();
+      const evidence = this.deliveryEligibilityInput(job, input.externalEligibilitySnapshot, true);
+      const candidate = evidence ? planTelegramFailedTopicResume(evidence, previous) : null;
+      if (!candidate || !same(candidate, input.candidate) || !input.allowedModes?.has("warning_replay")) conflict();
+      this.host.statement(`INSERT INTO topic_resume_attempt_history
+        (job_id, action_token, snapshot_json, superseded_by_action_token, archived_at_ms)
+        VALUES (?, ?, ?, ?, ?)`).run(job.id, previous.actionToken, JSON.stringify(previous), input.actionToken, input.eventAt);
+      const advanced = this.host.applyTransition({ jobId: job.id, eventId: input.eventId,
+        expectedVersion: job.version, event: resumeEvent(input.eventAt, "TOPIC_RESUME_PROBE_IN_FLIGHT") });
+      const updated = this.host.statement(`UPDATE topic_resume_attempts SET
+        action_token = ?, state = 'probe_in_flight', resume_mode = 'warning_replay',
+        anchor_attempt_baseline = ?, reserved_job_version = ?, current_job_version = ?,
+        next_attempt_at_ms = NULL, reason_code = NULL, started_at_ms = ?, updated_at_ms = ?
+        WHERE job_id = ? AND action_token = ? AND state = 'failed'
+          AND reason_code = 'TOPIC_RESUME_DELIVERY_FAILED' AND current_job_version = ?
+          AND next_attempt_at_ms IS NULL`).run(input.actionToken, candidate.anchorAttemptCount,
+        job.version, advanced.version, input.eventAt, input.eventAt, job.id,
+        previous.actionToken, job.version);
+      if (updated.changes !== 1) conflict();
       return { job: advanced, resume: this.require(job.id) };
     }).immediate();
   }

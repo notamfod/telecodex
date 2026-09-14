@@ -6,7 +6,7 @@ import type { SqliteTelegramJobStore } from "./telegram-job-store.js";
 import type { TelegramJob } from "./telegram-job-types.js";
 import type { TelegramStatusAction } from "./telegram-status-projection.js";
 import type { ForumTopicLiveness } from "./telegram-topic-liveness.js";
-import { planTelegramTopicResume, type TelegramTopicResumeCandidate, type TelegramTopicResumeMode }
+import { planTelegramFailedTopicResume, planTelegramTopicResume, type TelegramTopicResumeCandidate, type TelegramTopicResumeMode }
   from "./telegram-topic-resume.js";
 import type {
   TelegramTopicResumeExternalEligibilitySnapshot,
@@ -33,10 +33,17 @@ export type TopicResumeStore = Pick<
   | "get" | "readSourcePayload" | "listDeliveries" | "getTopicRecovery"
   | "getStatusAnchorPlan" | "hasJobQuarantine" | "reserveTopicResume"
   | "transitionTopicResume" | "settleTopicResumeDelivery" | "getTopicResume"
-  | "listTopicResumes" | "containTopicResumeDeliveries"
+  | "listTopicResumes" | "containTopicResumeDeliveries" | "retryFailedTopicResume"
 >;
 
+export interface RetryFailedTopicResumeAction {
+  readonly jobId: string;
+  readonly expectedVersion: number;
+  readonly priorActionToken: string;
+}
+
 export interface TelegramTopicResumeRuntime {
+  retryFailed(input: RetryFailedTopicResumeAction): Promise<void>;
   resume(action: TelegramStatusAction): Promise<void>;
   reconcile(): Promise<void>;
   dispose(): void;
@@ -400,6 +407,31 @@ export function createTelegramTopicResumeRuntime(
 
   return {
     resume,
+    async retryFailed(input) {
+      assertRunning(disposed);
+      if (Reflect.ownKeys(input).length !== 3 || typeof input.jobId !== "string"
+        || !input.jobId || !Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1
+        || !/^[0-9a-f]{64}$/.test(input.priorActionToken)) throw new Error("Telegram topic resume is no longer eligible");
+      await enqueue(input.jobId, async () => {
+        const previous = options.store.getTopicResume(input.jobId);
+        const job = options.store.get(input.jobId);
+        if (!previous || !job?.threadId || job.version !== input.expectedVersion
+          || previous.actionToken !== input.priorActionToken || !allowedModes.has("warning_replay")) {
+          throw new Error("Telegram topic resume is no longer eligible");
+        }
+        const source = options.store.readSourcePayload(job.id) as TelegramWorkSource | null;
+        const snapshot = readExternalEligibilitySnapshot(options, previous);
+        const candidate = currentCandidate(options, job, source, snapshot, previous);
+        if (!candidate) throw new Error("Telegram topic resume is no longer eligible");
+        const reserved = options.store.retryFailedTopicResume({ candidate, allowedModes,
+          priorActionToken: input.priorActionToken, externalEligibilitySnapshot: snapshot,
+          eventId: eventId(createId, "retry-failed"),
+          actionToken: createHash("sha256").update(createId()).digest("hex"),
+          eventAt: monotonicNow(now, job, previous) });
+        options.invalidateForumTopicLiveness?.(previous.destination);
+        await probe(reserved, "initial");
+      });
+    },
     async reconcile() {
       assertRunning(disposed);
       containDeliveryEvidence();
@@ -470,9 +502,9 @@ function currentCandidate(options: TelegramTopicResumeRuntimeOptions, job: Teleg
   readonly thread: CodexThreadRecord | null;
   readonly forumChatId: number;
   readonly hasThreadTopicBinding: boolean;
-}): TelegramTopicResumeCandidate | null {
+}, previous?: TelegramTopicResumeRecord): TelegramTopicResumeCandidate | null {
   if (!source) return null;
-  return planTelegramTopicResume({
+  const evidence = {
     job,
     source,
     deliveries: options.store.listDeliveries(job.id),
@@ -483,7 +515,8 @@ function currentCandidate(options: TelegramTopicResumeRuntimeOptions, job: Teleg
     forumChatId: external.forumChatId,
     hasThreadTopicBinding: external.hasThreadTopicBinding,
     quarantined: options.store.hasJobQuarantine(job.id),
-  });
+  };
+  return previous ? planTelegramFailedTopicResume(evidence, previous) : planTelegramTopicResume(evidence);
 }
 
 function externalStateIsCurrent(options: TelegramTopicResumeRuntimeOptions,

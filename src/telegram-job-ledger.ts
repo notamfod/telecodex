@@ -44,7 +44,7 @@ import { TelegramTopicResumeLedger } from "./telegram-topic-resume-ledger.js";
 import { TelegramTopicResumeDeliveryGuard } from "./telegram-topic-resume-delivery-guard.js";
 import type { TelegramTopicResumeExternalEligibilitySnapshot } from "./telegram-topic-resume-ledger.js";
 import type {
-  ReserveTopicResumeInput, SettleTopicResumeDeliveryInput, TelegramTopicResumeRecord,
+  ReserveTopicResumeInput, RetryFailedTopicResumeInput, SettleTopicResumeDeliveryInput, TelegramTopicResumeRecord,
   TelegramTopicResumeResult, TelegramTopicResumeState, TransitionTopicResumeInput,
 } from "./telegram-topic-resume-ledger.js";
 
@@ -64,7 +64,7 @@ export type {
   TelegramTopicRecoveryState, TopicRecoveryOutcomeInput,
 } from "./telegram-topic-recovery-ledger.js";
 export type {
-  ReserveTopicResumeInput, SettleTopicResumeDeliveryInput, TelegramTopicResumeReasonCode,
+  ReserveTopicResumeInput, RetryFailedTopicResumeInput, SettleTopicResumeDeliveryInput, TelegramTopicResumeReasonCode,
   TelegramTopicResumeExternalEligibilitySnapshot, TelegramTopicResumeRecord,
   TelegramTopicResumeResult, TelegramTopicResumeState,
   TransitionTopicResumeInput,
@@ -854,6 +854,10 @@ export class SqliteTelegramJobStore {
     this.assertOpen(); return this.topicResumeLedger.reserve(input);
   }
 
+  retryFailedTopicResume(input: RetryFailedTopicResumeInput): TelegramTopicResumeResult {
+    this.assertOpen(); return this.topicResumeLedger.retryFailed(input);
+  }
+
   transitionTopicResume(input: TransitionTopicResumeInput): TelegramTopicResumeResult {
     this.assertOpen(); return this.topicResumeLedger.transition(input);
   }
@@ -979,6 +983,7 @@ export class SqliteTelegramJobStore {
     this.statement("DELETE FROM job_quarantine WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM status_anchor_plans WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM status_anchor_plan_bootstrap_eligibility WHERE job_id = ?").run(jobId);
+    this.statement("DELETE FROM topic_resume_attempt_history WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM topic_resume_attempts WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM topic_recoveries WHERE job_id = ?").run(jobId);
     this.statement("DELETE FROM deliveries WHERE job_id = ?").run(jobId);

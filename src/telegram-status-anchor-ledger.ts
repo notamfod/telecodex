@@ -57,8 +57,8 @@ export interface ReplaceMissingStatusAnchorEditInput {
 }
 
 export interface MissingStatusAnchorReplacementValues {
-  readonly currentPayload: Extract<TelegramDeliveryPayload, { operation: "edit_text" }>;
-  readonly payload: Extract<TelegramDeliveryPayload, { operation: "send_text" }>;
+  readonly currentPayload: Extract<TelegramDeliveryPayload, { operation: "edit_text" | "edit_rich" }>;
+  readonly payload: Extract<TelegramDeliveryPayload, { operation: "send_text" | "send_rich" }>;
   readonly contentHash: string;
   readonly attemptCount: number;
 }
@@ -123,16 +123,36 @@ export function replaceMissingStatusAnchorEditValues(
     || current.telegramMessageId !== input.expectedMessageId) conflict();
   if (input.updatedAt < current.updatedAt) throw new Error("Telegram delivery cannot move backwards");
   const currentPayload = normalizeTelegramDeliveryPayload(current.payload);
-  if (currentPayload.operation !== "edit_text" || currentPayload.messageId !== input.expectedMessageId
+  if ((currentPayload.operation !== "edit_text" && currentPayload.operation !== "edit_rich")
+    || currentPayload.messageId !== input.expectedMessageId
     || !samePayload(current, currentPayload, hashTelegramDeliveryPayload(currentPayload))) conflict();
   const payload = normalizeTelegramDeliveryPayload(input.replacementPayload);
-  if (payload.operation !== "send_text" || payload.chatId !== currentPayload.chatId
-    || payload.text !== currentPayload.text) conflict();
+  if ((payload.operation !== "send_text" && payload.operation !== "send_rich")
+    || !isDeepStrictEqual(payload, missingStatusAnchorSendPayload(currentPayload, payload.messageThreadId))) conflict();
   return {
     currentPayload,
     payload,
     contentHash: hashTelegramDeliveryPayload(payload),
     attemptCount: input.expectedAttemptCount + 1,
+  };
+}
+
+export function missingStatusAnchorSendPayload(
+  payload: MissingStatusAnchorReplacementValues["currentPayload"],
+  messageThreadId: number | null,
+): MissingStatusAnchorReplacementValues["payload"] {
+  if (payload.operation === "edit_text") {
+    return { operation: "send_text", chatId: payload.chatId, messageThreadId, text: payload.text };
+  }
+  return {
+    operation: "send_rich", chatId: payload.chatId, messageThreadId,
+    markdown: payload.markdown, media: payload.media,
+    fallbackParts: payload.fallbackParts.map(part => {
+      if (part.payload.operation !== "edit_text") conflict();
+      return { ...part, payload: {
+        operation: "send_text", chatId: payload.chatId, messageThreadId, text: part.payload.text,
+      } };
+    }),
   };
 }
 

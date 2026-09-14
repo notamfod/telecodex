@@ -21,11 +21,12 @@ export function exactRichFallbackInstalled(
     || rows.length !== current.responsePlan.length + 1 || !validProjection(current, rows)) return false;
   const anchor = rows.find((row) => row.partKey === "status-anchor");
   if (!anchor || anchor.kind !== "status-anchor" || anchor.ordinal !== 0 || !validRow(anchor)) return false;
-  if (payload.operation === "edit_rich") {
+  if (payload.operation === "edit_rich" || primary.partKey === "status-anchor") {
     const fallback = payload.fallbackParts[0];
     const row = rows.find((candidate) => candidate.partKey === primary.partKey);
     return payload.fallbackParts.length === 1 && fallback !== undefined && row !== undefined
-      && row.partKey === "status-anchor" && row.telegramMessageId === payload.messageId
+      && row.partKey === "status-anchor"
+      && (payload.operation !== "edit_rich" || row.telegramMessageId === payload.messageId)
       && row.attemptCount >= 0 && row.payload !== undefined
       && isDeepStrictEqual(row.payload, fallback.payload)
       && row.contentHash === hashTelegramDeliveryPayload(fallback.payload)

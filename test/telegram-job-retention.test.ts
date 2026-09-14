@@ -63,6 +63,7 @@ describe("Telegram job retention", () => {
     });
     expect(store.get("job-one")).not.toHaveProperty("materializedPrompt");
     expect(store.get("job-one")).not.toHaveProperty("turnResult");
+    expect(resumeHistoryCount(databasePath)).toBe(1);
     expect(store.listEvents("job-one")).toEqual([]);
     expect(store.listEventSummaries("job-one").map((event) => event.type)).toEqual([
       "update.accepted",
@@ -96,6 +97,7 @@ describe("Telegram job retention", () => {
     expect(store.runRetention(retention(BASE + 90 * DAY))).toMatchObject({ jobsDeleted: 1 });
     expect(store.get("job-one")).toBeNull();
     expect(resumeAttemptCount(databasePath)).toBe(0);
+    expect(resumeHistoryCount(databasePath)).toBe(0);
     expect(store.listEventSummaries("job-one")).toEqual([]);
   });
 
@@ -460,6 +462,9 @@ function insertCompletedResume(databasePath: string, job: TelegramJob): void {
       job.id, "a".repeat(64), job.version - 1, "b".repeat(64), -1001, 7,
       job.version - 1, job.version, BASE, BASE,
     );
+    database.prepare(`INSERT INTO topic_resume_attempt_history
+      (job_id, action_token, snapshot_json, superseded_by_action_token, archived_at_ms)
+      VALUES (?, ?, ?, ?, ?)`).run(job.id, "c".repeat(64), JSON.stringify({ state: "failed" }), "a".repeat(64), BASE);
   } finally {
     database.close();
   }
@@ -473,4 +478,10 @@ function resumeAttemptCount(databasePath: string): number {
   } finally {
     database.close();
   }
+}
+
+function resumeHistoryCount(databasePath: string): number {
+  const database = new Database(databasePath, { readonly: true });
+  try { return database.prepare("SELECT count(*) FROM topic_resume_attempt_history").pluck().get() as number; }
+  finally { database.close(); }
 }

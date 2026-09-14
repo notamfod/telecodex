@@ -46,6 +46,7 @@ function mode(filePath: string): number {
 }
 
 function replaceTopicResumeWithV8(database: Database.Database): void {
+  database.exec("DROP TABLE topic_resume_attempt_history");
   database.exec("DROP TABLE topic_resume_attempts");
   database.exec(`CREATE TABLE topic_resume_attempts (
     job_id TEXT PRIMARY KEY, action_token TEXT NOT NULL UNIQUE,
@@ -137,7 +138,7 @@ describe("SqliteTelegramJobStore", () => {
       expect(db.prepare("SELECT count(*) AS count FROM inbox_updates").get()).toEqual({ count: 1 });
       expect(db.prepare("SELECT count(*) AS count FROM jobs").get()).toEqual({ count: 1 });
       expect(db.prepare("SELECT count(*) AS count FROM job_events").get()).toEqual({ count: 1 });
-      expect(db.pragma("user_version", { simple: true })).toBe(9);
+      expect(db.pragma("user_version", { simple: true })).toBe(10);
       expect(db.prepare("SELECT count(*) AS count FROM status_anchor_plans").get()).toEqual({ count: 0 });
       expect(db.prepare("SELECT count(*) AS count FROM status_anchor_plan_bootstrap_eligibility").get())
         .toEqual({ count: 0 });
@@ -171,9 +172,10 @@ describe("SqliteTelegramJobStore", () => {
     } finally { db.close(); }
   });
 
-  it("preserves the exact v7 topic recovery schema while migrating v6 to v9", () => {
+  it("preserves the exact v7 topic recovery schema while migrating v6 to v10", () => {
     open().close();
     const legacy = new Database(databasePath);
+    legacy.exec("DROP TABLE topic_resume_attempt_history");
     legacy.exec("DROP TABLE topic_resume_attempts");
     legacy.exec("DROP TABLE topic_recoveries");
     legacy.pragma("user_version = 6");
@@ -182,7 +184,7 @@ describe("SqliteTelegramJobStore", () => {
     open();
     const db = new Database(databasePath, { readonly: true });
     try {
-      expect(db.pragma("user_version", { simple: true })).toBe(9);
+      expect(db.pragma("user_version", { simple: true })).toBe(10);
       expect(db.prepare("PRAGMA table_info(topic_recoveries)").all()).toEqual([
         { cid: 0, name: "job_id", type: "TEXT", notnull: 0, dflt_value: null, pk: 1 },
         { cid: 1, name: "action_token", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
@@ -207,9 +209,10 @@ describe("SqliteTelegramJobStore", () => {
     } finally { db.close(); }
   });
 
-  it("migrates v7 to the exact v9 topic resume schema", () => {
+  it("migrates v7 to the exact topic resume schema at v10", () => {
     open().close();
     const legacy = new Database(databasePath);
+    legacy.exec("DROP TABLE topic_resume_attempt_history");
     legacy.exec("DROP TABLE topic_resume_attempts");
     legacy.pragma("user_version = 7");
     legacy.close();
@@ -217,7 +220,7 @@ describe("SqliteTelegramJobStore", () => {
     open();
     const db = new Database(databasePath, { readonly: true });
     try {
-      expect(db.pragma("user_version", { simple: true })).toBe(9);
+      expect(db.pragma("user_version", { simple: true })).toBe(10);
       expect(db.prepare("PRAGMA table_info(topic_resume_attempts)").all()).toEqual([
         { cid: 0, name: "job_id", type: "TEXT", notnull: 0, dflt_value: null, pk: 1 },
         { cid: 1, name: "action_token", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
@@ -245,7 +248,7 @@ describe("SqliteTelegramJobStore", () => {
     } finally { db.close(); }
   });
 
-  it("migrates an empty v8 topic resume table to v9 without changing its indexes", () => {
+  it("migrates an empty v8 topic resume table to v10 without changing its indexes", () => {
     open().close();
     const legacy = new Database(databasePath);
     try {
@@ -256,7 +259,7 @@ describe("SqliteTelegramJobStore", () => {
     open();
     const inspect = new Database(databasePath, { readonly: true });
     try {
-      expect(inspect.pragma("user_version", { simple: true })).toBe(9);
+      expect(inspect.pragma("user_version", { simple: true })).toBe(10);
       expect(inspect.prepare("PRAGMA table_info(topic_resume_attempts)").all().map((column) =>
         (column as { name: string }).name)).toEqual([
         "job_id", "action_token", "state", "resume_mode", "anchor_attempt_baseline",
@@ -271,7 +274,7 @@ describe("SqliteTelegramJobStore", () => {
     } finally { inspect.close(); }
   });
 
-  it("rolls back v8 to v9 migration when a resume row cannot acquire baselines", () => {
+  it("rolls back v8 to v10 migration when a resume row cannot acquire baselines", () => {
     const store = open();
     store.acceptUpdate({ job: job("active-resume"), sourcePayload: {}, eventId: "active-resume-event" });
     store.close();

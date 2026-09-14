@@ -22,6 +22,19 @@ afterEach(() => {
 });
 
 describe("canonical Telegram message routing", () => {
+  it("activates /task only after authorization and never starts a Codex run", async () => {
+    const subject = harness({ telegramForumChatId: -1001 });
+    await subject.bot.handleUpdate(messageUpdate(900, { text: "/task", from: { id: 555, is_bot: false, first_name: "Other" } }));
+    expect(subject.bot.taskCards?.enabled({ chatId: -1001, messageThreadId: 7 })).toBe(false);
+    await subject.bot.handleUpdate(messageUpdate(901, { text: "/task" }));
+    expect(subject.bot.taskCards?.enabled({ chatId: -1001, messageThreadId: 7 })).toBe(true);
+    expect(subject.reliability.handleWork).not.toHaveBeenCalled();
+    expect(subject.getOrCreate).not.toHaveBeenCalled();
+    expect(subject.apiCalls.filter(([method]) => method === "pinChatMessage")).toHaveLength(1);
+    await subject.bot.handleUpdate(messageUpdate(902, { forum_topic_edited: { name: "Ручное имя" } }));
+    await vi.waitFor(() => expect(subject.bot.taskCards?.getManualTitle({ chatId: -1001, messageThreadId: 7 })).toBe("Ручное имя"));
+    await subject.bot.taskCards?.dispose();
+  });
   it("does not construct the legacy JSON job store or prompt correctness owner", () => {
     const subject = harness();
 
@@ -496,7 +509,7 @@ function harness(
   } satisfies TelegramBotReliability;
   const bot = createBot(
     { ...config(workspace), ...configOverrides },
-    { onRemove: vi.fn(), getOrCreate, setContextDefaults } as never,
+    { onRemove: vi.fn(), getOrCreate, setContextDefaults, listContexts: () => [] } as never,
     reliability,
     botOptions,
   );

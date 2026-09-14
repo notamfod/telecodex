@@ -402,22 +402,35 @@ function renderProjection(projection: TelegramJobStatusProjection): ProgressMess
     : projection.health === "stalled" || projection.health === "unavailable"
       || projection.state.includes("failed") || projection.state === "delivery_uncertain"
       || projection.attention.kind === "required" ? "⚠️" : "⏳";
+  const states: Record<TelegramJobStatusProjection["state"], string> = {
+    accepted: "Запрос принят", queued: "В очереди", dispatching_not_sent: "Готовлю запуск",
+    dispatching_unknown: "Запуск не подтверждён", running: "Выполняю запрос",
+    stalled: "Нет прогресса, нужна проверка", delivering: "Доставляю ответ",
+    delivery_failed: "Не удалось доставить ответ", delivery_uncertain: "Доставка ответа не подтверждена",
+    terminal_incomplete: "Запрос выполнен, доставка ещё не завершена",
+    terminal_delivered: "Ответ доставлен", terminal_failed: "Запрос завершился ошибкой",
+    terminal_aborted: "Запрос остановлен", terminal_recovery_interrupted: "Запрос прерван при восстановлении",
+  };
+  const health: Record<TelegramJobStatusProjection["health"], string> = {
+    healthy: "Работает", quiet: "Нет новых событий", checking: "Проверяю состояние",
+    stalled: "Нет прогресса", unavailable: "Состояние недоступно",
+  };
+  const activity = { model: "Модель", tool: "Инструмент", subagent: "Помощник",
+    waiting: "Ожидание", unknown: "Нет данных об активности" };
   const facts = [
-    projection.state,
-    `health ${projection.health}`,
+    health[projection.health],
     projection.activity
-      ? `activity ${projection.activity.kind} · ${formatElapsed(projection.activity.ageMs)}`
+      ? `${activity[projection.activity.kind]} · ${formatElapsed(projection.activity.ageMs)} назад`
       : undefined,
-    projection.guardian.availability === "unavailable"
-      ? `guardian unavailable${projection.guardian.reasonCode ? ` (${projection.guardian.reasonCode})` : ""}`
-      : projection.guardian.health ? `guardian ${projection.guardian.health}` : undefined,
-    `delivery ${projection.delivery.delivered}/${projection.delivery.total}`,
-    projection.attention.kind === "required" ? `attention ${projection.attention.code}` : undefined,
-    projection.reasonCodes.length > 0 ? `reasons ${projection.reasonCodes.join(", ")}` : undefined,
+    projection.guardian.availability === "unavailable" ? "Проверка сессии недоступна" : undefined,
+    `Доставлено: ${projection.delivery.delivered}/${projection.delivery.total}`,
+    projection.attention.kind === "required" ? "Требуется ваше внимание" : undefined,
+    projection.state === "delivery_uncertain" || projection.state === "dispatching_unknown"
+      ? "Повтор может создать дубль. Сначала проверьте подробности." : undefined,
   ].filter((value): value is string => value !== undefined);
-  const title = `${icon} ${projection.shortJobId} · ${projection.state}`;
+  const title = `${icon} ${states[projection.state]}`;
   return {
-    html: `<b>${escapeHTML(title)}</b>\n<code>${escapeHTML(facts.join(" · "))}</code>`,
+    html: `<b>${escapeHTML(title)}</b>\n${escapeHTML(facts.join(" · "))}`,
     plain: `${title}\n${facts.join(" · ")}`,
     projection,
     actions: projection.actions,

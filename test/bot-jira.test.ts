@@ -9,7 +9,7 @@ describe("TeleCodex Jira command", () => {
     await registerCommands({ api: { setMyCommands } } as never);
 
     expect(setMyCommands).toHaveBeenCalledWith(expect.arrayContaining([
-      { command: "jira", description: "Open Jira sprint and filters" },
+      { command: "jira", description: "Спринт Jira и фильтры" },
     ]));
   });
 });

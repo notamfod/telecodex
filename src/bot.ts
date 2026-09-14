@@ -1,3 +1,4 @@
+import { createBotTopicTasks, type BotTopicTasks } from "./bot-topic-tasks.js";
 import { existsSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile, unlink, writeFile } from "node:fs/promises";
@@ -388,6 +389,7 @@ type RenderedChunk = RenderedText & {
 };
 
 export interface TeleCodexBot extends Bot<Context> {
+  taskCards?: BotTopicTasks;
   recoverPendingJobs(): Promise<void>;
   statusBoard?: StatusBoard;
   dashboard?: DashboardController;
@@ -419,6 +421,7 @@ export interface TelegramCanonicalControlSource extends TelegramCanonicalContext
 export interface TelegramBotReliability {
   handleWork(source: TelegramWorkSource): Promise<TelegramWorkTargetContext | null>;
   registerCompletionProcessor?(processor: TelegramCompletionProcessor): void;
+  refreshTopicTask?(context: TelegramCanonicalContext): Promise<void>;
   latestJob(context: TelegramCanonicalContext): Promise<TelegramCanonicalJobRef | null>;
   retry(input: {
     readonly source: TelegramCanonicalControlSource;
@@ -699,6 +702,23 @@ export function createBot(
     { processing: boolean; switching: boolean; transcribing: boolean }
   >();
   const inbox = new InboxStore(path.join(config.workspace, ".telecodex", "inbox.json"));
+  if (reliability) bot.taskCards = createBotTopicTasks({
+    api: bot.api, workspace: config.workspace, forumChatId: config.telegramForumChatId,
+    gate: options.backgroundWriteGate,
+    report: (error) => console.warn(formatTelegramErrorLog("topic", error)),
+    isExcluded: ({ chatId, messageThreadId }) => Boolean(
+      inbox.get(`${chatId}:${messageThreadId}`)
+      || bot.statusBoard?.isDashboardTopic(chatId, messageThreadId)
+      || bot.jiraPanel?.matches(chatId, messageThreadId)),
+    metadata: ({ chatId, messageThreadId }) => {
+      const metadata = registry.listContexts().find((entry) => entry.contextKey === `${chatId}:${messageThreadId}`);
+      const candidate = inbox.findTicketByTopic(messageThreadId);
+      const ticket = candidate && parseContextKey(candidate.inboxContextKey).chatId === chatId ? candidate : undefined;
+      return { workspace: metadata?.workspace ?? ticket?.workspace ?? config.workspace,
+        threadId: metadata?.threadId ?? null, topicName: ticket?.topicTitle ?? metadata?.topicName,
+        ticketId: ticket?.id, ticketKey: ticket?.externalKey ?? (ticket ? `#${ticket.id}` : undefined) };
+    },
+  });
   const jiraComment = config.jiraComment
     ? new JiraCommentClient(config.jiraComment)
     : undefined;
@@ -747,11 +767,12 @@ export function createBot(
       }
 
       const inboxContext = parseContextKey(current.inboxContextKey);
+      if (bot.taskCards?.shouldPreserveTitle({ chatId: inboxContext.chatId, messageThreadId: current.workTopicId })) return extracted.text;
       const topicName = renamedTicketTopic(current, extracted.title);
       try {
-        await bot.api.editForumTopic(inboxContext.chatId, current.workTopicId, {
-          name: topicName,
-        });
+        if (bot.taskCards) {
+          if (!await bot.taskCards.renameAutomatically({ chatId: inboxContext.chatId, messageThreadId: current.workTopicId }, topicName)) return extracted.text;
+        } else await bot.api.editForumTopic(inboxContext.chatId, current.workTopicId, { name: topicName });
         inbox.setTopicTitle(current.id, extracted.title);
       } catch (error) {
         if (isTelegramTopicNotModified(error)) {
@@ -803,7 +824,9 @@ export function createBot(
     jiraConfigured: jiraComment !== undefined,
     answerWorkspace: config.workspace,
     renameTopic: async (chatId, messageThreadId, name) => {
+      if (bot.taskCards?.shouldPreserveTitle({ chatId, messageThreadId })) return false;
       try {
+        if (bot.taskCards) return await bot.taskCards.renameAutomatically({ chatId, messageThreadId }, name);
         await bot.api.editForumTopic(chatId, messageThreadId, { name });
         return true;
       } catch (error) {
@@ -1595,6 +1618,14 @@ export function createBot(
     }
 
     if (isTopicLifecycleMessage(ctx.message)) {
+      if (ctx.chat && messageThreadId && (ctx.from?.is_bot || config.telegramAllowedUserIdSet.has(ctx.from?.id ?? 0))) {
+        const message = ctx.message;
+        const presence = message?.forum_topic_closed ? "closed" as const
+          : message?.forum_topic_reopened || message?.forum_topic_created ? "open" as const : undefined;
+        const title = !ctx.from?.is_bot ? message?.forum_topic_edited?.name : undefined;
+        void bot.taskCards?.observeTopic({ chatId: ctx.chat.id, messageThreadId }, presence, title)
+          .catch((error) => console.warn(formatTelegramErrorLog("topic", error)));
+      }
       return;
     }
 
@@ -1612,6 +1643,19 @@ export function createBot(
     }
 
     await next();
+    const taskTopic = ctx.message?.message_thread_id ?? ctx.callbackQuery?.message?.message_thread_id;
+    if (ctx.chat && taskTopic) {
+      const destination = { chatId: ctx.chat.id, messageThreadId: taskTopic };
+      void (async () => {
+        await bot.taskCards?.interact(destination);
+        if (bot.taskCards?.enabled(destination)) await reliability?.refreshTopicTask?.({ botId: String(ctx.me.id), ...destination });
+      })().catch((error) => console.warn(formatTelegramErrorLog("topic", error)));
+    }
+  });
+
+  bot.command("task", async (ctx) => {
+    if (bot.taskCards) await bot.taskCards.command(ctx);
+    else await safeReply(ctx, "Карточки задач доступны в режиме canonical SQLite.");
   });
 
   if (config.sessionGuardianSocketPath) {
@@ -3693,6 +3737,8 @@ export function createBot(
   });
 
   registerInboxHandlers({
+    renameTopicManually: bot.taskCards ? (chatId, messageThreadId, title) => bot.taskCards!.renameManually({ chatId, messageThreadId }, title).then(() => {}) : undefined,
+    onManualTopicTitle: (chatId, messageThreadId, title) => bot.taskCards?.manualTitle({ chatId, messageThreadId }, title).catch((error) => console.warn(formatTelegramErrorLog("topic", error))) ?? Promise.resolve(),
     bot,
     config,
     registry,
@@ -4376,29 +4422,30 @@ export function createBot(
 
 export async function registerCommands(bot: Bot<Context>): Promise<void> {
   await bot.api.setMyCommands([
-    { command: "start", description: "Welcome & status" },
-    { command: "help", description: "Command reference" },
-    { command: "new", description: "Start a new thread" },
-    { command: "session", description: "Current thread details" },
-    { command: "sessions", description: "Browse & switch threads" },
-    { command: "projects", description: "Topics grouped by project" },
-    { command: "jira", description: "Open Jira sprint and filters" },
-    { command: "inbox", description: "Turn this topic into a ticket inbox" },
-    { command: "tickets", description: "List unresolved inbox tickets" },
-    { command: "usage", description: "Token usage by project" },
-    { command: "title", description: "Rename the current ticket topic" },
-    { command: "mr", description: "Open merge requests, tap to review" },
-    { command: "retry", description: "Resend the last prompt" },
-    { command: "abort", description: "Cancel current operation" },
-    { command: "launch_profiles", description: "Select launch profile" },
-    { command: "effort", description: "Set reasoning effort" },
-    { command: "auth", description: "Check auth status" },
-    { command: "login", description: "Start authentication" },
-    { command: "logout", description: "Sign out" },
-    { command: "voice", description: "Voice transcription status" },
-    { command: "handback", description: "Hand thread to Codex CLI" },
-    { command: "attach", description: "Bind a Codex thread to this topic" },
-    { command: "switch", description: "Switch to a thread by ID" },
+    { command: "task", description: "Карточка задачи в этом топике" },
+    { command: "start", description: "Приветствие и состояние" },
+    { command: "help", description: "Справка по командам" },
+    { command: "new", description: "Новая сессия в текущем топике" },
+    { command: "session", description: "Текущая сессия" },
+    { command: "sessions", description: "Выбрать сессию" },
+    { command: "projects", description: "Топики по проектам" },
+    { command: "jira", description: "Спринт Jira и фильтры" },
+    { command: "inbox", description: "Сделать топик входящим Inbox" },
+    { command: "tickets", description: "Незавершённые обращения Inbox" },
+    { command: "usage", description: "Расход токенов по проектам" },
+    { command: "title", description: "Переименовать топик тикета" },
+    { command: "mr", description: "Merge requests для ревью" },
+    { command: "retry", description: "Повторить последний запрос" },
+    { command: "abort", description: "Остановить текущий прогон" },
+    { command: "launch_profiles", description: "Выбрать профиль запуска" },
+    { command: "effort", description: "Глубина рассуждений" },
+    { command: "auth", description: "Проверить авторизацию" },
+    { command: "login", description: "Войти в аккаунт" },
+    { command: "logout", description: "Выйти из аккаунта" },
+    { command: "voice", description: "Состояние распознавания голоса" },
+    { command: "handback", description: "Передать сессию в Codex CLI" },
+    { command: "attach", description: "Привязать сессию к топику" },
+    { command: "switch", description: "Выбрать сессию по ID" },
   ]);
 }
 

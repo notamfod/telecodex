@@ -11,60 +11,69 @@ export interface DualText {
 export function renderHelpMessage(): DualText {
   const sections = [
     {
-      title: "💬 Session",
+      title: "💬 Сессия",
       commands: [
-        ["/new", "Start a new thread"],
-        ["/session", "Current thread details"],
-        ["/sessions", "Browse & switch threads"],
-        ["/projects", "Topics grouped by project"],
-        ["/jira", "Open the Jira sprint and filters panel"],
-        ["/inbox", "Turn this topic into a ticket inbox"],
-        ["/mr", "Open merge requests, tap to review"],
-        ["/done", "Draft a \u201cdone\u201d comment for the linked merge request"],
-        ["/attach", "Bind a Codex thread to this topic"],
-        ["/handback", "Hand thread back to Codex CLI"],
-        ["/abort", "Cancel current operation"],
-        ["/retry", "Resend the last prompt"],
+        ["/new", "Новая сессия в этом топике"],
+        ["/task", "Создать или обновить постоянную карточку задачи в этом топике"],
+        ["/session", "Текущая сессия"],
+        ["/sessions", "Выбрать сессию"],
+        ["/projects", "Топики по проектам"],
+        ["/jira", "Спринт Jira и фильтры"],
+        ["/inbox", "Принимать тикеты в этом топике"],
+        ["/mr", "Открытые MR для ревью"],
+        ["/done", "Черновик комментария к MR; задачу не завершает"],
+        ["/attach", "Привязать сессию Codex к топику"],
+        ["/handback", "Передать сессию в Codex CLI"],
+        ["/abort", "Остановить текущий запрос"],
+        ["/retry", "Повторить последний запрос"],
       ],
     },
     {
-      title: "🤖 Model",
+      title: "🤖 Модель",
       commands: [
-        ["/launch_profiles", "Select launch profile"],
-        ["/effort", "Set reasoning effort"],
+        ["/launch_profiles", "Выбрать профиль запуска"],
+        ["/effort", "Выбрать глубину рассуждений"],
       ],
     },
     {
-      title: "🔐 Auth",
+      title: "🔐 Авторизация",
       commands: [
-        ["/auth", "Check auth status"],
-        ["/login", "Start authentication"],
-        ["/logout", "Sign out"],
+        ["/auth", "Проверить вход в аккаунт"],
+        ["/login", "Войти в аккаунт"],
+        ["/logout", "Выйти из аккаунта"],
       ],
     },
     {
-      title: "ℹ️ Utility",
+      title: "ℹ️ Справка",
       commands: [
-        ["/start", "Welcome & status"],
-        ["/help", "This reference"],
-        ["/voice", "Voice transcription status"],
+        ["/start", "Начало работы и статус"],
+        ["/help", "Список команд"],
+        ["/voice", "Статус распознавания голоса"],
       ],
     },
   ];
 
-  const htmlLines: string[] = [];
-  const plainLines: string[] = [];
+  const intro = "Задача - ваша цель; топик - место работы; сессия - диалог с Codex.";
+  const htmlLines: string[] = [escapeHTML(intro), ""];
+  const plainLines: string[] = [intro, ""];
 
   for (const section of sections) {
     htmlLines.push(`<b>${escapeHTML(section.title)}</b>`);
     plainLines.push(section.title);
     for (const [cmd, desc] of section.commands) {
-      htmlLines.push(`  ${cmd} — ${escapeHTML(desc)}`);
-      plainLines.push(`  ${cmd} — ${desc}`);
+      htmlLines.push(`  ${cmd} - ${escapeHTML(desc)}`);
+      plainLines.push(`  ${cmd} - ${desc}`);
     }
     htmlLines.push("");
     plainLines.push("");
   }
+
+  const taskHelp = [
+    "/task off - Остановить обновления, сохранив карточку",
+    "/task title <название> - Задать название топика вручную",
+  ];
+  htmlLines.push(...taskHelp.map(escapeHTML));
+  plainLines.push(...taskHelp);
 
   while (htmlLines.at(-1) === "") {
     htmlLines.pop();
@@ -84,20 +93,20 @@ export function renderHelpMessage(): DualText {
  */
 export function renderWelcomeFirstTime(authWarning?: string): DualText {
   const htmlLines = [
-    "<b>👋 TeleCodex is ready.</b>",
+    "<b>👋 TeleCodex готов.</b>",
     "",
-    "Send a message to start an OpenAI thread.",
-    "You can also send voice notes, photos, or documents.",
+    "Опишите задачу сообщением, чтобы начать сессию с Codex.",
+    "Можно отправлять голосовые сообщения, фотографии и документы.",
     "",
-    "Type /help for all commands.",
+    "Все команды: /help.",
   ];
   const plainLines = [
-    "👋 TeleCodex is ready.",
+    "👋 TeleCodex готов.",
     "",
-    "Send a message to start an OpenAI thread.",
-    "You can also send voice notes, photos, or documents.",
+    "Опишите задачу сообщением, чтобы начать сессию с Codex.",
+    "Можно отправлять голосовые сообщения, фотографии и документы.",
     "",
-    "Type /help for all commands.",
+    "Все команды: /help.",
   ];
 
   if (authWarning) {
@@ -117,7 +126,7 @@ export function renderWelcomeReturning(
   isTopicSession: boolean,
   authWarning?: string,
 ): DualText {
-  const label = isTopicSession ? "TeleCodex (topic session)" : "TeleCodex";
+  const label = isTopicSession ? "TeleCodex (сессия в топике)" : "TeleCodex";
 
   const htmlLines = [`<b>👋 ${escapeHTML(label)}</b>`, "", sessionHtml];
   const plainLines = [`👋 ${label}`, "", sessionPlain];

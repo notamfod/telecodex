@@ -30,7 +30,8 @@
     "release:preflight": "node dist/telecodex-release-cli.js preflight --json",
     "release:quarantine:audit": "node dist/telecodex-release-cli.js quarantine audit --json",
     "release:quarantine:diagnose": "node dist/telecodex-release-cli.js quarantine diagnose --json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:browser": "playwright test"
   },
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",
@@ -43,6 +44,7 @@
     "ws": "^8.21.2"
   },
   "devDependencies": {
+    "@playwright/test": "1.63.0",
     "@sveltejs/vite-plugin-svelte": "6.2.4",
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^25.5.0",

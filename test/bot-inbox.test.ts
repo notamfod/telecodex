@@ -206,6 +206,7 @@ describe("registerInboxHandlers", () => {
       registry: {} as never,
       inbox: {
         get: vi.fn(() => ({ workspace: "/work", template: "{message}" })),
+        recordFailure: vi.fn(),
         listTicketsByKey: vi.fn(() => [previous]),
       } as never,
       topicActivity: { rememberIdleIcon: vi.fn() },
@@ -266,6 +267,7 @@ describe("registerInboxHandlers", () => {
       registry: {} as never,
       inbox: {
         get: vi.fn(() => ({ workspace: "/work", template: "{message}" })),
+        recordFailure: vi.fn(),
         createTicket: vi.fn(() => pending),
         removeUnattachedTicket,
       } as never,

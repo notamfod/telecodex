@@ -30,6 +30,7 @@
   let startY = 0;
   let startOffset = 0;
   let axis: "pending" | "horizontal" | "vertical" = "pending";
+  let suppressClick = false;
 
   $: statusLabel = thread.state === "stalled"
     ? "зависла"
@@ -46,7 +47,7 @@
       ? "purple"
       : thread.state === "recent" ? "cool-gray" : "green") as "red" | "purple" | "cool-gray" | "green";
   $: canOpenCodex = Boolean(thread.codexUrl);
-  $: canOpenTelegram = Boolean(thread.telegramUrl || (thread.canCreateTopic && !creating));
+  $: canOpenTelegram = !creating && Boolean(thread.telegramUrl || thread.canCreateTopic);
   $: if (!dragging) {
     offset = revealedAction === "codex"
       ? THREAD_SWIPE_ACTION_WIDTH
@@ -54,6 +55,7 @@
   }
 
   function runAction(action: ThreadSwipeAction): void {
+    if (action === "telegram" ? !canOpenTelegram : !canOpenCodex) return;
     onReveal(swipeKey, null);
     if (action === "codex") onCodex(thread.codexUrl);
     else onTelegram(thread);
@@ -66,6 +68,7 @@
     startY = event.clientY;
     startOffset = offset;
     axis = "pending";
+    suppressClick = false;
     dragging = true;
   }
 
@@ -93,6 +96,7 @@
   function finishSwipe(event: PointerEvent): void {
     if (!dragging || event.pointerId !== pointerId) return;
     const finishedAxis = axis;
+    suppressClick = finishedAxis !== "pending" || revealedAction !== null;
     dragging = false;
     pointerId = null;
     if (finishedAxis === "horizontal") {
@@ -110,9 +114,15 @@
     dragging = false;
     pointerId = null;
     axis = "pending";
+    suppressClick = true;
     offset = revealedAction === "codex"
       ? THREAD_SWIPE_ACTION_WIDTH
       : revealedAction === "telegram" ? -THREAD_SWIPE_ACTION_WIDTH : 0;
+  }
+
+  function openFromClick(event: MouseEvent, action: ThreadSwipeAction): void {
+    if (event.detail !== 0 && suppressClick) { event.preventDefault(); return; }
+    runAction(action);
   }
 </script>
 
@@ -127,6 +137,7 @@
       type="button"
       class="thread__swipe-action thread__swipe-action--codex"
       aria-label="Открыть в приложении ChatGPT"
+      disabled={!canOpenCodex}
       on:focus={() => onReveal(swipeKey, "codex")}
       on:click={() => runAction("codex")}
     >
@@ -137,7 +148,7 @@
       type="button"
       class="thread__swipe-action thread__swipe-action--telegram"
       aria-label={thread.telegramUrl ? "Открыть топик Telegram" : "Создать топик Telegram"}
-      disabled={creating}
+      disabled={!canOpenTelegram}
       on:focus={() => onReveal(swipeKey, "telegram")}
       on:click={() => runAction("telegram")}
     >
@@ -165,13 +176,27 @@
   >
     <div class="thread__rail" aria-hidden="true"></div>
     <div class="thread__body">
-      <h2 title={thread.label}>{thread.label}</h2>
+      <h2 title={thread.label}>
+        <button
+          type="button"
+          class="thread__title-button"
+          disabled={!canOpenTelegram}
+          aria-label={`${thread.telegramUrl ? "Открыть топик" : "Создать топик"}: ${thread.label}`}
+          on:click={(event) => openFromClick(event, "telegram")}
+        >{thread.label}</button>
+      </h2>
       <p class="thread__meta" title={thread.workspace}>
         {thread.workspace}{thread.source ? ` · ${thread.source}` : ""}
       </p>
       <div class="thread__details">
         <Tag type={tagType} size="sm" inline>{statusLabel}</Tag>
         <span class="thread__age"><Time size={14} /> {relativeTime(thread.timestamp, now)}</span>
+      </div>
+      <div class="thread__open-actions">
+        <button type="button" disabled={!canOpenTelegram} on:click={(event) => openFromClick(event, "telegram")}>
+          {creating ? "Открываю…" : thread.telegramUrl ? "Открыть топик" : "Создать топик"}
+        </button>
+        <button type="button" disabled={!canOpenCodex} on:click={(event) => openFromClick(event, "codex")}>ChatGPT</button>
       </div>
     </div>
   </div>

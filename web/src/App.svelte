@@ -1,11 +1,11 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { Button, InlineLoading, InlineNotification, Tag, Theme } from "carbon-components-svelte";
   import PlayFilled from "carbon-icons-svelte/lib/PlayFilled.svelte";
   import RecentlyViewed from "carbon-icons-svelte/lib/RecentlyViewed.svelte";
   import Renew from "carbon-icons-svelte/lib/Renew.svelte";
   import WarningAltFilled from "carbon-icons-svelte/lib/WarningAltFilled.svelte";
-  import { ensureThreadTopic, loadDashboard } from "./api.js";
+  import { DashboardRequestError, ensureThreadTopic, loadDashboard, loadDashboardWindow } from "./api.js";
   import {
     dashboardPollInterval,
     mergeDashboardPage,
@@ -50,6 +50,11 @@
   let refreshTimer: number | undefined;
   let mounted = false;
   let requestVersion = 0;
+  let viewGeneration = 0;
+  let requestController: AbortController | undefined;
+  let authExpired = false;
+  let nextOffset = 0;
+  let list: SessionList | undefined;
 
   const initData = getTelegramWebApp()?.initData ?? "";
   $: tabs = [
@@ -63,29 +68,46 @@
     },
   ];
 
-  async function reload(): Promise<void> {
-    if (!initData || refreshing || loadingNext) return;
+  function startRequest(): { version: number; signal: AbortSignal } {
+    requestController?.abort();
+    requestController = new AbortController();
+    return { version: ++requestVersion, signal: requestController.signal };
+  }
+
+  function handleRequestError(cause: unknown, background = false): string {
+    if (cause instanceof DashboardRequestError && cause.status === 401) {
+      authExpired = true;
+      requestController?.abort();
+      requestVersion += 1;
+      loading = refreshing = loadingNext = false;
+      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
+      return "";
+    }
+    if (!background) haptic("error");
+    return cause instanceof Error ? cause.message : "Не удалось загрузить сессии";
+  }
+
+  async function reload(background = false): Promise<void> {
+    if (!initData || authExpired) return;
+    if (refreshing || loadingNext) { scheduleRefresh(); return; }
+    const { version, signal } = startRequest();
     const requestedView = view;
-    const version = ++requestVersion;
     refreshing = true;
     loading = sessions.length === 0;
     error = "";
     try {
-      const result = await loadDashboard(initData, {
-        view: requestedView,
-        offset: 0,
-        limit: PAGE_SIZE,
-      });
-      if (version !== requestVersion || requestedView !== view) return;
-      sessions = sessions.length === 0
-        ? [...result.sessions]
-        : mergeDashboardPage(sessions, result.sessions);
-      applyPayload(result);
-      revealedSwipe = null;
+      const result = await loadDashboardWindow(initData, requestedView, sessions.length, fetch, signal);
+      if (version !== requestVersion || !mounted) return;
+      const anchor = list?.captureAnchor();
+      sessions = [...result.payload.sessions];
+      nextOffset = result.nextOffset;
+      applyPayload(result.payload);
+      if (!page.hasMore) nextError = "";
+      await tick();
+      if (version === requestVersion && anchor) list?.restoreAnchor(anchor);
     } catch (cause) {
       if (version !== requestVersion) return;
-      error = cause instanceof Error ? cause.message : "Не удалось обновить сессии";
-      haptic("error");
+      error = handleRequestError(cause, background);
     } finally {
       if (version === requestVersion) {
         refreshing = false;
@@ -96,56 +118,57 @@
   }
 
   async function loadMore(): Promise<void> {
-    if (!initData || loadingNext || refreshing || !page.hasMore) return;
-    const requestedView = view;
-    const offset = sessions.length;
+    if (!initData || authExpired || loadingNext || refreshing || !page.hasMore) return;
+    const { version, signal } = startRequest();
     loadingNext = true;
     nextError = "";
     try {
       const result = await loadDashboard(initData, {
-        view: requestedView,
-        offset,
-        limit: PAGE_SIZE,
-      });
-      if (requestedView !== view) return;
+        view, offset: nextOffset, limit: PAGE_SIZE,
+      }, fetch, signal);
+      if (version !== requestVersion || !mounted) return;
       sessions = mergeDashboardPage(sessions, result.sessions);
+      nextOffset = result.page.offset + result.sessions.length;
       applyPayload(result);
+      // An empty page must not trigger an infinite automatic pagination loop.
+      if (result.sessions.length === 0 && page.hasMore) nextError = "Список изменился. Повторите загрузку.";
     } catch (cause) {
-      nextError = cause instanceof Error ? cause.message : "Не удалось загрузить следующие сессии";
-      haptic("error");
+      if (version !== requestVersion) return;
+      nextError = handleRequestError(cause);
     } finally {
-      loadingNext = false;
+      if (version === requestVersion) {
+        loadingNext = false;
+        scheduleRefresh();
+      }
     }
   }
 
   function applyPayload(result: DashboardPayload): void {
     counts = result.counts;
-    page = {
-      ...result.page,
-      offset: 0,
-      total: result.page.total,
-      hasMore: sessions.length < result.page.total,
-    };
+    page = { ...result.page, offset: 0, hasMore: nextOffset < result.page.total };
     generatedAt = result.generatedAt;
     codexAvailable = result.system.codexAvailable;
   }
 
   function scheduleRefresh(): void {
-    if (!mounted) return;
+    if (!mounted || authExpired) return;
     if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
     refreshTimer = window.setTimeout(() => {
-      if (document.visibilityState === "visible") void reload();
+      if (document.visibilityState === "visible") void reload(true);
       else scheduleRefresh();
     }, dashboardPollInterval(view));
   }
 
   function selectView(next: DashboardView): void {
-    if (view === next) return;
+    if (view === next || authExpired) return;
     haptic("tap");
+    requestController?.abort();
     requestVersion += 1;
-    refreshing = false;
+    refreshing = loadingNext = false;
+    viewGeneration += 1;
     view = next;
     sessions = [];
+    nextOffset = 0;
     page = emptyPage(next);
     error = "";
     nextError = "";
@@ -163,19 +186,20 @@
   }
 
   async function openSessionTopic(session: DashboardSession): Promise<void> {
-    if (creating.has(session.id)) return;
+    if (authExpired || creating.has(session.id)) return;
+    const generation = viewGeneration;
     creating = new Set(creating).add(session.id);
     error = "";
     try {
       const result = await ensureThreadTopic(session.id, initData);
+      if (!mounted || viewGeneration !== generation || authExpired) return;
       haptic("success");
       openTelegramUrl(result.url);
       sessions = sessions.map((row) => row.id === session.id
         ? { ...row, telegramUrl: result.url, canCreateTopic: false }
         : row);
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : "Не удалось открыть топик";
-      haptic("error");
+      if (mounted && viewGeneration === generation) error = handleRequestError(cause);
     } finally {
       const next = new Set(creating);
       next.delete(session.id);
@@ -190,6 +214,7 @@
     return () => {
       mounted = false;
       requestVersion += 1;
+      requestController?.abort();
       stopTelegram();
       if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
     };
@@ -209,8 +234,8 @@
         size="small"
         icon={Renew}
         iconDescription="Обновить"
-        disabled={refreshing || !initData}
-        on:click={reload}
+        disabled={refreshing || loadingNext || !initData || authExpired}
+        on:click={() => reload()}
       />
     </header>
 
@@ -238,6 +263,14 @@
         hideCloseButton
         lowContrast
       />
+    {:else if authExpired}
+      <InlineNotification
+        kind="warning"
+        title="Сессия истекла"
+        subtitle="Откройте Dashboard заново кнопкой из закреплённого топика."
+        hideCloseButton
+        lowContrast
+      />
     {:else}
       {#if error}
         <InlineNotification kind="error" title="Ошибка обновления" subtitle={error} hideCloseButton lowContrast />
@@ -245,11 +278,14 @@
       {#if loading && sessions.length === 0}
         <div class="loading"><InlineLoading description="Загружаю сессии" /></div>
       {:else}
+        {#key view}
         <SessionList
+          bind:this={list}
           {sessions}
           total={page.total}
           hasMore={page.hasMore}
           {loadingNext}
+          {refreshing}
           {nextError}
           {loadMore}
           {creating}
@@ -258,6 +294,7 @@
           onTelegram={openSessionTopic}
           onReveal={revealSessionAction}
         />
+        {/key}
       {/if}
     {/if}
   </main>

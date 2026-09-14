@@ -167,6 +167,37 @@ describe("TurnProgressPresenter", () => {
     );
   });
 
+  it.each([
+    ["running", "Выполняю запрос"],
+    ["dispatching_unknown", "Запуск не подтверждён"],
+    ["delivery_failed", "Не удалось доставить ответ"],
+    ["delivery_uncertain", "Доставка ответа не подтверждена"],
+    ["terminal_incomplete", "Запрос выполнен, доставка ещё не завершена"],
+    ["terminal_delivered", "Ответ доставлен"],
+  ] as const)("renders %s in Russian and keeps technical details in the projection", async (state, label) => {
+    const projection = projected({ state, reasonCodes: ["TECHNICAL_REASON"] });
+    const send = vi.fn(async (_message: { html: string; plain: string }) => 501);
+    const presenter = durablePresenter({
+      projection: () => projection,
+      anchor: {
+        prepare: async () => ({ kind: "prepared", revision: revision("ru"), operation: "send", attempt: 1 }),
+        finish: async () => undefined,
+      },
+      send,
+    });
+    await presenter.start();
+    const message = send.mock.calls[0]![0];
+    for (const text of [message.html, message.plain]) {
+      expect(text).toContain(label);
+      expect(text).toContain("Инструмент");
+      expect(text).toContain("Доставлено: 1/1");
+      expect(text).not.toContain(state);
+      expect(text).not.toContain("TECHNICAL_REASON");
+    }
+    expect(message).toMatchObject({ projection, actions: projection.actions });
+    await presenter.dispose();
+  });
+
   it("reuses a persisted anchor message after presenter recreation", async () => {
     const projection = projected();
     const anchor: TurnProgressAnchorPersistence = {
@@ -184,7 +215,7 @@ describe("TurnProgressPresenter", () => {
 
     expect(send).not.toHaveBeenCalled();
     expect(edit).toHaveBeenCalledWith(501, expect.objectContaining({
-      html: expect.stringContaining("running"), projection,
+      html: expect.stringContaining("Выполняю запрос"), projection,
     }), false);
     expect(anchor.finish).toHaveBeenCalledWith({
       revision: revision("edit-1"), state: "delivered", messageId: 501, updatedAt: NOW,

@@ -36,6 +36,8 @@ graphify-out/
 
 # Test coverage
 coverage/
+test-results/
+playwright-report/
 
 # Environment backups
 .env.*

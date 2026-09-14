@@ -1,0 +1,69 @@
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import Database from "better-sqlite3";
+import { afterEach, beforeEach, expect, it } from "vitest";
+import { TopicTaskStore } from "../src/topic-task-store.js";
+
+let directory: string;
+let file: string;
+let stores: TopicTaskStore[];
+const input = { chatId: -100123, messageThreadId: 42, title: "Task", workspace: "/srv/project" };
+function open() { const store = new TopicTaskStore(file); stores.push(store); return store; }
+beforeEach(() => { directory = mkdtempSync(path.join(tmpdir(), "topic-task-")); file = path.join(directory, "topic-tasks.sqlite"); stores = []; });
+afterEach(() => { for (const store of stores) store.close(); rmSync(directory, { recursive: true, force: true }); });
+
+it("keeps stable identity and existing metadata across ensure and restart", () => {
+  const store = open(); const task = store.ensure(input);
+  expect(task).toMatchObject({ contextKey: "-100123:42", version: 1, enabled: true, presence: "unknown", cardState: "none" });
+  expect(task.taskId).toMatch(/^[0-9a-f-]{36}$/);
+  expect(store.ensure({ ...input, title: "replacement" })).toEqual(task);
+  store.close(); expect(open().get(task.contextKey)).toEqual(task);
+  expect(statSync(file).mode & 0o777).toBe(0o600);
+});
+it("preserves card and manual title when a new job arrives", () => {
+  const store = open(); const task = store.ensure(input);
+  const edited = store.update(task.contextKey, task.version, { title: "Manual", titleSource: "manual", cardState: "ready", cardMessageId: 123 });
+  const updated = store.update(task.contextKey, edited!.version, { latestJobId: "job-1", latestJobAt: 100, latestJobVersion: 1, agentState: "queued" });
+  store.close(); expect(open().get(task.contextKey)).toEqual(updated);
+  expect(updated).toMatchObject({ title: "Manual", titleSource: "manual", cardState: "ready", cardMessageId: 123 });
+});
+it("uses CAS across independent connections", () => {
+  const first = open(); const second = open(); const task = first.ensure(input);
+  expect(first.update(task.contextKey, task.version, { title: "winner" })?.version).toBe(2);
+  expect(second.update(task.contextKey, task.version, { title: "loser" })).toBeNull();
+  expect(second.get(task.contextKey)?.title).toBe("winner");
+});
+it("keeps uncertain sending across restart", () => {
+  const store = open(); const task = store.ensure(input);
+  const pending = store.update(task.contextKey, task.version, { cardState: "sending", cardAttemptId: "attempt-1" });
+  store.close(); expect(open().get(task.contextKey)).toEqual(pending);
+});
+it("lists only enabled records", () => {
+  const store = open(); const a = store.ensure(input); store.ensure({ ...input, messageThreadId: 43 });
+  store.update(a.contextKey, a.version, { enabled: false });
+  expect(store.listEnabled().map((item) => item.messageThreadId)).toEqual([43]);
+});
+it.each([{ messageThreadId: 0 }, { chatId: 0 }, { title: "bad\nname" }, { workspace: "x".repeat(4097) }, { title: "sk-" + "a".repeat(32) }])("rejects invalid identity %j", (patch) => {
+  expect(() => open().ensure({ ...input, ...patch })).toThrow();
+});
+it.each([{ cardState: "ready" }, { cardState: "sending" }, { ticketId: -1 }, { version: 99 }, { chatId: 12 }, { pinState: "pinned" }, { titleSource: "other" }])("rejects invalid updates %j", (patch) => {
+  const store = open(); const task = store.ensure(input);
+  expect(() => store.update(task.contextKey, task.version, patch as never)).toThrow();
+  expect(store.get(task.contextKey)).toEqual(task);
+});
+it("does not claim a failed database write succeeded", () => {
+  const store = open(); const task = store.ensure(input); const db = new Database(file);
+  db.exec("CREATE TRIGGER reject_updates BEFORE UPDATE ON topic_tasks BEGIN SELECT RAISE(ABORT, 'write rejected'); END"); db.close();
+  expect(() => store.update(task.contextKey, task.version, { title: "not saved" })).toThrow("write rejected");
+  expect(store.get(task.contextKey)).toEqual(task);
+});
+it("fails closed for a newer schema", () => {
+  const db = new Database(file); db.pragma("user_version = 99"); db.close();
+  expect(() => open()).toThrow();
+});
+it("fails closed for corrupt records", () => {
+  const store = open(); const task = store.ensure(input); store.close();
+  const db = new Database(file); db.prepare("UPDATE topic_tasks SET payload = ?").run('{"version":1}'); db.close();
+  expect(() => open().get(task.contextKey)).toThrow();
+});

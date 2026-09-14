@@ -28,15 +28,15 @@ describe("canonical Telegram status callbacks", () => {
 
     expect(sendMessage).toHaveBeenCalledWith(-1001, "Recovery", expect.objectContaining({
       reply_markup: { inline_keyboard: [[{
-        text: "Recover topic",
+        text: "Восстановить топик",
         callback_data: callbackData,
       }]] },
     }), expect.any(AbortSignal));
   });
 
   it.each([
-    ["resume_existing_topic", "u", "Resume topic"],
-    ["resume_existing_topic_warning", "w", "Resume; status may duplicate"],
+    ["resume_existing_topic", "u", "Продолжить в топике"],
+    ["resume_existing_topic_warning", "w", "Продолжить; возможен дубль статуса"],
   ] as const)("encodes %s within Telegram callback limits", async (kind, code, label) => {
     const sendMessage = vi.fn(async () => ({ message_id: 51 }));
     const transport = createTelegramStatusTransport({

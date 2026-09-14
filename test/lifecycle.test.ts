@@ -28,6 +28,7 @@ describe("TeleCodex lifecycle", () => {
           return reliabilityDrain.promise.then(() => { events.push("reliability.end"); });
         } },
         backgroundWriteGate: { dispose: () => { events.push("gate.dispose"); } },
+        taskCards: { dispose: async () => { events.push("tasks.dispose"); } },
         sqliteJobStore: { close: () => { events.push("sqlite.close"); } },
         registry: { disposeAll: () => { events.push("registry.dispose"); } },
       }),
@@ -59,6 +60,7 @@ describe("TeleCodex lifecycle", () => {
       "reliability.begin",
       "gate.dispose",
       "reliability.end",
+      "tasks.dispose",
       "sqlite.close",
       "registry.dispose",
       "exit.1",

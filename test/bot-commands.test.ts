@@ -128,13 +128,20 @@ describe("Telegram delivery policy", () => {
 });
 
 describe("TeleCodex command menu", () => {
+  it("exposes persistent task cards in the command menu", async () => {
+    const setMyCommands = vi.fn().mockResolvedValue(undefined);
+    await registerCommands({ api: { setMyCommands } } as never);
+    expect(setMyCommands).toHaveBeenCalledWith(expect.arrayContaining([
+      { command: "task", description: "Карточка задачи в этом топике" },
+    ]));
+  });
   it("registers /tickets for unresolved ticket navigation", async () => {
     const setMyCommands = vi.fn().mockResolvedValue(undefined);
 
     await registerCommands({ api: { setMyCommands } } as never);
 
     expect(setMyCommands).toHaveBeenCalledWith(expect.arrayContaining([
-      { command: "tickets", description: "List unresolved inbox tickets" },
+      { command: "tickets", description: "Незавершённые обращения Inbox" },
     ]));
   });
 
@@ -144,7 +151,7 @@ describe("TeleCodex command menu", () => {
     await registerCommands({ api: { setMyCommands } } as never);
 
     expect(setMyCommands).toHaveBeenCalledWith(expect.arrayContaining([
-      { command: "title", description: "Rename the current ticket topic" },
+      { command: "title", description: "Переименовать топик тикета" },
     ]));
   });
 
@@ -154,7 +161,7 @@ describe("TeleCodex command menu", () => {
     await registerCommands({ api: { setMyCommands } } as never);
 
     expect(setMyCommands).toHaveBeenCalledWith(expect.arrayContaining([
-      { command: "usage", description: "Token usage by project" },
+      { command: "usage", description: "Расход токенов по проектам" },
     ]));
   });
 

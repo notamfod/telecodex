@@ -94,6 +94,7 @@ const lifecycle = createTeleCodexLifecycle({
     retentionRuntime,
     reliabilityRuntime,
     backgroundWriteGate,
+    taskCards: bot?.taskCards,
     sqliteJobStore,
     registry,
   }),
@@ -146,6 +147,7 @@ try {
     handleWork: (source) => requireReliabilityRuntime().handleWork(source),
     registerCompletionProcessor: (processor) => { completionProcessor = processor; },
     latestJob: (context) => requireReliabilityRuntime().latestJob(context),
+    refreshTopicTask: (context) => requireReliabilityRuntime().refreshTopicTask(context),
     retry: (input) => requireReliabilityRuntime().retry(input),
     abort: (input) => requireReliabilityRuntime().abort(input),
     loadDashboardReliability: (limit) => requireReliabilityRuntime().loadDashboardReliability(limit),
@@ -190,6 +192,11 @@ try {
         })
       : undefined;
     reliabilityRuntime = createTelegramReliabilityRuntime({
+      topicTaskObserver: {
+        enabled: (_job, destination) => bot?.taskCards?.enabled(destination) === true,
+        observe: (job, projection, deliveries, destination, waitingOn, acceptanceOrder) =>
+          bot?.taskCards?.observe(job, projection, deliveries, destination, waitingOn, acceptanceOrder) ?? Promise.resolve(),
+      },
       store: canonicalJobStore,
       registry,
       materializationRoot,

@@ -1,5 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import path from "node:path";
+
+import { readInboxFailures, type InboxFailure } from "./inbox-failures.js";
 
 import { containsSecret } from "./topic-sync.js";
 
@@ -394,6 +397,7 @@ export interface Ticket {
 }
 
 interface InboxFile {
+  failures?: InboxFailure[];
   nextTicketId: number;
   inboxes: Record<string, InboxSettings>;
   tickets: Record<string, Ticket>;
@@ -414,6 +418,15 @@ export class InboxStore {
 
   get(contextKey: string): InboxSettings | undefined {
     return this.data.inboxes[contextKey];
+  }
+
+  recordFailure(failure: InboxFailure): boolean {
+    this.data.failures = readInboxFailures([...(this.data.failures ?? []), failure]);
+    return this.save();
+  }
+
+  listFailures(contextKey: string): InboxFailure[] {
+    return structuredClone((this.data.failures ?? []).filter(failure => failure.contextKey === contextKey).reverse());
   }
 
   listInboxes(): Array<[string, InboxSettings]> {
@@ -622,6 +635,7 @@ export class InboxStore {
         nextTicketId: parsed.nextTicketId ?? 1,
         inboxes: parsed.inboxes ?? {},
         tickets: parsed.tickets ?? {},
+        failures: readInboxFailures(parsed.failures),
       };
     } catch (error) {
       console.warn(
@@ -631,18 +645,21 @@ export class InboxStore {
     }
   }
 
-  private save(): void {
+  private save(): boolean {
+    const temporary = `${this.filePath}.${randomUUID()}.tmp`;
     try {
       const dir = path.dirname(this.filePath);
       if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true });
       }
-      writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), "utf8");
-    } catch (error) {
-      console.warn(
-        "Failed to persist inbox state:",
-        error instanceof Error ? error.message : String(error),
-      );
+      writeFileSync(temporary, JSON.stringify(this.data, null, 2), { encoding: "utf8", mode: 0o600, flag: "wx" });
+      renameSync(temporary, this.filePath);
+      return true;
+    } catch {
+      console.warn("Failed to persist inbox state");
+      return false;
+    } finally {
+      try { rmSync(temporary, { force: true }); } catch { /* Best effort cleanup. */ }
     }
   }
 }

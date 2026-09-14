@@ -8,7 +8,7 @@ import {
   type DashboardPayload,
   type DashboardSession,
 } from "../web/src/model.js";
-import { ensureThreadTopic, loadDashboard } from "../web/src/api.js";
+import { DashboardRequestError, ensureThreadTopic, loadDashboard, loadDashboardWindow } from "../web/src/api.js";
 import {
   ensureJiraThread,
   loadJiraIssue,
@@ -126,6 +126,45 @@ describe("Mini App API client", () => {
     expect(fetcher).toHaveBeenCalledWith("/api/dashboard?view=recent&offset=30&limit=30", {
       headers: { "x-telegram-init-data": "signed-data" },
     });
+  });
+
+  it("refreshes a window beyond 100 rows and preserves the raw pagination cursor", async () => {
+    const signal = new AbortController().signal;
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(init?.signal).toBe(signal);
+      const url = new URL(String(input), "http://test");
+      const offset = Number(url.searchParams.get("offset"));
+      const limit = Number(url.searchParams.get("limit"));
+      return new Response(JSON.stringify({
+        sessions: Array.from({ length: limit }, (_, i) => ({ id: String(offset + i) })),
+        page: { offset, limit, total: 240, hasMore: offset + limit < 240 },
+      }));
+    });
+    const result = await loadDashboardWindow("signed-data", "active", 230, fetcher, signal);
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      "/api/dashboard?view=active&offset=0&limit=100",
+      "/api/dashboard?view=active&offset=100&limit=100",
+      "/api/dashboard?view=active&offset=200&limit=30",
+    ]);
+    expect(result.payload.sessions).toHaveLength(230);
+    expect(result.nextOffset).toBe(230);
+  });
+
+  it("rejects an incomplete window instead of returning a partial replacement", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        sessions: Array.from({ length: 100 }, (_, i) => ({ id: String(i) })),
+        page: { hasMore: true },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: "Offline" }), { status: 503 }));
+    await expect(loadDashboardWindow("signed-data", "active", 130, fetcher)).rejects.toThrow("Offline");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains the authentication status even with a non-JSON response", async () => {
+    const fetcher = vi.fn(async () => new Response("expired", { status: 401 }));
+    await expect(loadDashboardWindow("signed-data", "active", 0, fetcher)).rejects.toBeInstanceOf(DashboardRequestError);
+    await expect(loadDashboardWindow("signed-data", "active", 0, fetcher)).rejects.toMatchObject({ status: 401 });
   });
 
   it("posts topic creation and surfaces server errors", async () => {

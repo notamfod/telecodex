@@ -24,7 +24,7 @@ import {
   type TelegramWorkTargetContext,
 } from "./telegram-job-ingress.js";
 import type { TelegramCompletionProcessor } from "./telegram-inbox-completion.js";
-import type { SqliteTelegramJobStore } from "./telegram-job-store.js";
+import type { DeliveryPart, SqliteTelegramJobStore } from "./telegram-job-store.js";
 import type { TelegramJob } from "./telegram-job-types.js";
 import {
   createTelegramReconciliationRuntime,
@@ -43,6 +43,7 @@ import {
   enrichTopicRecoveryAction,
   enrichTopicResumeAction,
   type TelegramStatusAction,
+  type TelegramJobStatusProjection,
   type TelegramTopicRecoveryActionState,
 } from "./telegram-status-projection.js";
 import {
@@ -127,6 +128,12 @@ export interface TelegramReliabilityRuntimeOptions {
   readonly targetProvisionTimeoutMs?: number;
   readonly transcribeAttachment?: TelegramJobIngressOptions["transcribeAttachment"];
   readonly materializationTimeoutMs?: number;
+  readonly topicTaskObserver?: {
+    enabled(job: TelegramJob, destination: TelegramWorkTargetContext): boolean;
+    observe(job: TelegramJob, projection: TelegramJobStatusProjection,
+      deliveries: readonly DeliveryPart[], destination: TelegramWorkTargetContext,
+      waitingOn: "input" | "approval" | undefined, acceptanceOrder: number): Promise<void>;
+  };
   readonly statusTransport: TelegramDurableStatusOptions["transport"];
   readonly classifyStatusTransportError: TelegramDurableStatusOptions["classifyTransportError"];
   readonly deliveryTransport: TelegramDeliveryAdapter;
@@ -163,6 +170,7 @@ export interface TelegramReliabilityRuntime {
     readonly target: TelegramCanonicalJobRef;
   }): Promise<void>;
   refresh(jobId: string): Promise<void>;
+  refreshTopicTask(context: TelegramCanonicalContext): Promise<void>;
   loadDashboardReliability(limit?: number): Promise<DashboardReliabilitySnapshot>;
   loadDashboardSessionStatuses(): Promise<readonly DashboardSessionStatus[]>;
   runDashboardAction(action: TelegramStatusAction, context?: TelegramCanonicalContext): Promise<void>;
@@ -251,9 +259,59 @@ export function createTelegramReliabilityRuntime(
     onBackgroundError: (jobId, error) => report(jobId, "status_refresh", error),
     now,
   });
+  // Observers own presentation only. Never await them in canonical effects or shutdown.
+  const taskObservations = new Map<string, { dirty: boolean }>();
+  const notifyTask = (jobId: string): void => {
+    const observer = options.topicTaskObserver;
+    if (!observer || disposed) return;
+    const pending = taskObservations.get(jobId);
+    if (pending) { pending.dirty = true; return; }
+    const entry = { dirty: true };
+    taskObservations.set(jobId, entry);
+    void Promise.resolve().then(async () => {
+      while (entry.dirty && !disposed) {
+        entry.dirty = false;
+        try {
+          const initial = requireJob(store, jobId);
+          const source = durableSource(store, initial);
+          const destination = source.targetContext ?? {
+            chatId: source.chatId, messageThreadId: source.messageThreadId,
+          };
+          if (destination.messageThreadId === null) continue;
+          const initialTarget = { chatId: destination.chatId, messageThreadId: destination.messageThreadId };
+          if (!observer.enabled(initial, initialTarget)) continue;
+          const [projection, waitingOn] = await Promise.all([
+            status.readProjection(jobId),
+            readTaskWaitingOn(options.exactTurnReader, initial),
+          ]);
+          if (disposed) return;
+          const current = requireJob(store, jobId);
+          if (current.version !== projection.expectedVersion || current.version !== initial.version) {
+            entry.dirty = true; continue;
+          }
+          const currentSource = durableSource(store, current);
+          const currentDestination = currentSource.targetContext ?? {
+            chatId: currentSource.chatId, messageThreadId: currentSource.messageThreadId,
+          };
+          if (currentDestination.messageThreadId === null) continue;
+          const target = { chatId: currentDestination.chatId, messageThreadId: currentDestination.messageThreadId };
+          if (!observer.enabled(current, target)) continue;
+          const { deliveries } = store.readStatusDeliveryEvidence(jobId);
+          const acceptanceOrder = store.getAcceptanceOrder(jobId);
+          if (acceptanceOrder === null) throw new Error("Missing Telegram job acceptance order");
+          await observer.observe(current, projection, deliveries, target, waitingOn, acceptanceOrder);
+        } catch (error) {
+          report(jobId, "status_refresh", error);
+        }
+      }
+    }).finally(() => {
+      taskObservations.delete(jobId);
+      if (entry.dirty && !disposed) notifyTask(jobId);
+    }).catch((error) => report(jobId, "status_refresh", error));
+  };
   const deliveryAttemptJobIds: string[] = [];
   const outbox = new TelegramDeliveryOutbox({
-    store: trackDeliveryAttemptJobs(store, (jobId) => deliveryAttemptJobIds.push(jobId)),
+    store: trackDeliveryAttemptJobs(store, (jobId) => deliveryAttemptJobIds.push(jobId), notifyTask),
     telegram: {
       deliver: async (payload, signal) => {
         const jobId = deliveryAttemptJobIds.shift() ?? null;
@@ -367,6 +425,7 @@ export function createTelegramReliabilityRuntime(
     jobId: string,
     priority: TelegramStatusRefreshPriority,
   ): Promise<void> => {
+    notifyTask(jobId);
     if (statusCutovers.has(jobId)) return;
     const job = requireJob(store, jobId);
     if (job.phase === "terminal" && job.outcome === "completed") {
@@ -457,6 +516,7 @@ export function createTelegramReliabilityRuntime(
     if (job.phase === "delivering") await pumpOutboxAndReconcileTopicResume();
   };
   const afterTransition = (job: TelegramJob): void => {
+    notifyTask(job.id);
     if (job.phase === "delivering" && job.turnResult) {
       statusCutovers.add(job.id);
       status.beginDisposeJob(job.id);
@@ -640,6 +700,7 @@ export function createTelegramReliabilityRuntime(
     async handleWork(source) { return (await scheduleWork(source)).target; },
     async reconcile() {
       assertRunning(disposed);
+      if (options.topicTaskObserver) for (const job of store.listUnfinished()) notifyTask(job.id);
       let result: Awaited<ReturnType<typeof runReconciliation>>;
       try {
         await topicResume?.reconcile();
@@ -707,6 +768,13 @@ export function createTelegramReliabilityRuntime(
         await coordinator.abort(target.jobId);
       });
       await drain(target.jobId, effects);
+    },
+    async refreshTopicTask(context) {
+      assertRunning(disposed);
+      const expected = normalizeContext(context);
+      if (!options.topicTaskObserver) return;
+      const job = store.findLatestAcceptedByContext(expected);
+      if (job) notifyTask(job.id);
     },
     async refresh(jobId) {
       assertRunning(disposed);
@@ -1291,9 +1359,38 @@ function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+async function readTaskWaitingOn(
+  reader: TelegramExactTurnReader,
+  job: TelegramJob,
+): Promise<"input" | "approval" | undefined> {
+  if (job.phase !== "running" || !job.threadId || !job.turnId) return undefined;
+  try {
+    const raw = await withRuntimeTimeout(
+      reader.request("thread/read", { threadId: job.threadId, includeTurns: true }),
+      INTERNAL_DEPENDENCY_PROBE_TIMEOUT_MS,
+    );
+    if (!record(raw) || !record(raw.thread)) return undefined;
+    const thread = raw.thread;
+    if (thread.id !== job.threadId || !record(thread.status)
+      || thread.status.type !== "active" || !Array.isArray(thread.status.activeFlags)
+      || !Array.isArray(thread.turns)) return undefined;
+    const activeTurns = thread.turns.filter((turn) => record(turn) && turn.status === "inProgress");
+    if (activeTurns.length !== 1 || !record(activeTurns[0]) || activeTurns[0].id !== job.turnId) return undefined;
+    const flags = thread.status.activeFlags;
+    const approval = flags.includes("waitingOnApproval");
+    const input = flags.includes("waitingOnUserInput");
+    if (approval === input) return undefined;
+    return approval ? "approval" : "input";
+  } catch {
+    // Absence of exact live evidence cannot turn generic waiting into a user action.
+    return undefined;
+  }
+}
+
 function trackDeliveryAttemptJobs(
   store: SqliteTelegramJobStore,
   onAttempt: (jobId: string) => void,
+  onProjection: (jobId: string) => void,
 ): SqliteTelegramJobStore {
   return new Proxy(store, {
     get(target, property) {
@@ -1301,6 +1398,7 @@ function trackDeliveryAttemptJobs(
         return (input: Parameters<SqliteTelegramJobStore["transitionDeliveryAndProject"]>[0]) => {
           const result = target.transitionDeliveryAndProject(input);
           if (input.state === "sending") onAttempt(input.jobId);
+          onProjection(input.jobId);
           return result;
         };
       }

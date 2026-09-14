@@ -9,6 +9,7 @@
   export let total: number;
   export let hasMore: boolean;
   export let loadingNext: boolean;
+  export let refreshing = false;
   export let nextError: string;
   export let loadMore: () => Promise<void>;
   export let creating: Set<string>;
@@ -18,7 +19,6 @@
   export let onReveal: (key: string, action: ThreadSwipeAction | null) => void;
 
   let viewport: HTMLDivElement | undefined;
-  let requestedAtCount = -1;
   let now = Date.now();
 
   const rowVirtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
@@ -33,7 +33,7 @@
   $: virtualItems = $rowVirtualizer.getVirtualItems();
   $: totalSize = $rowVirtualizer.getTotalSize();
   $: lastVirtualIndex = virtualItems[virtualItems.length - 1]?.index ?? -1;
-  $: if (hasMore && !loadingNext && lastVirtualIndex >= sessions.length - 8) {
+  $: if (hasMore && !loadingNext && !refreshing && !nextError && lastVirtualIndex >= sessions.length - 8) {
     void requestNext();
   }
 
@@ -60,9 +60,32 @@
   }
 
   async function requestNext(): Promise<void> {
-    if (!hasMore || loadingNext || requestedAtCount === sessions.length) return;
-    requestedAtCount = sessions.length;
+    if (!hasMore || loadingNext || refreshing) return;
     await loadMore();
+  }
+
+  export function captureAnchor(): { ids: string[]; offset: number } | undefined {
+    if (!viewport) return;
+    const first = get(rowVirtualizer).getVirtualItems().find((item) => item.end > viewport!.scrollTop);
+    if (!first) return;
+    const ids = [sessions[first.index].id];
+    for (let distance = 1; distance < sessions.length; distance++) {
+      if (sessions[first.index + distance]) ids.push(sessions[first.index + distance].id);
+      if (sessions[first.index - distance]) ids.push(sessions[first.index - distance].id);
+    }
+    return {
+      ids,
+      offset: viewport.scrollTop - first.start,
+    };
+  }
+
+  export function restoreAnchor(anchor: { ids: string[]; offset: number }): void {
+    const indices = new Map(sessions.map((row, index) => [row.id, index]));
+    const id = anchor.ids.find((candidate) => indices.has(candidate));
+    if (!id) return;
+    const virtualizer = get(rowVirtualizer);
+    const position = virtualizer.getOffsetForIndex(indices.get(id)!, "start");
+    if (position) virtualizer.scrollToOffset(position[0] + anchor.offset);
   }
 </script>
 

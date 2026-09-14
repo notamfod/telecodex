@@ -12,10 +12,10 @@ describe("bot-ui", () => {
   describe("renderHelpMessage", () => {
     it("contains all command groups", () => {
       const { html, plain } = renderHelpMessage();
-      expect(html).toContain("Session");
-      expect(html).toContain("Model");
-      expect(html).toContain("Auth");
-      expect(html).toContain("Utility");
+      expect(html).toContain("Сессия");
+      expect(html).toContain("Модель");
+      expect(html).toContain("Авторизация");
+      expect(html).toContain("Справка");
       expect(plain).toContain("/new");
       expect(plain).toContain("/help");
       expect(plain).toContain("/retry");
@@ -24,10 +24,23 @@ describe("bot-ui", () => {
       expect(plain).not.toContain("/model");
     });
 
-    it("lists all 20 commands", () => {
+    it("lists all 21 commands", () => {
       const { plain } = renderHelpMessage();
-      const commandMatches = plain.match(/\/\w+/g) ?? [];
-      expect(commandMatches.length).toBe(20);
+      const commandMatches = plain.match(/^  \/\w+/gm) ?? [];
+      expect(commandMatches.length).toBe(21);
+    });
+
+    it("explains task controls without confusing a session or MR draft with task completion", () => {
+      for (const text of Object.values(renderHelpMessage())) {
+        expect(text).toContain("Задача - ваша цель");
+        expect(text).toContain("топик - место работы");
+        expect(text).toContain("сессия - диалог с Codex");
+        expect(text).toContain("/new - Новая сессия в этом топике");
+        expect(text).toContain("/done - Черновик комментария к MR; задачу не завершает");
+        expect(text).toContain("/task - Создать или обновить постоянную карточку задачи в этом топике");
+        expect(text).toContain("/task off - Остановить обновления, сохранив карточку");
+        expect(text).toContain(text.includes("<b>") ? "/task title &lt;название&gt;" : "/task title <название>");
+      }
     });
 
     it("returns valid HTML with bold tags", () => {
@@ -60,9 +73,9 @@ describe("bot-ui", () => {
   describe("renderWelcomeFirstTime", () => {
     it("shows welcome without auth warning", () => {
       const { html, plain } = renderWelcomeFirstTime();
-      expect(html).toContain("TeleCodex is ready");
+      expect(html).toContain("TeleCodex готов");
       expect(plain).toContain("/help");
-      expect(plain).toContain("Send a message to start an OpenAI thread.");
+      expect(plain).toContain("Опишите задачу сообщением, чтобы начать сессию с Codex.");
       expect(plain).not.toContain("choose a model");
       expect(html).not.toContain("⚠️");
     });
@@ -88,7 +101,7 @@ describe("bot-ui", () => {
 
     it("shows topic label for topic sessions", () => {
       const { html } = renderWelcomeReturning("", "", true);
-      expect(html).toContain("topic session");
+      expect(html).toContain("сессия в топике");
     });
 
     it("includes auth warning when provided", () => {

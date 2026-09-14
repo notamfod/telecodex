@@ -11,6 +11,7 @@ import {
   parseContextKey,
   type TelegramContextKey,
 } from "./context-key.js";
+import { inboxFailureText, makeInboxFailure, type InboxProgress } from "./inbox-failures.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML } from "./format.js";
 import {
@@ -65,6 +66,8 @@ type TextOptions = {
 };
 
 export interface RegisterInboxHandlersDeps {
+  renameTopicManually?(chatId: number, messageThreadId: number, title: string): Promise<void>;
+  onManualTopicTitle?(chatId: number, messageThreadId: number, title: string): Promise<void>;
   bot: Bot<Context>;
   config: TeleCodexConfig;
   registry: SessionRegistry;
@@ -126,11 +129,7 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
   const forwardAttachments = async (group: InboxItem[], threadId: number): Promise<void> => {
     const first = group[0]!;
     for (const item of group.filter((entry) => entry.hasAttachment)) {
-      try {
-        await bot.api.forwardMessage(first.chatId, first.chatId, item.messageId, { message_thread_id: threadId });
-      } catch (error) {
-        console.warn(formatTelegramErrorLog("inbox", error));
-      }
+      await bot.api.forwardMessage(first.chatId, first.chatId, item.messageId, { message_thread_id: threadId });
     }
   };
   const appendToTicket = async (ticket: Ticket, group: InboxItem[], text: string, source: string): Promise<void> => {
@@ -144,11 +143,11 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
       fallbackText: `${ticketHeading(ticket)}: ${url}`,
     });
   };
-  const createTicket = async (group: InboxItem[], options: {
+  const createTicketAttempt = async (group: InboxItem[], options: {
     skipDuplicateCheck?: boolean;
     supersedesId?: number;
     continueTicketId?: number;
-  } = {}): Promise<void> => {
+  } = {}, progress: InboxProgress): Promise<void> => {
     const first = group[0];
     if (!first) return;
     const settings = inbox.get(first.contextKey);
@@ -161,6 +160,8 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
       for (const candidate of candidates) {
         if (candidate.resolvedAt !== undefined || !candidate.workTopicId) continue;
         if (await deps.topicIsAlive(first.chatId, candidate.workTopicId)) {
+          progress.outcome = "topic_exists";
+          progress.workTopicId = candidate.workTopicId;
           await appendToTicket(candidate, group, text, source);
           return;
         }
@@ -193,12 +194,15 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
     });
     const topicName = ticketTopicName(pending.id, text, pending.externalKey);
     let topic;
+    progress.outcome = "creation_unknown";
     try {
       topic = await bot.api.createForumTopic(first.chatId, topicName, settings.iconCustomEmojiId ? { icon_custom_emoji_id: settings.iconCustomEmojiId } : undefined);
     } catch (error) {
       if (!continued) inbox.removeUnattachedTicket(pending.id);
       throw error;
     }
+    progress.outcome = "topic_exists";
+    progress.workTopicId = topic.message_thread_id;
     topicActivity.rememberIdleIcon(first.chatId, topic.message_thread_id, settings.iconCustomEmojiId ?? null);
     const ticket = continued
       ? inbox.continueTicket(continued.id, { workTopicId: topic.message_thread_id, prompt, source })!
@@ -225,10 +229,28 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
       fallbackText: `${ticketHeading(ticket)}: ${url}`,
     });
   };
+  const reportFailure = async (group: InboxItem[], error: unknown, progress: InboxProgress = { outcome: "processing_failed" }): Promise<void> => {
+    console.error(formatTelegramErrorLog("inbox", error));
+    const first = group[0];
+    if (!first) return;
+    const failure = makeInboxFailure(first.contextKey, group.map(item => item.messageId), progress, error);
+    const persisted = inbox.recordFailure(failure);
+    const text = inboxFailureText(failure) + (persisted === false ? "\nНе удалось сохранить запись ошибки. Сохрани номера сообщений для проверки после перезапуска." : "");
+    try {
+      await deps.sendText(first.chatId, escapeHTML(text), {
+        messageThreadId: parseContextKey(first.contextKey).messageThreadId, fallbackText: text,
+      });
+    } catch (noticeError) { console.error(formatTelegramErrorLog("inbox", noticeError)); }
+  };
+  const createTicket = async (group: InboxItem[], options: Parameters<typeof createTicketAttempt>[1] = {}): Promise<void> => {
+    const progress: InboxProgress = { outcome: "processing_failed" };
+    try { await createTicketAttempt(group, options, progress); }
+    catch (error) { await reportFailure(group, error, progress); }
+  };
   const createTicketsSequentially = async (groups: InboxItem[][]): Promise<void> => {
     for (const [index, group] of groups.entries()) {
       if (index > 0) await new Promise((resolve) => setTimeout(resolve, INBOX_TOPIC_PAUSE_MS));
-      try { await createTicket(group); } catch (error) { console.error(formatTelegramErrorLog("inbox", error)); }
+      await createTicket(group);
     }
   };
   const askHowToSplit = async (groups: InboxItem[][]): Promise<void> => {
@@ -242,7 +264,7 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
   };
   const inboxBuffer = new BurstBuffer<InboxItem>(INBOX_QUIET_MS, (items) => {
     const groups = groupBurst(items);
-    void (groups.length === 1 ? createTicket(groups[0]) : askHowToSplit(groups)).catch((error) => console.error(formatTelegramErrorLog("inbox", error)));
+    void (groups.length === 1 ? createTicket(groups[0]) : askHowToSplit(groups)).catch((error) => reportFailure(items, error));
   });
 
   registerInboxCommands(deps);
@@ -250,21 +272,25 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
     const batchId = ctx.match?.[1];
     const choice = ctx.match?.[2];
     const groups = batchId ? pendingBatches.get(batchId) : undefined;
-    if (!groups) { await ctx.answerCallbackQuery({ text: "Устарело, перешли сообщения заново" }); return; }
+    if (!groups) { await ctx.answerCallbackQuery({ text: "Выбор устарел. Проверь /inbox status и список топиков." }); return; }
     pendingBatches.delete(batchId!);
-    if (choice === "cancel") { await ctx.answerCallbackQuery({ text: "Отменено" }); await ctx.editMessageText("Отменено, тикеты не заводились."); return; }
-    await ctx.answerCallbackQuery({ text: "Завожу тикеты..." });
     const batches = choice === "one" ? [groups.flat()] : groups;
-    await ctx.editMessageText(choice === "one" ? "Завожу один тикет..." : `Завожу тикетов: ${batches.length}...`);
+    try {
+      if (choice === "cancel") { await ctx.answerCallbackQuery({ text: "Отменено" }); await ctx.editMessageText("Отменено, тикеты не заводились."); return; }
+      await ctx.answerCallbackQuery({ text: "Завожу тикеты..." });
+      await ctx.editMessageText(choice === "one" ? "Завожу один тикет..." : `Завожу тикетов: ${batches.length}...`);
+    } catch (error) { await reportFailure(groups.flat(), error); return; }
     await createTicketsSequentially(batches);
   });
   bot.callbackQuery(/^ticket_dup:(\d+):(reuse|new)$/, async (ctx) => {
     const decisionId = Number.parseInt(ctx.match?.[1] ?? "", 10);
     const choice = ctx.match?.[2];
     const pending = Number.isNaN(decisionId) ? undefined : pendingDuplicateDecisions.get(decisionId);
-    if (!pending || (choice !== "reuse" && choice !== "new")) { await ctx.answerCallbackQuery({ text: "Выбор устарел, перешли сообщение заново" }); return; }
+    if (!pending || (choice !== "reuse" && choice !== "new")) { await ctx.answerCallbackQuery({ text: "Выбор устарел. Проверь /inbox status и список топиков." }); return; }
     pendingDuplicateDecisions.delete(decisionId);
-    await ctx.answerCallbackQuery({ text: choice === "reuse" ? "Продолжаю тикет..." : "Создаю новый тикет..." });
+    try {
+      await ctx.answerCallbackQuery({ text: choice === "reuse" ? "Продолжаю тикет..." : "Создаю новый тикет..." });
+    } catch (error) { await reportFailure(pending.group, error); return; }
     await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
     await createTicket(pending.group, { skipDuplicateCheck: true, ...(choice === "reuse" ? { continueTicketId: pending.previousTicketId } : { supersedesId: pending.previousTicketId }) });
   });
@@ -437,8 +463,9 @@ function registerInboxCommands(deps: RegisterInboxHandlersDeps): void {
     }
     if (action === "status" || action === "") {
       if (!settings) { const text = `Этот топик не инбокс.\n\n${usage}`; await deps.safeReply(ctx, escapeHTML(text), { fallbackText: text }); return; }
-      const html = ["<b>Инбокс включён.</b>", `Проект: <code>${escapeHTML(settings.workspace)}</code>`, `Профиль: <code>${escapeHTML(settings.launchProfileId ?? "по умолчанию")}</code>`].join("\n");
-      await deps.safeReply(ctx, html, { fallbackText: "Инбокс включён." }); return;
+      const failures = inbox.listFailures(contextKey).slice(0, 3).map(inboxFailureText).join("\n\n");
+      const html = ["<b>Инбокс включён.</b>", `Проект: <code>${escapeHTML(settings.workspace)}</code>`, `Профиль: <code>${escapeHTML(settings.launchProfileId ?? "по умолчанию")}</code>`, failures ? `\nПоследние ошибки (требуют проверки):\n${escapeHTML(failures)}` : ""].filter(Boolean).join("\n");
+      await deps.safeReply(ctx, html, { fallbackText: ["Инбокс включён.", failures].filter(Boolean).join("\n") }); return;
     }
     await deps.safeReply(ctx, escapeHTML(usage), { fallbackText: usage });
   });
@@ -466,9 +493,13 @@ function registerInboxCommands(deps: RegisterInboxHandlersDeps): void {
     const extracted = extractTopicRename(`TOPIC: ${requested}\n\n`);
     if (!extracted) { await deps.safeReply(ctx, escapeHTML("Укажи безопасное непустое название: /title <текст>")); return; }
     const topicName = renamedTicketTopic(ticket, extracted.title);
-    try { await bot.api.editForumTopic(chatId, threadId, { name: topicName }); }
+    try {
+      if (deps.renameTopicManually) await deps.renameTopicManually(chatId, threadId, topicName);
+      else await bot.api.editForumTopic(chatId, threadId, { name: topicName });
+    }
     catch (error) { if (!isTelegramTopicNotModified(error)) throw error; }
     inbox.setTopicTitle(ticket.id, extracted.title);
+    await deps.onManualTopicTitle?.(chatId, threadId, topicName);
     const text = `Топик переименован: ${topicName}`;
     await deps.safeReply(ctx, escapeHTML(text), { fallbackText: text });
   });

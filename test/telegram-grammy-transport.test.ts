@@ -118,8 +118,8 @@ describe("grammY canonical Telegram transports", () => {
     expect(sendMessage).toHaveBeenCalledWith(-1001, "<b>Queued</b>", expect.objectContaining({
       message_thread_id: 7, parse_mode: "HTML",
       reply_markup: { inline_keyboard: [
-        [expect.objectContaining({ callback_data: "tcj:a:job-1:4" })],
-        [expect.objectContaining({ callback_data: "tcj:d:job-1:4" })],
+        [expect.objectContaining({ text: "Остановить", callback_data: "tcj:a:job-1:4" })],
+        [expect.objectContaining({ text: "Подробности", callback_data: "tcj:d:job-1:4" })],
       ] },
     }), expect.any(AbortSignal));
     expect(editMessageText).toHaveBeenCalledWith(-1001, 51, "<b>Queued</b>", expect.objectContaining({

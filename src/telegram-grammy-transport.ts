@@ -369,12 +369,12 @@ export function telegramStatusActionCallbackData(action: TelegramStatusAction): 
 
 function actionLabel(action: TelegramStatusAction): string {
   const labels: Record<TelegramStatusAction["kind"], string> = {
-    abort: "Stop", refresh: "Refresh", details: "Details", inspect: "Inspect",
-    retry_new_turn: "Retry", guardian_restore: "Restore", retry_delivery: "Retry delivery",
-    recover_missing_topic: "Recover topic",
-    resume_existing_topic: "Resume topic",
-    resume_existing_topic_warning: "Resume; status may duplicate",
-    send_again_warning: "Send again",
+    abort: "Остановить", refresh: "Обновить", details: "Подробности", inspect: "Проверить",
+    retry_new_turn: "Повторить запрос", guardian_restore: "Восстановить", retry_delivery: "Повторить доставку",
+    recover_missing_topic: "Восстановить топик",
+    resume_existing_topic: "Продолжить в топике",
+    resume_existing_topic_warning: "Продолжить; возможен дубль статуса",
+    send_again_warning: "Отправить снова; возможен дубль",
   };
   return labels[action.kind];
 }

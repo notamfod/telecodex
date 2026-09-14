@@ -294,6 +294,21 @@ export class SqliteTelegramJobStore {
     return row ? this.decodeCurrentRow(row).job : null;
   }
 
+  /** Stable acceptance order survives payload archival and does not follow completion time. */
+  getAcceptanceOrder(jobId: string): number | null {
+    this.assertOpen();
+    if (!nonEmpty(jobId)) return null;
+    const rows = this.statement(`SELECT sequence FROM job_events
+      WHERE job_id = ? AND event_type = 'update.accepted'
+      UNION SELECT sequence FROM job_event_archive
+      WHERE job_id = ? AND event_type = 'update.accepted'`).all(jobId, jobId) as { sequence: unknown }[];
+    if (rows.length === 0) return null;
+    if (rows.length !== 1) throw new Error("Invalid Telegram job acceptance order");
+    const sequence = integer(rows[0]!.sequence, "acceptance order");
+    if (sequence < 1) throw new Error("Invalid Telegram job acceptance order");
+    return sequence;
+  }
+
   getBySourceKey(key: TelegramSourceKey): TelegramJob | null {
     this.assertOpen();
     assertSource(key);
@@ -487,7 +502,16 @@ export class SqliteTelegramJobStore {
   listRecent(limit: number): readonly TelegramJob[] {
     return this.listBy("1 = 1", limit, "updated_at_ms DESC, id ASC");
   }
+  findLatestAcceptedByContext(input: { readonly botId: string; readonly chatId: number; readonly messageThreadId: number | null }): TelegramJob | null {
+    return this.findContextJob(input, "accepted");
+  }
   findLatestByContext(input: { readonly botId: string; readonly chatId: number; readonly messageThreadId: number | null }): TelegramJob | null {
+    return this.findContextJob(input, "updated");
+  }
+  private findContextJob(
+    input: { readonly botId: string; readonly chatId: number; readonly messageThreadId: number | null },
+    order: "accepted" | "updated",
+  ): TelegramJob | null {
     this.assertOpen();
     bounded(input.botId, "botId", BOT_ID_MAX_LENGTH);
     if (!Number.isSafeInteger(input.chatId) || input.chatId === 0 || !(input.messageThreadId === null
@@ -495,19 +519,23 @@ export class SqliteTelegramJobStore {
       throw new Error("Invalid Telegram context");
     }
     const row = this.statement(`${JOB_WITH_INBOX}
-      WHERE inbox_updates.bot_id = ? AND json_valid(inbox_updates.source_json)
-      AND ((json_extract(inbox_updates.source_json, '$.chatId') = ?
-        AND ((? IS NULL AND json_type(inbox_updates.source_json, '$.messageThreadId') = 'null')
-          OR (? IS NOT NULL AND json_extract(inbox_updates.source_json, '$.messageThreadId') = ?)))
-        OR (json_extract(inbox_updates.source_json, '$.targetContext.chatId') = ?
-          AND ? IS NOT NULL
-          AND json_extract(inbox_updates.source_json, '$.targetContext.messageThreadId') = ?))
+      WHERE inbox_updates.bot_id = @botId AND json_valid(inbox_updates.source_json)
+      AND ${order === "accepted" ? `
+        COALESCE(json_extract(inbox_updates.source_json, '$.targetContext.chatId'),
+          json_extract(inbox_updates.source_json, '$.chatId')) = @chatId
+        AND COALESCE(json_extract(inbox_updates.source_json, '$.targetContext.messageThreadId'),
+          json_extract(inbox_updates.source_json, '$.messageThreadId')) IS @messageThreadId
+      ` : `((json_extract(inbox_updates.source_json, '$.chatId') = @chatId
+        AND ((@messageThreadId IS NULL AND json_type(inbox_updates.source_json, '$.messageThreadId') = 'null')
+          OR (@messageThreadId IS NOT NULL AND json_extract(inbox_updates.source_json, '$.messageThreadId') = @messageThreadId)))
+        OR (json_extract(inbox_updates.source_json, '$.targetContext.chatId') = @chatId
+          AND @messageThreadId IS NOT NULL
+          AND json_extract(inbox_updates.source_json, '$.targetContext.messageThreadId') = @messageThreadId))`}
       AND NOT EXISTS (SELECT 1 FROM job_quarantine WHERE job_quarantine.job_id = jobs.id)
-      ORDER BY jobs.updated_at_ms DESC, jobs.id ASC LIMIT 1`).get(
-        input.botId,
-        input.chatId, input.messageThreadId, input.messageThreadId, input.messageThreadId,
-        input.chatId, input.messageThreadId, input.messageThreadId,
-      ) as Record<string, unknown> | undefined;
+      ORDER BY ${order === "accepted" ? `COALESCE(
+        (SELECT sequence FROM job_events WHERE job_id = jobs.id AND event_type = 'update.accepted'),
+        (SELECT sequence FROM job_event_archive WHERE job_id = jobs.id AND event_type = 'update.accepted')
+      ) DESC` : "jobs.updated_at_ms DESC, jobs.id ASC"} LIMIT 1`).get(input) as Record<string, unknown> | undefined;
     return row ? this.decodeCurrentRow(row).job : null;
   }
 

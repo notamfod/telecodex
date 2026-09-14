@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { runTaskAction } from "./api.js";
   import { onMount, tick } from "svelte";
   import { Button, InlineLoading, InlineNotification, Tag, Theme } from "carbon-components-svelte";
   import PlayFilled from "carbon-icons-svelte/lib/PlayFilled.svelte";
@@ -280,6 +281,7 @@
       {:else}
         {#key view}
         <SessionList
+          onTaskAction={async action => { try { await runTaskAction(action, initData); } finally { await reload(); } }}
           bind:this={list}
           {sessions}
           total={page.total}

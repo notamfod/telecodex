@@ -112,6 +112,7 @@ export interface TelegramReliabilityRuntimeErrorContext {
 }
 
 export interface TelegramReliabilityRuntimeOptions {
+  readonly canAcceptTaskWork?: (context: TelegramCanonicalContext) => boolean;
   readonly store: SqliteTelegramJobStore;
   readonly registry: TelegramSessionCodexAdapterOptions["registry"];
   readonly materializationRoot: string;
@@ -129,6 +130,7 @@ export interface TelegramReliabilityRuntimeOptions {
   readonly transcribeAttachment?: TelegramJobIngressOptions["transcribeAttachment"];
   readonly materializationTimeoutMs?: number;
   readonly topicTaskObserver?: {
+    reconcile?(): Promise<void>;
     enabled(job: TelegramJob, destination: TelegramWorkTargetContext): boolean;
     observe(job: TelegramJob, projection: TelegramJobStatusProjection,
       deliveries: readonly DeliveryPart[], destination: TelegramWorkTargetContext,
@@ -157,6 +159,10 @@ export interface TelegramReliabilityRuntimeOptions {
 }
 
 export interface TelegramReliabilityRuntime {
+  withTaskContext<T>(context: TelegramCanonicalContext, operation: () => Promise<T>): Promise<T>;
+  readTaskContext(context: TelegramCanonicalContext): Promise<{
+    safe: boolean; projection: TelegramJobStatusProjection | null;
+  }>;
   handle(source: TelegramWorkSource): Promise<TelegramWorkHandlingResult>;
   handleWork(source: TelegramWorkSource): Promise<TelegramWorkTargetContext | null>;
   reconcile(): ReturnType<ReturnType<typeof createTelegramReconciliationRuntime>>;
@@ -187,6 +193,19 @@ export function createTelegramReliabilityRuntime(
   const now = options.now ?? Date.now;
   const createId = options.createId ?? randomUUID;
   const store = options.store;
+  const taskContexts = new Map<string, Promise<unknown>>();
+  const withTaskContext = <T>(context: TelegramCanonicalContext, operation: () => Promise<T>): Promise<T> => {
+    if (disposed) return Promise.reject(new Error("Telegram reliability runtime is disposed"));
+    const normalized = normalizeContext(context);
+    const key = JSON.stringify([normalized.botId, normalized.chatId, normalized.messageThreadId]);
+    const next = (taskContexts.get(key) ?? Promise.resolve()).catch(() => {}).then(() => {
+      assertRunning(disposed);
+      return operation();
+    });
+    taskContexts.set(key, next);
+    void next.finally(() => { if (taskContexts.get(key) === next) taskContexts.delete(key); }).catch(() => {});
+    return next;
+  };
   const targetProvisionTimeoutMs = boundedTimeout(
     options.targetProvisionTimeoutMs ?? options.deliveryTimeoutMs ?? 15_000,
     "targetProvisionTimeoutMs",
@@ -633,12 +652,27 @@ export function createTelegramReliabilityRuntime(
     }
   };
 
-  const scheduleWork = async (source: TelegramWorkSource): Promise<{
+  const scheduleWork = async (source: TelegramWorkSource, expectedRetryVersion?: number, contextLocked = false): Promise<{
     readonly result: TelegramWorkHandlingResult;
     readonly target: TelegramWorkTargetContext | null;
   }> => {
     assertRunning(disposed);
-    const accepted = ingress.accept(source);
+    const destination = { botId: source.botId, ...(source.targetContext ?? {
+      chatId: source.chatId, messageThreadId: source.messageThreadId,
+    }) };
+    const accept = async () => {
+      assertRunning(disposed);
+      if (options.canAcceptTaskWork?.(destination) === false) {
+        throw new Error("Задача закрыта или изменение её состояния ещё не подтверждено. Открой карточку задачи.");
+      }
+      if (expectedRetryVersion !== undefined) {
+        const result = ingress.acceptRetry(source, expectedRetryVersion);
+        releaseAmbiguousRetryParent(source);
+        return result;
+      }
+      return ingress.accept(source);
+    };
+    const accepted = contextLocked ? await accept() : await withTaskContext(destination, accept);
     const target = await ensureTarget(accepted.job.id);
     const durable = durableSource(store, requireJob(store, accepted.job.id));
     const statusPriority: TelegramStatusRefreshPriority = accepted.created ? "urgent" : "ordinary";
@@ -696,10 +730,24 @@ export function createTelegramReliabilityRuntime(
   };
 
   return {
+    withTaskContext,
+    async readTaskContext(context) {
+      assertRunning(disposed);
+      const normalized = normalizeContext(context);
+      if (normalized.messageThreadId === null) throw new Error("Task topic is required");
+      const job = store.findLatestAcceptedByContext(normalized);
+      const raw = job ? await status.readProjection(job.id) : null;
+      const recovered = raw && topicRecovery ? enrichTopicRecoveryProjection(store, options.topicRecovery!, raw) : raw;
+      const projection = recovered && topicResume ? enrichTopicResumeProjection(store, options.topicResume!, recovered) : recovered;
+      const guard = store.readTaskContextGuard({ ...normalized, messageThreadId: normalized.messageThreadId });
+      return { safe: guard.safe, projection };
+    },
     handle,
     async handleWork(source) { return (await scheduleWork(source)).target; },
     async reconcile() {
       assertRunning(disposed);
+      // Task lifecycle recovery cannot delay canonical job reconciliation.
+      void options.topicTaskObserver?.reconcile?.().catch(error => report(null, "status_refresh", error));
       if (options.topicTaskObserver) for (const job of store.listUnfinished()) notifyTask(job.id);
       let result: Awaited<ReturnType<typeof runReconciliation>>;
       try {
@@ -751,9 +799,7 @@ export function createTelegramReliabilityRuntime(
           : {}),
         ...(durable.completion ? { completion: structuredClone(durable.completion) } : {}),
       };
-      ingress.acceptRetry(retrySource, target.version);
-      releaseAmbiguousRetryParent(retrySource);
-      await scheduleWork(retrySource);
+      await scheduleWork(retrySource, target.version);
     },
     async abort({ source, target }) {
       assertRunning(disposed);
@@ -837,86 +883,90 @@ export function createTelegramReliabilityRuntime(
       }));
     },
     async runDashboardAction(action, context) {
-      assertRunning(disposed);
-      if (context) {
-        const durable = durableSource(store, requireJob(store, action.jobId));
-        if (!sameJobContext(durable, normalizeContext(context))) {
-          throw new Error("Telegram job source mismatch");
+      const source = durableSource(store, requireJob(store, action.jobId));
+      const destination = { botId: source.botId, ...(source.targetContext ?? { chatId: source.chatId, messageThreadId: source.messageThreadId }) };
+      return withTaskContext(destination, async () => {
+        assertRunning(disposed);
+        if (!["refresh", "details", "inspect", "recover_missing_topic"].includes(action.kind)
+          && options.canAcceptTaskWork?.(destination) === false) throw new Error("Task action is no longer available");
+        if (context) {
+          const durable = durableSource(store, requireJob(store, action.jobId));
+          if (!sameJobContext(durable, normalizeContext(context))) {
+            throw new Error("Telegram job source mismatch");
+          }
         }
-      }
-      const rawProjection = await status.readProjection(action.jobId);
-      const recoveryProjection = topicRecovery
-        ? enrichTopicRecoveryProjection(store, options.topicRecovery!, rawProjection)
-        : rawProjection;
-      const projection = topicResume
-        ? enrichTopicResumeProjection(store, options.topicResume!, recoveryProjection)
-        : recoveryProjection;
-      const effectiveAction = action.kind === "guardian_restore" && !action.alertId
-        ? projection.actions.find((candidate) => candidate.kind === "guardian_restore"
-            && candidate.jobId === action.jobId
-            && candidate.expectedVersion === action.expectedVersion)
-        : action;
-      if (!effectiveAction
-        || !projection.actions.some((candidate) => sameStatusAction(candidate, effectiveAction))) {
-        throw new Error("Dashboard action is no longer legal");
-      }
-      if (action.kind === "recover_missing_topic") {
-        if (!topicRecovery) throw new Error("Dashboard action is no longer legal");
-        await topicRecovery.recover(action);
-        return;
-      }
-      if (action.kind === "resume_existing_topic" || action.kind === "resume_existing_topic_warning") {
-        if (!topicResume) throw new Error("Dashboard action is no longer legal");
-        await topicResume.resume(action);
-        return;
-      }
-      if (action.kind === "details" || action.kind === "inspect") return;
-      if (action.kind === "refresh") {
-        await enqueue(action.jobId, "status_refresh", () => refreshNow(action.jobId, "urgent"));
-        await drain(action.jobId, effects);
-        return;
-      }
-      if (action.kind === "abort") {
-        await enqueue(action.jobId, "coordinator", async () => {
-          exactJob(store, { jobId: action.jobId, version: action.expectedVersion });
-          await coordinator.abort(action.jobId);
-        });
-        await drain(action.jobId, effects);
-        return;
-      }
-      if (effectiveAction.kind === "guardian_restore" && effectiveAction.alertId
-        && options.guardian.repairAlert) {
-        await options.guardian.repairAlert(effectiveAction.alertId);
-        return;
-      }
-      if (action.kind === "send_again_warning" && action.partKey) {
-        await runOutboxAndReconcileTopicResume(
-          () => outbox.sendAgainWithWarning(action.jobId, action.partKey!),
-        );
-        return;
-      }
-      if (action.kind === "retry_delivery" && action.partKey) {
-        await runOutboxAndReconcileTopicResume(
-          () => outbox.retryFailed(action.jobId, action.partKey!, {
-            expectedJobVersion: action.expectedVersion,
-          }),
-        );
-        return;
-      }
-      if (action.kind === "retry_new_turn") {
-        const parent = exactJob(store, {
-          jobId: action.jobId,
-          version: action.expectedVersion,
-        });
-        const durable = durableSource(store, parent);
-        assertRetryNewTurnLegal(parent, durable, "Dashboard action is no longer legal");
-        const retrySource = dashboardRetrySource(store, durable, parent.id);
-        ingress.acceptRetry(retrySource, action.expectedVersion);
-        releaseAmbiguousRetryParent(retrySource);
-        await scheduleWork(retrySource);
-        return;
-      }
-      throw new Error("Dashboard action is not supported by this runtime");
+        const rawProjection = await status.readProjection(action.jobId);
+        const recoveryProjection = topicRecovery
+          ? enrichTopicRecoveryProjection(store, options.topicRecovery!, rawProjection)
+          : rawProjection;
+        const projection = topicResume
+          ? enrichTopicResumeProjection(store, options.topicResume!, recoveryProjection)
+          : recoveryProjection;
+        const effectiveAction = action.kind === "guardian_restore" && !action.alertId
+          ? projection.actions.find((candidate) => candidate.kind === "guardian_restore"
+              && candidate.jobId === action.jobId
+              && candidate.expectedVersion === action.expectedVersion)
+          : action;
+        if (!effectiveAction
+          || !projection.actions.some((candidate) => sameStatusAction(candidate, effectiveAction))) {
+          throw new Error("Dashboard action is no longer legal");
+        }
+        if (action.kind === "recover_missing_topic") {
+          if (!topicRecovery) throw new Error("Dashboard action is no longer legal");
+          await topicRecovery.recover(action);
+          return;
+        }
+        if (action.kind === "resume_existing_topic" || action.kind === "resume_existing_topic_warning") {
+          if (!topicResume) throw new Error("Dashboard action is no longer legal");
+          await topicResume.resume(action);
+          return;
+        }
+        if (action.kind === "details" || action.kind === "inspect") return;
+        if (action.kind === "refresh") {
+          await enqueue(action.jobId, "status_refresh", () => refreshNow(action.jobId, "urgent"));
+          await drain(action.jobId, effects);
+          return;
+        }
+        if (action.kind === "abort") {
+          await enqueue(action.jobId, "coordinator", async () => {
+            exactJob(store, { jobId: action.jobId, version: action.expectedVersion });
+            await coordinator.abort(action.jobId);
+          });
+          await drain(action.jobId, effects);
+          return;
+        }
+        if (effectiveAction.kind === "guardian_restore" && effectiveAction.alertId
+          && options.guardian.repairAlert) {
+          await options.guardian.repairAlert(effectiveAction.alertId);
+          return;
+        }
+        if (action.kind === "send_again_warning" && action.partKey) {
+          await runOutboxAndReconcileTopicResume(
+            () => outbox.sendAgainWithWarning(action.jobId, action.partKey!),
+          );
+          return;
+        }
+        if (action.kind === "retry_delivery" && action.partKey) {
+          await runOutboxAndReconcileTopicResume(
+            () => outbox.retryFailed(action.jobId, action.partKey!, {
+              expectedJobVersion: action.expectedVersion,
+            }),
+          );
+          return;
+        }
+        if (action.kind === "retry_new_turn") {
+          const parent = exactJob(store, {
+            jobId: action.jobId,
+            version: action.expectedVersion,
+          });
+          const durable = durableSource(store, parent);
+          assertRetryNewTurnLegal(parent, durable, "Dashboard action is no longer legal");
+          const retrySource = dashboardRetrySource(store, durable, parent.id);
+          await scheduleWork(retrySource, action.expectedVersion, true);
+          return;
+        }
+        throw new Error("Dashboard action is not supported by this runtime");
+      });
     },
     async dispose() {
       if (disposed) return;
@@ -927,11 +977,13 @@ export function createTelegramReliabilityRuntime(
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
       await Promise.allSettled([
+        ...taskContexts.values(),
         ...effects.values(),
         ...topicRecoveryEffects,
         ...topicResumeEffects,
       ]);
       effects.clear();
+      taskContexts.clear();
       topicRecoveryEffects.clear();
       topicResumeEffects.clear();
       turns.clear();

@@ -1,3 +1,4 @@
+import type { TopicTaskAction } from "./topic-task-actions.js";
 import type { CodexThreadRecord } from "./codex-state.js";
 import {
   buildDashboardPayload,
@@ -13,10 +14,14 @@ import type { TelegramStatusAction } from "./telegram-status-projection.js";
 export interface DashboardController {
   loadDashboard(query?: DashboardQuery): Promise<DashboardPayload>;
   ensureTopic(threadId: string): Promise<{ created: boolean; url: string }>;
+  runTaskAction?(action: TopicTaskAction): Promise<void>;
   runJobAction(action: TelegramStatusAction): Promise<void>;
 }
 
 export interface DashboardControllerOptions {
+  taskLinks?(threadId: string): Promise<{ label: string; url: string }[]>;
+  taskActions?(threadId: string): Promise<{ action: TopicTaskAction; label: string }[]>;
+  runTaskAction?(action: TopicTaskAction): Promise<void>;
   chatId: number;
   collect(): Promise<StatusSnapshot>;
   loadSessionStatuses?(): Promise<readonly DashboardSessionStatus[]>;
@@ -71,12 +76,16 @@ export function createDashboardController(
   options: DashboardControllerOptions,
 ): DashboardController {
   return {
+    ...(options.runTaskAction ? { runTaskAction: options.runTaskAction } : {}),
     loadDashboard: async (query = { view: "active", offset: 0, limit: 30 }) => {
       const [snapshot, statuses] = await Promise.all([
         options.collect(),
         options.loadSessionStatuses?.() ?? [],
       ]);
-      return buildDashboardPayload(snapshot, options.chatId, statuses, query);
+      const payload = buildDashboardPayload(snapshot, options.chatId, statuses, query);
+      return { ...payload, sessions: await Promise.all(payload.sessions.map(async session => ({ ...session,
+        ...(options.taskActions ? { taskActions: await options.taskActions(session.id) } : {}),
+        ...(options.taskLinks ? { taskLinks: await options.taskLinks(session.id) } : {}) }))) };
     },
     ensureTopic: async (threadId) => {
       const thread = options.getThread(threadId);

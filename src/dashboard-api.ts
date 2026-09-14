@@ -15,6 +15,8 @@ export interface DashboardQuery {
 }
 
 export interface DashboardSession {
+  readonly taskLinks?: readonly { label: string; url: string }[];
+  readonly taskActions?: readonly { action: import("./topic-task-actions.js").TopicTaskAction; label: string }[];
   readonly id: string;
   readonly label: string;
   readonly workspace: string;

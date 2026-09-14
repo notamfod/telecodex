@@ -13,6 +13,15 @@
     type ThreadSwipeAction,
   } from "./model.js";
 
+  export let onTaskAction: ((action: Record<string, unknown>) => Promise<void>) | undefined = undefined;
+  let taskPending = false;
+  let taskError = "";
+  async function performTaskAction(action: Record<string, unknown>) {
+    if (taskPending || !onTaskAction) return;
+    taskPending = true; taskError = "";
+    try { await onTaskAction(action); } catch (error) { taskError = error instanceof Error ? error.message : "Обнови список и повтори."; }
+    finally { taskPending = false; }
+  }
   export let thread: DashboardSession;
   export let swipeKey: string;
   export let revealedAction: ThreadSwipeAction | null = null;
@@ -62,7 +71,7 @@
   }
 
   function startSwipe(event: PointerEvent): void {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || (event.target instanceof Element && event.target.closest(".thread__task-actions"))) return;
     pointerId = event.pointerId;
     startX = event.clientX;
     startY = event.clientY;
@@ -198,6 +207,17 @@
         </button>
         <button type="button" disabled={!canOpenCodex} on:click={(event) => openFromClick(event, "codex")}>ChatGPT</button>
       </div>
+      {#if thread.taskActions?.length || thread.taskLinks?.length}
+        <div class="thread__task-actions thread__open-actions" role="group" aria-label="Действия задачи">
+          {#each thread.taskActions ?? [] as item}
+            <button type="button" disabled={taskPending} on:click={() => performTaskAction(item.action)}>{item.label}</button>
+          {/each}
+          {#each thread.taskLinks ?? [] as link}
+            <button type="button" on:click={() => onTelegram({ ...thread, telegramUrl: link.url })}>{link.label}</button>
+          {/each}
+        </div>
+      {/if}
+      {#if taskError}<p role="alert">{taskError}</p>{/if}
     </div>
   </div>
 </article>

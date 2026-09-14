@@ -10,6 +10,7 @@ export interface TaskDestination { chatId: number; messageThreadId: number }
 export interface TopicTaskTransport {
   send(destination: TaskDestination, html: string): Promise<number>;
   edit(destination: TaskDestination, messageId: number, html: string): Promise<void>;
+  syncActions?(task: TopicTaskRecord): Promise<void>;
   pin(destination: TaskDestination, messageId: number): Promise<void>;
   probe(destination: TaskDestination): Promise<"live" | "closed" | "missing">;
 }
@@ -118,8 +119,8 @@ export class TopicTaskCardService {
       task = this.patch(task, { cardState: "ready", cardMessageId: messageId, contentHash: hash });
     }
     if (!task.cardMessageId) return;
-    if (task.presence === "closed" || task.presence === "missing") return;
-    if (task.pinState === "none") {
+    if (task.presence === "missing") return;
+    if (task.pinState === "none" && task.presence === "open") {
       task = this.patch(task, { pinState: "unknown" });
       try {
         await this.transport.pin(task, task.cardMessageId!);
@@ -131,10 +132,11 @@ export class TopicTaskCardService {
     }
     const html = renderTopicTask(task).html;
     const hash = digest(html);
-    if (hash === task.contentHash) return;
+    if (hash === task.contentHash) { await this.transport.syncActions?.(task); return; }
     try {
       await this.transport.edit(task, task.cardMessageId!, html);
-      this.patch(task, { contentHash: hash });
+      task = this.patch(task, { contentHash: hash });
+      await this.transport.syncActions?.(task);
     } catch (error) {
       const apiError = error as { error_code?: number; description?: string };
       if (apiError?.error_code === 400 && /message is not modified/iu.test(apiError.description ?? "")) {

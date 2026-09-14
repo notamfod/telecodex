@@ -148,6 +148,8 @@ try {
     registerCompletionProcessor: (processor) => { completionProcessor = processor; },
     latestJob: (context) => requireReliabilityRuntime().latestJob(context),
     refreshTopicTask: (context) => requireReliabilityRuntime().refreshTopicTask(context),
+    withTaskContext: (context, operation) => requireReliabilityRuntime().withTaskContext(context, operation),
+    readTaskContext: (context) => requireReliabilityRuntime().readTaskContext(context),
     retry: (input) => requireReliabilityRuntime().retry(input),
     abort: (input) => requireReliabilityRuntime().abort(input),
     loadDashboardReliability: (limit) => requireReliabilityRuntime().loadDashboardReliability(limit),
@@ -192,7 +194,10 @@ try {
         })
       : undefined;
     reliabilityRuntime = createTelegramReliabilityRuntime({
+      canAcceptTaskWork: (context) => context.messageThreadId === null
+        || bot?.taskCards?.canAcceptTaskWork({ chatId: context.chatId, messageThreadId: context.messageThreadId }) !== false,
       topicTaskObserver: {
+        reconcile: () => bot?.taskCards?.reconcile() ?? Promise.resolve(),
         enabled: (_job, destination) => bot?.taskCards?.enabled(destination) === true,
         observe: (job, projection, deliveries, destination, waitingOn, acceptanceOrder) =>
           bot?.taskCards?.observe(job, projection, deliveries, destination, waitingOn, acceptanceOrder) ?? Promise.resolve(),

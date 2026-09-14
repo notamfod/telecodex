@@ -5,14 +5,15 @@ import os from "node:os";
 import { createBotTopicTasks } from "../src/bot-topic-tasks.js";
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
-function harness() {
+function harness(withControls = false) {
  const workspace = mkdtempSync(path.join(os.tmpdir(), "bot-task-"));
- const api = { sendMessage: vi.fn(async () => ({ message_id: 42 })), editMessageText: vi.fn(async () => true), pinChatMessage: vi.fn(async () => true), sendChatAction: vi.fn(async () => true), editForumTopic: vi.fn(async () => true) };
+ const api = { editMessageReplyMarkup: vi.fn(async () => true), closeForumTopic: vi.fn(async () => true), reopenForumTopic: vi.fn(async () => true), sendMessage: vi.fn(async () => ({ message_id: 42 })), editMessageText: vi.fn(async () => true), pinChatMessage: vi.fn(async () => true), sendChatAction: vi.fn(async () => true), editForumTopic: vi.fn(async () => true) };
  const reply = vi.fn(async () => {});
  const gate = { run: vi.fn(async (_chat, _priority, operation) => operation()) };
  const metadata = { workspace, topicName: "Проверить оплату", threadId: "thread-1" };
  const tasks = createBotTopicTasks({ api: api as never, workspace, forumChatId: -100123,
   metadata: () => metadata, isExcluded: () => false,
+  ...(withControls ? { controls: { read: async () => ({ safe: true, projection: null }), serialize: async <T>(_key: string, fn: () => Promise<T>) => fn(), syncInbox: async () => {}, runJob: async () => {} } } : {}),
   gate: gate as never, report: vi.fn() });
  const ctx = { chat: { id: -100123 }, message: { message_thread_id: 5, text: "/task" }, reply } as never;
  cleanups.push(async () => { await tasks.dispose(); rmSync(workspace, { recursive: true, force: true }); });
@@ -118,4 +119,20 @@ it("restores a manual Telegram name observed during an automatic request", async
  await vi.waitFor(() => expect(tasks.getManualTitle(destination)).toBe("Из Telegram"));
  finish(); await Promise.all([automatic, manualEvent]);
  expect(api.editForumTopic.mock.calls.at(-1)?.[2]).toEqual({ name: "Из Telegram" });
+});
+
+it("keeps callback handles stable and skips identical keyboard writes", async () => {
+ const { tasks, ctx, api } = harness(true);
+ await tasks.command(ctx);
+ const first = api.editMessageReplyMarkup.mock.calls.length;
+ expect(first).toBe(1);
+ await tasks.command(ctx);
+ expect(api.editMessageReplyMarkup).toHaveBeenCalledTimes(first);
+ const actions = await tasks.actions({ chatId: -100123, messageThreadId: 5 });
+ expect(actions.map(action => action.kind)).toEqual(["complete"]);
+ await tasks.runAction(actions[0]);
+ expect(api.closeForumTopic).toHaveBeenCalledTimes(1);
+ expect(api.sendMessage).toHaveBeenCalledTimes(1);
+ expect((await tasks.actions({ chatId: -100123, messageThreadId: 5 })).map(action => action.kind)).toEqual(["reopen"]);
+ expect(api.editMessageReplyMarkup).toHaveBeenCalledTimes(first + 1);
 });

@@ -106,6 +106,7 @@ export function startConfiguredMiniApp(
     allowedUserIds: options.allowedUserIds,
     authMaxAgeSeconds: options.config.authMaxAgeSeconds,
     loadDashboard: (query) => options.dashboard.loadDashboard(query),
+    ...(options.dashboard.runTaskAction ? { runTaskAction: (action: import("./topic-task-actions.js").TopicTaskAction) => options.dashboard.runTaskAction!(action) } : {}),
     ensureTopic: (threadId) => options.dashboard.ensureTopic(threadId),
     ...(options.dashboard.runJobAction
       ? { runJobAction: (action) => options.dashboard.runJobAction(action) }

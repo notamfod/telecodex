@@ -11,6 +11,8 @@ export interface DashboardQuery {
 }
 
 export interface DashboardSession {
+  readonly taskLinks?: readonly { label: string; url: string }[];
+  taskActions?: readonly { label: string; action: Record<string, unknown> }[];
   id: string;
   label: string;
   workspace: string;

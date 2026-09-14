@@ -370,16 +370,13 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): void {
     const ticketId = Number.parseInt(ctx.match?.[1] ?? "", 10);
     const ticket = Number.isNaN(ticketId) ? undefined : inbox.getTicket(ticketId);
     if (!ticket) { await ctx.answerCallbackQuery({ text: "Тикет не найден" }); return; }
-    if (!inbox.markResolved(ticket.id)) { await ctx.answerCallbackQuery({ text: "Тикет уже отмечен решённым" }); return; }
-    await ctx.answerCallbackQuery({ text: "Тикет решён" });
-    await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
-    const inboxContext = parseContextKey(ticket.inboxContextKey);
-    const url = topicUrl(inboxContext.chatId, ticket.workTopicId);
-    await deps.sendText(inboxContext.chatId, `✅ <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a> решён.`, {
-      messageThreadId: inboxContext.messageThreadId,
-      fallbackText: `${ticketHeading(ticket)} решён: ${url}`,
-    });
-    await bot.api.closeForumTopic(inboxContext.chatId, ticket.workTopicId);
+    const source = ctx.callbackQuery.message;
+    const binding = parseContextKey(ticket.inboxContextKey);
+    if (!source || source.chat.id !== binding.chatId || !("message_thread_id" in source)
+      || source.message_thread_id !== ticket.workTopicId) {
+      await ctx.answerCallbackQuery({ text: "Кнопка относится к другому топику." }); return;
+    }
+    await ctx.answerCallbackQuery({ text: "Эта кнопка устарела. Открой /task в рабочем топике и заверши задачу из свежей карточки." });
   });
   bot.on("message", async (ctx, next) => {
     const contextKey = contextKeyFromCtx(ctx);

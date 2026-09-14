@@ -585,6 +585,20 @@ export class InboxStore {
     return true;
   }
 
+  /** Lifecycle confirmation must not outlive a failed Inbox write. */
+  setLifecycleDurably(id: number, lifecycle: "open" | "completed", now = Date.now()): void {
+    const ticket = this.data.tickets[String(id)];
+    if (!ticket) throw new Error("Inbox ticket no longer exists");
+    const previous = ticket.resolvedAt;
+    if (lifecycle === "completed") ticket.resolvedAt ??= now;
+    else delete ticket.resolvedAt;
+    // Persist even an idempotent call: an earlier process-local change is not evidence of disk state.
+    if (this.save()) return;
+    if (previous === undefined) delete ticket.resolvedAt;
+    else ticket.resolvedAt = previous;
+    throw new Error("Inbox lifecycle persistence failed");
+  }
+
   markResolved(id: number, now = Date.now()): boolean {
     const ticket = this.data.tickets[String(id)];
     if (!ticket || ticket.resolvedAt !== undefined) {

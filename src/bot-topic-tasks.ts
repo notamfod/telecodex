@@ -1,3 +1,5 @@
+import { TopicTaskControls, taskActionLabel, type TopicTaskControlsOptions } from "./topic-task-controls.js";
+import type { TopicTaskAction } from "./topic-task-actions.js";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Api, Context } from "grammy";
@@ -11,7 +13,8 @@ import type { TelegramJobStatusProjection } from "./telegram-status-projection.j
 
 interface Metadata { workspace: string; topicName?: string; threadId: string | null; ticketId?: number; ticketKey?: string }
 interface Options {
-  api: Pick<Api, "sendMessage" | "editMessageText" | "pinChatMessage" | "sendChatAction" | "editForumTopic">;
+  api: Pick<Api, "sendMessage" | "editMessageText" | "pinChatMessage" | "sendChatAction" | "editForumTopic" | "closeForumTopic" | "reopenForumTopic" | "editMessageReplyMarkup">;
+  controls?: Omit<TopicTaskControlsOptions, "store" | "eligible" | "transport">;
   workspace: string;
   forumChatId?: number;
   metadata(destination: TaskDestination): Metadata | undefined;
@@ -22,9 +25,11 @@ interface Options {
 
 export function createBotTopicTasks(options: Options) {
   const file = path.join(options.workspace, ".telecodex", "topic-tasks.sqlite");
+  let controls: TopicTaskControls | undefined;
   let service: TopicTaskCardService | undefined;
   let disposed = false;
   const shutdown = new AbortController();
+  const keyboards = new Map<string, string>();
   const nameWrites = new Map<string, Promise<boolean>>();
   const write = async <T>(destination: TaskDestination, operation: (signal: AbortSignal) => Promise<T>, callerSignal?: AbortSignal): Promise<T> => {
     const admission = AbortSignal.any([shutdown.signal, AbortSignal.timeout(15_000), ...(callerSignal ? [callerSignal] : [])]);
@@ -46,15 +51,36 @@ export function createBotTopicTasks(options: Options) {
     requireDefinitiveErrors: true, cacheTtlMs: 1,
   });
   const transport: TopicTaskTransport = {
+    syncActions: async task => {
+      if (!controls || !task.cardMessageId) return;
+      const actions = (await controls.actions(task.contextKey)).filter(action => action.kind !== "job" || !["details", "inspect"].includes(action.action.kind));
+      const links = await controls.links(task.contextKey);
+      const markup = { inline_keyboard: [...actions.map(action => [{ text: taskActionLabel(action), callback_data: `task_action:${controls!.token(action)}` }]), ...links.map(link => [{ text: link.label, url: link.url }])] };
+      const cacheKey = `${task.contextKey}:${task.cardMessageId}`;
+      const serialized = JSON.stringify(markup);
+      if (keyboards.get(cacheKey) === serialized) return;
+      try { await write(task, signal => options.api.editMessageReplyMarkup(task.chatId, task.cardMessageId!, { reply_markup: markup }, signal as never)); }
+      catch (error) { if (!/message is not modified/iu.test((error as { description?: string }).description ?? "")) throw error; }
+      keyboards.set(cacheKey, serialized);
+      if (keyboards.size > 2048) keyboards.delete(keyboards.keys().next().value!);
+    },
     send: async (destination, html) => (await write(destination, signal => options.api.sendMessage(destination.chatId, html,
       { message_thread_id: destination.messageThreadId, parse_mode: "HTML", disable_notification: true }, signal as never))).message_id,
-    edit: async (destination, messageId, html) => { await write(destination, signal => options.api.editMessageText(destination.chatId, messageId, html, { parse_mode: "HTML" }, signal as never)); },
+    edit: async (destination, messageId, html) => { keyboards.delete(`${key(destination)}:${messageId}`); await write(destination, signal => options.api.editMessageText(destination.chatId, messageId, html, { parse_mode: "HTML" }, signal as never)); },
     pin: async (destination, messageId) => { await write(destination, signal => options.api.pinChatMessage(destination.chatId, messageId, { disable_notification: true }, signal as never)); },
     probe: destination => probe(destination, shutdown.signal),
   };
   const getService = (create = false): TopicTaskCardService | undefined => {
     if (disposed) return;
-    if (!service && (create || existsSync(file))) service = new TopicTaskCardService(new TopicTaskStore(file), transport);
+    if (!service && (create || existsSync(file))) {
+      service = new TopicTaskCardService(new TopicTaskStore(file), transport);
+      if (options.controls) controls = new TopicTaskControls({ ...options.controls, store: service.store, eligible,
+        transport: {
+          close: task => write(task, signal => options.api.closeForumTopic(task.chatId, task.messageThreadId, signal as never)),
+          reopen: task => write(task, signal => options.api.reopenForumTopic(task.chatId, task.messageThreadId, signal as never)),
+          probe: async task => { const value = await probe(task, shutdown.signal); return value === "live" ? "open" : value; },
+        } });
+    }
     return service;
   };
   const eligible = (destination: TaskDestination) => destination.chatId === options.forumChatId
@@ -92,6 +118,48 @@ export function createBotTopicTasks(options: Options) {
     await getService()?.update(key(destination), { title: safeTaskText(title), titleSource: "manual" });
   };
   return {
+    canAcceptTaskWork(destination: TaskDestination): boolean {
+      const store = getService()?.store;
+      const task = store?.get(key(destination));
+      if (!task) return true;
+      const intent = store!.getLifecycleIntent(task.contextKey);
+      return task.lifecycle === "open" && task.presence !== "closed" && task.presence !== "missing"
+        && (!intent || intent.phase === "complete" || intent.outcome === "failed");
+    },
+    async reconcile(): Promise<void> {
+      const store = getService()?.store;
+      for (const intent of store?.listPendingLifecycleIntents() ?? []) {
+        await controls?.lifecycle.reconcile(intent.operationId);
+        await service?.refresh(intent.contextKey);
+      }
+    },
+    async links(destination: TaskDestination): Promise<{ label: string; url: string }[]> {
+      getService(); return eligible(destination) ? controls?.links(key(destination)) ?? [] : [];
+    },
+    async actions(destination: TaskDestination): Promise<TopicTaskAction[]> {
+      getService(); return eligible(destination) ? controls?.actions(key(destination)) ?? [] : [];
+    },
+    async runAction(action: TopicTaskAction): Promise<void> {
+      getService(); if (!controls) throw new Error("Сначала открой /task в рабочем топике.");
+      try { await controls.run(action); } finally {
+        const task = service?.store.get(action.contextKey);
+        if (task && eligible(task)) await service?.refresh(action.contextKey);
+      }
+    },
+    async callback(ctx: Context): Promise<void> {
+      const message = ctx.callbackQuery?.message;
+      const destination = { chatId: message?.chat.id ?? 0, messageThreadId: message && "message_thread_id" in message ? message.message_thread_id ?? 0 : 0 };
+      try {
+        getService();
+        if (!eligible(destination) || !controls) throw new Error("Открой /task в рабочем топике.");
+        await controls.callback((ctx.callbackQuery?.data ?? "").slice("task_action:".length), key(destination));
+        await ctx.answerCallbackQuery({ text: "Готово" });
+        await service?.refresh(key(destination));
+      } catch (error) {
+        await ctx.answerCallbackQuery({ text: error instanceof Error ? error.message.slice(0, 180) : "Обнови карточку." });
+        if (eligible(destination)) await service?.refresh(key(destination)).catch(options.report);
+      }
+    },
     enabled(destination: TaskDestination): boolean { return eligible(destination) && getService()?.enabled(destination) === true; },
     shouldPreserveTitle(destination: TaskDestination): boolean {
       try { return getService()?.store.get(key(destination))?.titleSource === "manual"; }
@@ -151,7 +219,11 @@ export function createBotTopicTasks(options: Options) {
     async observeTopic(destination: TaskDestination, presence?: "open" | "closed", title?: string): Promise<void> {
       if (!eligible(destination)) return;
       const namingInFlight = nameWrites.has(key(destination));
-      await getService()?.update(key(destination), { ...(presence ? { presence } : {}), ...(title ? { title: safeTaskText(title), titleSource: "manual" as const } : {}) });
+      const taskService = getService();
+      const intent = taskService?.store.getLifecycleIntent(key(destination));
+      const pending = intent && intent.phase !== "complete" && intent.outcome !== "failed";
+      await taskService?.update(key(destination), { ...(presence && !pending ? { presence } : {}), ...(title ? { title: safeTaskText(title), titleSource: "manual" as const } : {}) });
+      if (pending) await controls?.lifecycle.reconcile(intent.operationId);
       if (title && namingInFlight) await rename(destination, title, true);
     },
     async observe(job: TelegramJob, projection: TelegramJobStatusProjection, deliveries: readonly DeliveryPart[], destination: TaskDestination, waitingOn?: "input" | "approval", acceptanceOrder?: number): Promise<void> {

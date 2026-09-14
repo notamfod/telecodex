@@ -1,3 +1,4 @@
+import { taskActionLabel } from "./topic-task-controls.js";
 import { createBotTopicTasks, type BotTopicTasks } from "./bot-topic-tasks.js";
 import { existsSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
@@ -421,6 +422,8 @@ export interface TelegramCanonicalControlSource extends TelegramCanonicalContext
 export interface TelegramBotReliability {
   handleWork(source: TelegramWorkSource): Promise<TelegramWorkTargetContext | null>;
   registerCompletionProcessor?(processor: TelegramCompletionProcessor): void;
+  withTaskContext?<T>(context: TelegramCanonicalContext, operation: () => Promise<T>): Promise<T>;
+  readTaskContext?(context: TelegramCanonicalContext): Promise<{ safe: boolean; projection: import("./telegram-status-projection.js").TelegramJobStatusProjection | null }>;
   refreshTopicTask?(context: TelegramCanonicalContext): Promise<void>;
   latestJob(context: TelegramCanonicalContext): Promise<TelegramCanonicalJobRef | null>;
   retry(input: {
@@ -705,6 +708,31 @@ export function createBot(
   if (reliability) bot.taskCards = createBotTopicTasks({
     api: bot.api, workspace: config.workspace, forumChatId: config.telegramForumChatId,
     gate: options.backgroundWriteGate,
+    controls: reliability.readTaskContext && reliability.withTaskContext ? {
+      read: async task => {
+        const state = await reliability.readTaskContext!({ botId: String(bot.botInfo.id), chatId: task.chatId, messageThreadId: task.messageThreadId });
+        const metadata = registry.listContexts().find(entry => entry.contextKey === task.contextKey);
+        let externalSafe = task.threadId === null;
+        if (task.threadId) {
+          try {
+            const response = await registry.getAppServerClient().request<{ thread?: { id?: string; status?: { type?: string }; turns?: { status?: string }[] } }>(
+              "thread/read", { threadId: task.threadId, includeTurns: true }, { timeoutMs: 2_000 });
+            externalSafe = response.thread?.id === task.threadId && response.thread.status?.type === "idle"
+              && Array.isArray(response.thread.turns) && !response.thread.turns.some(turn => turn.status === "inProgress");
+          } catch { externalSafe = false; }
+        }
+        return { ...state, safe: state.safe && externalSafe && !isBusy(task.contextKey as TelegramContextKey)
+          && (!metadata || metadata.threadId === task.threadId) };
+      },
+      serialize: (contextKey, operation) => { const context = parseContextKey(contextKey as TelegramContextKey); return reliability.withTaskContext!({ botId: String(bot.botInfo.id), chatId: context.chatId, messageThreadId: context.messageThreadId ?? null }, operation); },
+      runJob: (action, task) => reliability.runDashboardAction!(action, { botId: String(bot.botInfo.id), chatId: task.chatId, messageThreadId: task.messageThreadId }),
+      syncInbox: async task => {
+        if (task.ticketId === null) return;
+        const ticket = inbox.getTicket(task.ticketId);
+        if (!ticket || ticket.workTopicId !== task.messageThreadId || parseContextKey(ticket.inboxContextKey).chatId !== task.chatId) throw new Error("Ticket binding changed");
+        inbox.setLifecycleDurably(ticket.id, task.lifecycle);
+      },
+    } : undefined,
     report: (error) => console.warn(formatTelegramErrorLog("topic", error)),
     isExcluded: ({ chatId, messageThreadId }) => Boolean(
       inbox.get(`${chatId}:${messageThreadId}`)
@@ -1653,6 +1681,7 @@ export function createBot(
     }
   });
 
+  bot.callbackQuery(/^task_action:/, async ctx => { await bot.taskCards?.callback(ctx); });
   bot.command("task", async (ctx) => {
     if (bot.taskCards) await bot.taskCards.command(ctx);
     else await safeReply(ctx, "Карточки задач доступны в режиме canonical SQLite.");
@@ -4256,6 +4285,23 @@ export function createBot(
     });
     if (config.miniApp) {
       bot.dashboard = createDashboardController({
+        taskLinks: async threadId => {
+          const bindings = registry.listContexts().filter(entry => entry.threadId === threadId && parseContextKey(entry.contextKey).chatId === boardChatId);
+          if (bindings.length !== 1) return [];
+          const destination = parseContextKey(bindings[0].contextKey);
+          return destination.messageThreadId ? bot.taskCards?.links({ chatId: destination.chatId, messageThreadId: destination.messageThreadId }) ?? [] : [];
+        },
+        taskActions: async threadId => {
+          const bindings = registry.listContexts().filter(entry => entry.threadId === threadId
+            && parseContextKey(entry.contextKey).chatId === boardChatId);
+          if (bindings.length !== 1) return [];
+          const destination = parseContextKey(bindings[0].contextKey);
+          if (!destination.messageThreadId) return [];
+          return (await bot.taskCards?.actions({ chatId: destination.chatId, messageThreadId: destination.messageThreadId }) ?? [])
+            .filter(action => action.kind !== "job" || !["details", "inspect"].includes(action.action.kind))
+            .map(action => ({ action, label: taskActionLabel(action) }));
+        },
+        runTaskAction: action => bot.taskCards ? bot.taskCards.runAction(action) : Promise.reject(new Error("Task actions unavailable")),
         chatId: boardChatId,
         collect: createDashboardSnapshotCollector(collectStatusSnapshot),
         ...(reliability?.loadDashboardSessionStatuses

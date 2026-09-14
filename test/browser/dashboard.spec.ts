@@ -215,3 +215,26 @@ test("a refresh that exhausts the list removes the obsolete pagination retry", a
   await expect(page.getByText("В этом разделе нет сессий")).toBeVisible();
   await expect(page.getByRole("button", { name: "Повторить", exact: true })).toHaveCount(0);
 });
+
+test("task action posts captured binding once and reloads stale controls", async ({ page }) => {
+  const data = await dashboardFixture(page);
+  const action = { kind: "complete", contextKey: "-100123:10", taskId: "task-original", expectedVersion: 7, latestJobId: "job-original", latestJobVersion: 3 };
+  data.rows.active[0].taskActions = [{ label: "Завершить задачу", action }];
+  let calls = 0;
+  let finish!: () => void;
+  await page.route("**/api/dashboard/tasks/action", async route => {
+    calls++;
+    expect(route.request().postDataJSON()).toEqual(action);
+    await new Promise<void>(resolve => { finish = resolve; });
+    data.rows.active[0].taskActions = [];
+    await route.fulfill({ status: 409, json: { error: "Состояние изменилось. Обнови карточку или список." } });
+  });
+  await page.goto("/");
+  const button = page.getByRole("button", { name: "Завершить задачу", exact: true });
+  await button.click();
+  await expect(button).toBeDisabled();
+  await expect.poll(() => calls).toBe(1);
+  finish();
+  await expect(button).toHaveCount(0);
+  await expect(page.getByRole("alert")).toContainText("Состояние изменилось");
+});

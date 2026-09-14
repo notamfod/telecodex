@@ -3,6 +3,7 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import Database from "better-sqlite3";
+import { readTaskContextGuard, type TaskGuardContext, type TaskContextGuard } from "./telegram-task-context-guard.js";
 
 import { TelegramDeliveryLedger, validateDelivery } from "./telegram-delivery-ledger.js";
 import type {
@@ -501,6 +502,10 @@ export class SqliteTelegramJobStore {
 
   listRecent(limit: number): readonly TelegramJob[] {
     return this.listBy("1 = 1", limit, "updated_at_ms DESC, id ASC");
+  }
+  readTaskContextGuard(context: TaskGuardContext): TaskContextGuard {
+    this.assertOpen();
+    return readTaskContextGuard(this.database, context);
   }
   findLatestAcceptedByContext(input: { readonly botId: string; readonly chatId: number; readonly messageThreadId: number | null }): TelegramJob | null {
     return this.findContextJob(input, "accepted");

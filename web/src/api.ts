@@ -76,3 +76,9 @@ export function ensureThreadTopic(
     fetcher,
   );
 }
+
+export function runTaskAction(action: Record<string, unknown>, initData: string, fetcher: Fetcher = fetch): Promise<{ ok: boolean }> {
+  return requestJson("/api/dashboard/tasks/action", { method: "POST", headers: {
+    "x-telegram-init-data": initData, "content-type": "application/json",
+  }, body: JSON.stringify(action) }, fetcher);
+}

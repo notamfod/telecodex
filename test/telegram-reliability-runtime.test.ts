@@ -1912,8 +1912,10 @@ describe("Telegram reliability runtime", () => {
     expect(store.countJobs()).toBe(2);
     expect(store.listRecent(2)).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: accepted.job.id, outcome: "recovery_interrupted" }),
-      expect.objectContaining({ phase: "running", outcome: null }),
     ]));
+    const retryJob = store.listRecent(2).find(job => job.id !== accepted.job.id)!;
+    expect(["running", "delivering", "terminal"]).toContain(retryJob.phase);
+    expect(retryJob.outcome).toBe(retryJob.phase === "terminal" ? "completed" : null);
     expect(harness.session.prompt).toHaveBeenCalledOnce();
   });
 

@@ -16,6 +16,69 @@ describe("topic task runtime observer", () => {
     store = new SqliteTelegramJobStore(path.join(directory, "jobs.sqlite"));
   });
   afterEach(async () => { await runtime?.dispose(); store.close(); rmSync(directory, { recursive: true, force: true }); });
+  it("serializes incoming acceptance behind task lifecycle operations at the target context", async () => {
+    const harness = createHarness(store, directory);
+    runtime = createTelegramReliabilityRuntime(harness.options);
+    let release!: () => void;
+    let entered!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const lifecycle = runtime.withTaskContext({ botId: "bot", chatId: -1001, messageThreadId: 99 }, async () => { entered(); await hold; });
+    await ready;
+    const incoming = runtime.handleWork(source({ targetContext: { chatId: -1001, messageThreadId: 99 } }));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(store.countJobs()).toBe(0);
+    release(); await lifecycle; await incoming;
+    expect(store.countJobs()).toBe(1);
+  });
+  it("rechecks task admission after a lifecycle operation releases the context", async () => {
+    const harness = createHarness(store, directory);
+    runtime = createTelegramReliabilityRuntime({ ...harness.options, canAcceptTaskWork: () => false });
+    await expect(runtime.handleWork(source())).rejects.toThrow("Задача закрыта");
+    expect(store.countJobs()).toBe(0);
+  });
+  it("drains lifecycle operations during shutdown and rejects new ones", async () => {
+    runtime = createTelegramReliabilityRuntime(createHarness(store, directory).options);
+    let release!: () => void;
+    let entered!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const context = { botId: "bot", chatId: -1001, messageThreadId: 7 };
+    const operation = runtime.withTaskContext(context, async () => { entered(); await hold; });
+    await ready;
+    let disposed = false;
+    const disposal = runtime.dispose().then(() => { disposed = true; });
+    try {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(disposed).toBe(false);
+      await expect(runtime.withTaskContext(context, async () => undefined)).rejects.toThrow();
+    } finally { release(); await operation; await disposal; }
+  });
+  it("serializes canonical button actions behind lifecycle operations", async () => {
+    const harness = createHarness(store, directory);
+    let allowed = true;
+    runtime = createTelegramReliabilityRuntime({ ...harness.options, canAcceptTaskWork: () => allowed });
+    const ingress = new TelegramJobIngress({ store, materializationRoot: directory, downloadAttachment: async () => new Uint8Array(), now: () => NOW });
+    ingress.accept(source());
+    const context = { botId: "bot", chatId: -1001, messageThreadId: 7 };
+    const { projection } = await runtime.readTaskContext(context);
+    const action = projection!.actions.find(action => action.kind === "refresh")!;
+    expect(action).toBeDefined();
+    let release!: () => void;
+    let entered!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const lifecycle = runtime.withTaskContext(context, async () => { entered(); await hold; allowed = false; });
+    await ready;
+    let settled = false;
+    const clicked = runtime.runDashboardAction(action, context).finally(() => { settled = true; });
+    const outcome = clicked.then(() => "ran", error => error.message);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const settledWhileClosing = settled;
+    release(); await lifecycle;
+    expect(settledWhileClosing).toBe(false);
+    expect(await outcome).toBe("ran");
+  });
   it("observes coordinator transitions and final delivered evidence in the actual target topic", async () => {
     const harness = createHarness(store, directory);
     const observe = vi.fn<NonNullable<TelegramReliabilityRuntimeOptions["topicTaskObserver"]>["observe"]>(async () => undefined);

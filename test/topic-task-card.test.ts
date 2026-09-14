@@ -121,10 +121,11 @@ it("allows only explicit reactivation after a proven rejected send", async () =>
 it("rechecks persisted closed presence on explicit activation after a missed reopen event", async () => {
  const { service, transport } = harness(); await service.activate(identity);
  await service.update(key, { presence: "closed", title: "Новое имя" });
- expect(transport.edit).not.toHaveBeenCalled();
+ expect(transport.edit).toHaveBeenCalledTimes(1);
+ expect(transport.edit.mock.calls[0]?.[2]).toContain("Топик закрыт");
  await service.activate(identity);
  expect(store.get(key)?.presence).toBe("open"); expect(transport.send).toHaveBeenCalledTimes(1);
- expect(transport.edit).toHaveBeenCalledTimes(1);
+ expect(transport.edit).toHaveBeenCalledTimes(2);
 });
 
 it("commits an already-applied edit after its first acknowledgement was lost", async () => {

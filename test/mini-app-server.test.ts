@@ -46,6 +46,7 @@ describe("Mini App HTTP server", () => {
   });
 
   async function start() {
+    const runTaskAction = vi.fn(async (_action: unknown) => {});
     const loadDashboard = vi.fn(async () => ({ generatedAt: NOW_SECONDS * 1000, sessions: [] }));
     const ensureTopic = vi.fn(async () => ({
       created: true,
@@ -71,6 +72,7 @@ describe("Mini App HTTP server", () => {
       authMaxAgeSeconds: 300,
       nowSeconds: () => NOW_SECONDS,
       loadDashboard,
+      runTaskAction,
       ensureTopic,
       runJobAction,
       probes: {
@@ -83,8 +85,21 @@ describe("Mini App HTTP server", () => {
       jira,
       logger: { info: vi.fn(), warn: vi.fn() },
     });
-    return { server, loadDashboard, ensureTopic, runJobAction, jira };
+    return { server, loadDashboard, ensureTopic, runJobAction, runTaskAction, jira };
   }
+
+  it("authenticates and validates exact task envelopes before dispatch", async () => {
+    const { server, runTaskAction } = await start();
+    const action = { contextKey: "-100123:42", taskId: THREAD_ID, expectedVersion: 2, latestJobId: null, latestJobVersion: 0, kind: "complete" };
+    const send = (body: unknown, auth = true) => fetch(`${server.url}/api/dashboard/tasks/action`, { method: "POST",
+      headers: { "content-type": "application/json", ...(auth ? { "x-telegram-init-data": signedInitData() } : {}) }, body: JSON.stringify(body) });
+    expect((await send(action, false)).status).toBe(401);
+    expect((await send({ ...action, unexpected: true })).status).toBe(400);
+    expect((await send({ ...action, expectedVersion: -1 })).status).toBe(400);
+    expect(runTaskAction).not.toHaveBeenCalled();
+    expect((await send(action)).status).toBe(200);
+    expect(runTaskAction).toHaveBeenCalledExactlyOnceWith(action);
+  });
 
   it("serves the built app and its assets", async () => {
     const { server } = await start();

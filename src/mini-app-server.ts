@@ -1,3 +1,4 @@
+import type { TopicTaskAction } from "./topic-task-actions.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
@@ -131,6 +132,7 @@ export interface MiniAppServerOptions {
   authMaxAgeSeconds: number;
   loadDashboard(query: DashboardQuery): Promise<unknown>;
   ensureTopic(threadId: string): Promise<MiniAppTopicResult>;
+  runTaskAction?(action: TopicTaskAction): Promise<void>;
   runJobAction?(action: TelegramStatusAction): Promise<void>;
   probes?: MiniAppProbeProvider;
   probeTimeoutMs?: number;
@@ -216,6 +218,30 @@ async function handleRequest(
     return;
   }
 
+  if (url.pathname === "/api/dashboard/tasks/action" && request.method === "POST") {
+    authenticate(request, options);
+    if (!options.runTaskAction) throw httpError(503, "Task actions unavailable");
+    if (!hasJsonContentType(request)) throw httpError(400, "Invalid task action");
+    const body = await readJsonObject(request);
+    if (typeof body.contextKey !== "string" || !/^-?\d+:\d+$/.test(body.contextKey)
+      || typeof body.taskId !== "string" || !THREAD_ID_PATTERN.test(body.taskId)
+      || !Number.isSafeInteger(body.expectedVersion) || Number(body.expectedVersion) < 1
+      || !(body.latestJobId === null || typeof body.latestJobId === "string" && JOB_ID_PATTERN.test(body.latestJobId))
+      || !Number.isSafeInteger(body.latestJobVersion) || Number(body.latestJobVersion) < 0
+      || !["complete", "reopen", "job"].includes(String(body.kind))) throw httpError(400, "Invalid task action");
+    if (Object.keys(body).some(key => !["contextKey", "taskId", "expectedVersion", "latestJobId", "latestJobVersion", "kind", ...(body.kind === "job" ? ["action"] : [])].includes(key))) throw httpError(400, "Invalid task action");
+    const action = { contextKey: body.contextKey, taskId: body.taskId, expectedVersion: body.expectedVersion,
+      latestJobId: body.latestJobId, latestJobVersion: body.latestJobVersion, kind: body.kind } as TopicTaskAction;
+    if (action.kind === "job") {
+      const job = body.action;
+      if (!job || typeof job !== "object" || Array.isArray(job)) throw httpError(400, "Invalid task action");
+      const value = job as Record<string, unknown>;
+      if (Object.keys(value).some(key => !["kind", "jobId", "expectedVersion", "alertId", "partKey"].includes(key))) throw httpError(400, "Invalid task action");
+      action.action = parseJobAction(String(value.jobId), String(value.kind), value);
+    }
+    await options.runTaskAction(action);
+    sendJson(response, 200, { ok: true }); return;
+  }
   const topicMatch = /^\/api\/dashboard\/threads\/([^/]+)\/topic$/.exec(url.pathname);
   if (topicMatch && request.method === "POST" && THREAD_ID_PATTERN.test(topicMatch[1])) {
     authenticate(request, options);

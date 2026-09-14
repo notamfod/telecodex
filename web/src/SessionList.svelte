@@ -5,6 +5,7 @@
   import type { DashboardSession, ThreadSwipeAction } from "./model.js";
   import ThreadRow from "./ThreadRow.svelte";
 
+  export let onTaskAction: ((action: Record<string, unknown>) => Promise<void>) | undefined = undefined;
   export let sessions: DashboardSession[];
   export let total: number;
   export let hasMore: boolean;
@@ -109,7 +110,7 @@
           use:measureElement
           style={`transform: translateY(${virtualRow.start}px)`}
         >
-          <ThreadRow
+          <ThreadRow {onTaskAction}
             {thread}
             {now}
             swipeKey={thread.id}

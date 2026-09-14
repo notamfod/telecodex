@@ -15,7 +15,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 - **Voice transcription** — send a voice message or audio file; TeleCodex transcribes it (local parakeet-coreml or OpenAI Whisper) and forwards the text to Codex
 - **Image input** — send a photo (with optional caption) to pass screenshots or images directly to Codex
 - **File ingest & artifacts** — send a document to stage it for Codex; generated files are delivered back as Telegram documents
-- **Session browser** — `/sessions` lists recent threads from `~/.codex`, grouped by workspace; tap to switch
+- **Session browser** — `/sessions` lists recent threads from `~/.codex` with workspace labels; in forum groups, tap to open a separate topic
 - **Telegram login** — `/login` authenticates against the Codex CLI via device auth flow, no terminal needed
 - **Launch profiles** — `/launch_profiles` selects the sandbox + approval mode for new or reattached threads in the current Telegram context (`/launch` remains an alias)
 - **OpenAI default** — new threads start with the configured OpenAI model; provider/model selection is disabled
@@ -86,8 +86,9 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/help` | Grouped command reference |
 | `/new` | Start a fresh thread (workspace picker if multiple workspaces) |
 | `/session` | Current thread ID, workspace, model, effort, and token totals |
-| `/sessions` | Browse recent threads grouped by workspace; tap to switch |
-| `/switch <id>` | Switch directly to a thread by ID |
+| `/topic <id>` | Create or open a separate forum topic for a Codex thread; keep the current topic binding |
+| `/sessions [id]` | Browse or open a session; forum selections open a separate topic |
+| `/switch <id>` | Explicitly switch the current chat/topic to a thread by ID |
 | `/retry` | Resend the last prompt |
 | `/abort` | Cancel the current turn |
 | `/launch_profiles` | Select launch profile for new or reattached threads (`/launch` alias kept) |
@@ -165,8 +166,10 @@ The `SessionRegistry` maps context keys to `CodexSessionService` instances:
 - **First message** in a context → creates a new `CodexSessionService` → starts a new Codex thread
 - **Subsequent messages** → same context key → same session → conversation continues
 - **`/new`** → replaces the thread within the same context (optionally picking a workspace first)
-- **`/sessions`** → lists all Codex threads from `~/.codex`, lets you switch within the current context
-- **`/attach <id>`** → resumes a specific Codex CLI thread (useful for picking up work started in the terminal)
+- **`/topic <id>`** → creates a dedicated topic for an available Codex thread, or links to its existing dedicated topic. The invoking topic keeps its binding; no Codex turn starts until you send a message in the destination. Use this command in a forum group.
+- **`/sessions`** → lists Codex threads from `~/.codex`; in forum groups, selecting a thread opens its own topic. In private chats it switches the current session.
+- **`/switch <id>`** → explicitly changes the current context, including in forum groups.
+- **`/attach <id>`** → explicitly replaces the current context binding with a specific Codex CLI thread; use `/topic <id>` to continue it in a separate topic.
 
 Session metadata (thread ID, workspace, launch profile, model, effort) is persisted to `.telecodex/contexts.json` and restored on restart so threads survive bot reboots.
 

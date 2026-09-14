@@ -1,3 +1,6 @@
+import { TelegramBackgroundWriteGateAdmissionCancelledError } from "./telegram-background-write-gate.js";
+import { definitiveTelegramRetryAfterMs } from "./telegram-rate-limit.js";
+import type { TaskProvisioningService } from "./task-provisioning.js";
 import { ForumTopicAvailabilityUnknownError } from "./telegram-topic-liveness.js";
 import path from "node:path";
 
@@ -137,6 +140,9 @@ export async function partitionJobsByTopicLiveness<
 }
 
 export interface EnsureThreadTopicOptions {
+  provisioning: TaskProvisioningService;
+  excludeContextKey?: string;
+  isExcludedTopic?(messageThreadId: number): boolean;
   chatId: number;
   contexts: ContextMetadata[];
   topicIsAlive(messageThreadId: number): Promise<boolean>;
@@ -158,41 +164,68 @@ export async function ensureThreadTopic(
   options: EnsureThreadTopicOptions,
 ): Promise<EnsuredThreadTopic> {
   const name = buildTopicName(thread);
+  // Shared with automatic sync: one durable creation identity across all entry points.
+  const operationId = `sync:${options.chatId}:${thread.id}`;
+  const previous = options.provisioning.store.get(operationId);
   let availability: "unknown" | undefined;
-  const bound = await findLiveBoundTopic(
-    options.contexts,
-    options.chatId,
-    thread.id,
-    async messageThreadId => {
-      try { return await options.topicIsAlive(messageThreadId); }
-      catch (error) {
-        if (!(error instanceof ForumTopicAvailabilityUnknownError)) throw error;
-        // Navigation may reuse a recorded destination, but must not call it live.
-        availability = "unknown";
-        return true;
-      }
-    },
-  );
-  if (bound !== undefined) {
-    return {
-      created: false,
-      ...(availability ? { availability } : {}),
-      messageThreadId: bound,
-      name,
-      url: topicUrl(options.chatId, bound),
-    };
-  }
-
-  const topic = await options.createForumTopic(name);
-  const contextKey = contextKeyFromMessage(options.chatId, topic.message_thread_id);
-  options.bindThread(contextKey, thread);
-  await options.sendWelcome(topic.message_thread_id, name);
-  return {
-    created: true,
-    messageThreadId: topic.message_thread_id,
-    name,
-    url: topicUrl(options.chatId, topic.message_thread_id),
+  const reusable = async (messageThreadId: number): Promise<boolean> => {
+    if (messageThreadId <= 1 || options.isExcludedTopic?.(messageThreadId)) return false;
+    try { return await options.topicIsAlive(messageThreadId); }
+    catch (error) {
+      if (!(error instanceof ForumTopicAvailabilityUnknownError)) throw error;
+      availability = "unknown";
+      return true;
+    }
   };
+  const result = (messageThreadId: number, created: boolean): EnsuredThreadTopic => ({
+    created, messageThreadId, name, url: topicUrl(options.chatId, messageThreadId),
+    ...(availability ? { availability } : {}),
+  });
+  if (previous?.state === "ready" && previous.messageThreadId) {
+    if (!options.contexts.some(context => context.contextKey === `${options.chatId}:${previous.messageThreadId}` && context.threadId === thread.id)) {
+      throw new Error("Сохранённая привязка топика изменилась. Автоматическое создание замены остановлено.");
+    }
+    if (!await reusable(previous.messageThreadId)) throw new Error("Сохранённый топик недоступен. Автоматическое создание замены остановлено.");
+    return result(previous.messageThreadId, false);
+  }
+  if (!previous) {
+    const bound = await findLiveBoundTopic(
+      options.contexts.filter(context => context.contextKey !== options.excludeContextKey),
+      options.chatId, thread.id, reusable,
+    );
+    if (bound !== undefined) return result(bound, false);
+  }
+  if (typeof previous?.metadata?.retryAfterUntil === "number" && Date.now() < previous.metadata.retryAfterUntil) {
+    throw new Error("Telegram просит подождать перед созданием топика. Повтори команду позже.");
+  }
+  let created = false;
+  let creationError: unknown;
+  const record = await options.provisioning.provision(previous ?? {
+    operationId, sourceContextKey: String(options.chatId), sourceMessageIds: [],
+    title: name, workspace: thread.cwd, kind: "sync", metadata: { threadId: thread.id },
+  }, {
+    createTopic: async item => {
+      try {
+        const topic = await options.createForumTopic(item.title);
+        created = true;
+        return topic.message_thread_id;
+      } catch (error) { creationError = error; throw error; }
+    },
+    bind: item => options.bindThread(contextKeyFromMessage(options.chatId, item.messageThreadId!), thread),
+    ready: item => options.sendWelcome(item.messageThreadId!, item.title),
+  });
+  if (creationError !== undefined && record.failureStage === "create" && !record.messageThreadId) {
+    const retryAfterMs = definitiveTelegramRetryAfterMs(creationError);
+    if (retryAfterMs !== undefined || creationError instanceof TelegramBackgroundWriteGateAdmissionCancelledError) {
+      options.provisioning.store.patch(operationId, { state: "accepted", failureStage: undefined,
+        metadata: { ...record.metadata, retryAfterUntil: Date.now() + (retryAfterMs ?? 1000) } });
+      throw new Error("Telegram просит подождать перед созданием топика. Повтори команду позже.");
+    }
+  }
+  if (record.state !== "ready" || !record.messageThreadId) {
+    throw new Error("Создание или привязка топика не подтверждены. Повторное создание остановлено; нужна проверка.");
+  }
+  return result(record.messageThreadId, created);
 }
 
 /** Private supergroups are addressed by their id without the -100 prefix. */
@@ -216,7 +249,7 @@ export function renderProjectHTML(group: ProjectGroup): string {
   return [
     `📁 ${projectHeader(group)}`,
     "",
-    "Tap a session to continue it in this topic.",
+    "Выбери сессию для продолжения.",
   ].join("\n");
 }
 

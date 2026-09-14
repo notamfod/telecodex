@@ -1,3 +1,5 @@
+import { provisionSyncedTopic } from "../src/topic-sync-provisioning.js";
+import { TaskProvisioningService, TaskProvisioningStore } from "../src/task-provisioning.js";
 import { ForumTopicAvailabilityUnknownError } from "../src/telegram-topic-liveness.js";
 import { describe, expect, it, vi } from "vitest";
 
@@ -122,6 +124,7 @@ describe("renderProjectHTML", () => {
 });
 
 describe("findBoundTopic", () => {
+
   const FORUM_CHAT_ID = -1001234567890;
 
   function context(overrides: Partial<ContextMetadata> = {}): ContextMetadata {
@@ -166,10 +169,13 @@ describe("findBoundTopic", () => {
 });
 
 describe("ensureThreadTopic", () => {
+  let provisioning: TaskProvisioningService;
+  beforeEach(() => { provisioning = new TaskProvisioningService(new TaskProvisioningStore(":memory:")); });
+  afterEach(async () => { await provisioning.dispose(); });
   it("returns the recorded destination with unknown availability without creating a duplicate", async () => {
     const createForumTopic = vi.fn(); const sendWelcome = vi.fn();
     const result = await ensureThreadTopic(thread(), {
-      chatId: FORUM_CHAT_ID,
+      provisioning, chatId: FORUM_CHAT_ID,
       contexts: [{ contextKey: `${FORUM_CHAT_ID}:154`, threadId: thread().id }],
       topicIsAlive: vi.fn().mockRejectedValue(new ForumTopicAvailabilityUnknownError()),
       createForumTopic, bindThread: vi.fn(), sendWelcome,
@@ -178,6 +184,96 @@ describe("ensureThreadTopic", () => {
     expect(createForumTopic).not.toHaveBeenCalled(); expect(sendWelcome).not.toHaveBeenCalled();
   });
 
+  it("excludes a legacy binding in the invoking topic and durably creates only once", async () => {
+    const createForumTopic = vi.fn(async () => ({ message_thread_id: 91 }));
+    const bindThread = vi.fn(); const sendWelcome = vi.fn();
+    const options = { provisioning, chatId: FORUM_CHAT_ID,
+      excludeContextKey: `${FORUM_CHAT_ID}:7`, contexts: [{ contextKey: `${FORUM_CHAT_ID}:7`, threadId: thread().id }],
+      topicIsAlive: vi.fn(async () => true), createForumTopic, bindThread, sendWelcome };
+    const results = await Promise.all([ensureThreadTopic(thread(), options), ensureThreadTopic(thread(), options)]);
+    expect(results.map(result => result.messageThreadId)).toEqual([91, 91]);
+    expect(createForumTopic).toHaveBeenCalledOnce(); expect(bindThread).toHaveBeenCalledOnce(); expect(sendWelcome).toHaveBeenCalledOnce();
+    expect(bindThread).toHaveBeenCalledWith(`${FORUM_CHAT_ID}:91`, thread());
+    options.contexts.push({ contextKey: `${FORUM_CHAT_ID}:91`, threadId: thread().id });
+    await expect(ensureThreadTopic(thread({ cwd: "/other" }), { ...options, excludeContextKey: `${FORUM_CHAT_ID}:91` }))
+      .resolves.toMatchObject({ messageThreadId: 91, created: false });
+    expect(createForumTopic).toHaveBeenCalledOnce();
+  });
+
+  it("never repeats an ambiguous create across invoking topics", async () => {
+    const createForumTopic = vi.fn().mockRejectedValue(new Error("lost response"));
+    const options = { provisioning, chatId: FORUM_CHAT_ID, contexts: [], topicIsAlive: vi.fn(),
+      createForumTopic, bindThread: vi.fn(), sendWelcome: vi.fn() };
+    await expect(ensureThreadTopic(thread(), { ...options, excludeContextKey: `${FORUM_CHAT_ID}:7` })).rejects.toThrow();
+    await expect(ensureThreadTopic(thread(), { ...options, excludeContextKey: `${FORUM_CHAT_ID}:8` })).rejects.toThrow();
+    expect(createForumTopic).toHaveBeenCalledOnce(); expect(options.bindThread).not.toHaveBeenCalled();
+    expect(options.sendWelcome).not.toHaveBeenCalled();
+  });
+
+  it("does not resend an uncertain welcome or recreate its known topic", async () => {
+    const createForumTopic = vi.fn(async () => ({ message_thread_id: 91 }));
+    const sendWelcome = vi.fn().mockRejectedValue(new Error("lost welcome response"));
+    const options = { provisioning, chatId: FORUM_CHAT_ID, contexts: [], topicIsAlive: vi.fn(),
+      createForumTopic, bindThread: vi.fn(), sendWelcome };
+    await expect(ensureThreadTopic(thread(), options)).rejects.toThrow();
+    await expect(ensureThreadTopic(thread(), options)).rejects.toThrow();
+    expect(createForumTopic).toHaveBeenCalledOnce(); expect(sendWelcome).toHaveBeenCalledOnce();
+  });
+
+  it("shares ambiguous creation fences with automatic sync in both directions", async () => {
+    const createForumTopic = vi.fn().mockRejectedValue(new Error("lost response"));
+    const options = { provisioning, chatId: FORUM_CHAT_ID, contexts: [], topicIsAlive: vi.fn(),
+      createForumTopic, bindThread: vi.fn(), sendWelcome: vi.fn() };
+    await expect(ensureThreadTopic(thread(), options)).rejects.toThrow();
+    await expect(provisionSyncedTopic(provisioning, FORUM_CHAT_ID, thread(), createForumTopic, vi.fn())).resolves.toBe("skipped");
+    const other = thread({ id: "other" });
+    await expect(provisionSyncedTopic(provisioning, FORUM_CHAT_ID, other, createForumTopic, vi.fn())).rejects.toThrow();
+    await expect(ensureThreadTopic(other, options)).rejects.toThrow();
+    expect(createForumTopic).toHaveBeenCalledTimes(2);
+  });
+
+  it("honors automatic sync's persisted rate-limit deadline", async () => {
+    const createForumTopic = vi.fn().mockRejectedValue({ error_code: 429, parameters: { retry_after: 30 } });
+    await expect(provisionSyncedTopic(provisioning, FORUM_CHAT_ID, thread(), createForumTopic, vi.fn())).rejects.toBeDefined();
+    await expect(ensureThreadTopic(thread(), { provisioning, chatId: FORUM_CHAT_ID, contexts: [], topicIsAlive: vi.fn(),
+      createForumTopic, bindThread: vi.fn(), sendWelcome: vi.fn() })).rejects.toThrow("подождать");
+    expect(createForumTopic).toHaveBeenCalledOnce();
+  });
+
+  it("never reuses General or service topic bindings", async () => {
+    const createForumTopic = vi.fn(async () => ({ message_thread_id: 91 }));
+    const result = await ensureThreadTopic(thread(), { provisioning, chatId: FORUM_CHAT_ID,
+      contexts: [1, 2, 3].map(id => ({ contextKey: `${FORUM_CHAT_ID}:${id}`, threadId: thread().id })),
+      isExcludedTopic: id => id === 2 || id === 3, topicIsAlive: vi.fn(async () => true),
+      createForumTopic, bindThread: vi.fn(), sendWelcome: vi.fn() });
+    expect(result.messageThreadId).toBe(91); expect(createForumTopic).toHaveBeenCalledOnce();
+  });
+
+  it("blocks a previously provisioned topic rebound to a different Codex session", async () => {
+    const createForumTopic = vi.fn(async () => ({ message_thread_id: 91 }));
+    const options = { provisioning, chatId: FORUM_CHAT_ID, contexts: [], topicIsAlive: vi.fn(async () => true),
+      createForumTopic, bindThread: vi.fn(), sendWelcome: vi.fn() };
+    await ensureThreadTopic(thread(), options);
+    await expect(ensureThreadTopic(thread(), { ...options, contexts: [{ contextKey: `${FORUM_CHAT_ID}:91`, threadId: "different" }] }))
+      .rejects.toThrow("привязка");
+    expect(createForumTopic).toHaveBeenCalledOnce();
+  });
+
+  it("allows later explicit retry after a definitive create 429 and honors its deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const createForumTopic = vi.fn().mockRejectedValueOnce({ error_code: 429, parameters: { retry_after: 30 } })
+        .mockResolvedValue({ message_thread_id: 91 });
+      const options = { provisioning, chatId: FORUM_CHAT_ID, contexts: [], topicIsAlive: vi.fn(),
+        createForumTopic, bindThread: vi.fn(), sendWelcome: vi.fn() };
+      await expect(ensureThreadTopic(thread(), options)).rejects.toBeDefined();
+      await expect(ensureThreadTopic(thread(), options)).rejects.toThrow("подождать");
+      expect(createForumTopic).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(30_001);
+      await expect(ensureThreadTopic(thread(), options)).resolves.toMatchObject({ messageThreadId: 91 });
+      expect(createForumTopic).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
   const FORUM_CHAT_ID = -1001234567890;
 
   it("returns an existing live topic without creating another one", async () => {
@@ -190,7 +286,7 @@ describe("ensureThreadTopic", () => {
     const createForumTopic = vi.fn();
 
     const result = await ensureThreadTopic(thread(), {
-      chatId: FORUM_CHAT_ID,
+      provisioning, chatId: FORUM_CHAT_ID,
       contexts,
       topicIsAlive: vi.fn().mockResolvedValue(true),
       createForumTopic,
@@ -207,7 +303,7 @@ describe("ensureThreadTopic", () => {
     const sendWelcome = vi.fn();
 
     const result = await ensureThreadTopic(thread(), {
-      chatId: FORUM_CHAT_ID,
+      provisioning, chatId: FORUM_CHAT_ID,
       contexts: [],
       topicIsAlive: vi.fn(),
       createForumTopic: vi.fn().mockResolvedValue({ message_thread_id: 91 }),

@@ -784,6 +784,7 @@ export function createBot(
   const pendingProjectButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingProjectSessionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingSessionPicks = new Map<TelegramContextKey, string[]>();
+  const pendingTopicSessionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingWorkspacePicks = new Map<TelegramContextKey, string[]>();
   const pendingSessionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingWorkspaceButtons = new Map<TelegramContextKey, KeyboardItem[]>();
@@ -893,6 +894,7 @@ export function createBot(
     pendingLaunchPicks.delete(key);
     pendingLaunchButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
+    pendingTopicSessionButtons.delete(key);
     pendingWorkspacePicks.delete(key);
     pendingWorkspaceButtons.delete(key);
     lastPromptInput.delete(key);
@@ -2381,6 +2383,26 @@ export function createBot(
       return;
     }
 
+    const rawCommand = ctx.message?.text ?? "";
+    const ownTopic = /^\/sessions(?:@\w+)?(?:\s|$)/u.test(rawCommand)
+      && ctx.chat.type === "supergroup" && ctx.chat.is_forum === true;
+    if (ownTopic) {
+      const threadId = rawCommand.replace(/^\/sessions(?:@\w+)?\s*/u, "").trim();
+      if (threadId) { await openSessionTopic(ctx, threadId); return; }
+      const threads = listUserThreads(50);
+      const buttons = threads.map(thread => ({
+        label: formatSessionLabel({ workspace: thread.cwd, title: thread.title || thread.firstUserMessage || "",
+          relativeTime: formatRelativeTime(thread.updatedAt), isActive: false }),
+        callbackData: `projopen:${thread.id}`,
+      }));
+      const contextKey = contextKeyFromCtx(ctx)!;
+      pendingTopicSessionButtons.set(contextKey, buttons);
+      await safeReply(ctx, threads.length ? "<b>Сессии Codex</b>\nВыбери сессию, чтобы открыть её отдельный топик." : "Сессий Codex пока нет.", {
+        replyMarkup: threads.length ? paginateKeyboard(buttons, 0, "topicsess") : undefined,
+      });
+      return;
+    }
+
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -3241,6 +3263,7 @@ export function createBot(
     });
   }
   handlePageCallback(/^sess_page_(\d+)$/, "sess", pendingSessionButtons, "Expired, run /sessions again");
+  handlePageCallback(/^topicsess_page_(\d+)$/, "topicsess", pendingTopicSessionButtons, "Список устарел, открой /sessions ещё раз");
   handlePageCallback(/^proj_page_(\d+)$/, "proj", pendingProjectButtons, "Expired, run /projects again");
   handlePageCallback(/^mrpage_page_(\d+)$/, "mrpage", pendingMergeRequestButtons, "Устарело, вызови /mr заново");
   handlePageCallback(/^projsess_page_(\d+)$/, "projsess", pendingProjectSessionButtons, "Expired, run /projects again");
@@ -3358,21 +3381,51 @@ export function createBot(
   const ensureHostThreadTopic = (
     thread: NonNullable<ReturnType<typeof getThread>>,
     chatId: number,
+    excludeContextKey?: string,
   ) => ensureThreadTopic(thread, {
-    chatId,
+    provisioning: getProvisioning(),
+    chatId, excludeContextKey,
+    isExcludedTopic: messageThreadId => Boolean(inbox.get(`${chatId}:${messageThreadId}`)
+      || bot.statusBoard?.isDashboardTopic(chatId, messageThreadId) || bot.jiraPanel?.matches(chatId, messageThreadId)),
     contexts: registry.listContexts(),
     topicIsAlive: (messageThreadId) => topicIsAlive(chatId, messageThreadId),
     createForumTopic: (name) => bot.api.createForumTopic(chatId, name),
-    bindThread: (contextKey, record) => registry.bindThread(contextKey, record),
+    bindThread: (contextKey, record) => registry.bindThreadDurably(contextKey, record),
     sendWelcome: async (messageThreadId, name) => {
       await sendTextMessage(
         bot.api,
         chatId,
-        `<b>${escapeHTML(name)}</b>\n\nSend a message to continue this session.`,
+        `<b>${escapeHTML(name)}</b>\n\nНапиши сообщение, чтобы продолжить эту сессию.`,
         { messageThreadId, fallbackText: name },
       );
     },
   });
+
+  const openSessionTopic = async (ctx: Context, threadId: string): Promise<void> => {
+    const fromDashboard = !!ctx.callbackQuery && bot.statusBoard?.isDashboardTopic(ctx.chat?.id, ctx.callbackQuery.message?.message_thread_id) === true;
+    const reply = async (text: string) => {
+      if (fromDashboard) {
+        await ctx.answerCallbackQuery({ text: text.replace(/<[^>]+>/gu, "").slice(0, 180) }).catch(() => {});
+        await bot.statusBoard?.refreshSafely();
+        return;
+      }
+      if (ctx.callbackQuery) await ctx.answerCallbackQuery().catch(() => {});
+      await safeReply(ctx, text);
+    };
+    if (ctx.chat?.type !== "supergroup" || ctx.chat.is_forum !== true) {
+      await reply("Открой эту команду в группе с топиками: /topic &lt;ID сессии Codex&gt;"); return;
+    }
+    if (!threadId) { await reply("Укажи ID сессии Codex: /topic &lt;ID&gt;"); return; }
+    const thread = getThread(threadId);
+    if (!thread) { await reply("Сессия Codex с таким ID не найдена на этом устройстве."); return; }
+    try {
+      const result = await ensureHostThreadTopic(thread, ctx.chat.id, contextKeyFromCtx(ctx) ?? undefined);
+      const label = result.created ? "Топик создан" : result.availability === "unknown"
+        ? "Топик сессии (доступность не подтверждена)" : "Топик сессии";
+      await reply(`${label}: <a href="${result.url}">${escapeHTML(result.name)}</a>`);
+    } catch (error) { await reply(`Не удалось открыть топик: ${escapeHTML(friendlyErrorText(error))}`); }
+  };
+  bot.command("topic", ctx => openSessionTopic(ctx, String(ctx.match ?? "").trim()));
 
   bot.callbackQuery(/^jtask:/, async (ctx) => {
     const callback = parseJiraTaskCallback(ctx.callbackQuery.data);
@@ -3452,7 +3505,8 @@ export function createBot(
       return;
     }
 
-    await attachThreadHere(ctx, threadId);
+    if (ctx.chat?.type === "supergroup" && ctx.chat.is_forum === true) await openSessionTopic(ctx, threadId);
+    else await attachThreadHere(ctx, threadId);
   });
 
   // A session picked from /projects gets its own topic instead of taking over
@@ -3477,40 +3531,7 @@ export function createBot(
       return;
     }
 
-    const fromDashboard = bot.statusBoard?.isDashboardTopic(
-      chatId,
-      ctx.callbackQuery.message?.message_thread_id,
-    ) === true;
-    try {
-      const result = await ensureHostThreadTopic(thread, chatId);
-
-      if (fromDashboard) {
-        await ctx.answerCallbackQuery({
-          text: result.created ? "Топик создан" : result.availability === "unknown" ? "Доступность записанного топика не подтверждена" : "Топик уже существует",
-        });
-        await bot.statusBoard?.refreshSafely();
-        return;
-      }
-
-      await ctx.answerCallbackQuery({
-        text: result.created ? "Топик создан" : result.availability === "unknown" ? "Доступность записанного топика не подтверждена" : "У сессии уже есть топик",
-      });
-      const prefix = result.created ? "Топик создан" : result.availability === "unknown" ? "Записанный топик (доступность не подтверждена)" : "Топик сессии";
-      await safeReply(ctx, `${prefix}: <a href="${result.url}">${escapeHTML(result.name)}</a>`, {
-        fallbackText: `${prefix}: ${result.url}`,
-      });
-    } catch (error) {
-      if (fromDashboard) {
-        await ctx.answerCallbackQuery({
-          text: `Ошибка: ${friendlyErrorText(error)}`.slice(0, 180),
-        });
-        return;
-      }
-      await ctx.answerCallbackQuery({ text: "Failed to create topic" });
-      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed: ${friendlyErrorText(error)}`,
-      });
-    }
+    await openSessionTopic(ctx, threadId);
   });
 
   bot.callbackQuery(/^sess_(\d+)$/, async (ctx) => {
@@ -4530,7 +4551,10 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "topicsync", description: "Настроить появление топиков" },
     { command: "new", description: "Новая сессия в текущем топике" },
     { command: "session", description: "Текущая сессия" },
-    { command: "sessions", description: "Выбрать сессию" },
+    { command: "sessions", description: "Выбрать сессию для отдельного топика" },
+    { command: "switch", description: "Сменить сессию в текущем контексте" },
+    { command: "attach", description: "Привязать ID к текущему контексту" },
+    { command: "topic", description: "Топик для сессии Codex по ID" },
     { command: "projects", description: "Топики по проектам" },
     { command: "jira", description: "Спринт Jira и фильтры" },
     { command: "inbox", description: "Сделать топик входящим Inbox" },
@@ -4547,8 +4571,6 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "logout", description: "Выйти из аккаунта" },
     { command: "voice", description: "Состояние распознавания голоса" },
     { command: "handback", description: "Передать сессию в Codex CLI" },
-    { command: "attach", description: "Привязать сессию к топику" },
-    { command: "switch", description: "Выбрать сессию по ID" },
   ]);
 }
 

@@ -404,3 +404,15 @@ describe("usage report", () => {
     expect(report.html).toContain("Недельный лимит исчерпан");
   });
 });
+
+it("registers each command once with explicit session destination labels", async () => {
+  const setMyCommands = vi.fn().mockResolvedValue(undefined);
+  await registerCommands({ api: { setMyCommands } } as never);
+  const commands = setMyCommands.mock.calls[0]![0] as Array<{ command: string; description: string }>;
+  expect(new Set(commands.map(item => item.command)).size).toBe(commands.length);
+  expect(commands).toEqual(expect.arrayContaining([
+    { command: "topic", description: "Топик для сессии Codex по ID" },
+    { command: "switch", description: "Сменить сессию в текущем контексте" },
+    { command: "attach", description: "Привязать ID к текущему контексту" },
+  ]));
+});

@@ -47,3 +47,20 @@ TeleCodex PID 474743 active, NRestarts=0; Guardian PID 2007728 active, NRestarts
 Live API pilot used a dedicated technical topic [5487](https://t.me/c/3981282865/5487), card 5488 and a sample response 5490–5492 with code, link and three part labels. All 18 API operations were confirmed, including typing classified unknown, intended card send, pin/edit, answer send, close/reopen/close. Final card ready/current/pinned, topic closed, no pending lifecycle intents. Runtime registry/Inbox were not used for the synthetic task; its task database is isolated. Receipt: `/var/tmp/telecodex-ux08-live-24ru_mp7/report.json`.
 
 Remaining validation boundary: no physical phone or real Telegram WebView interaction was available. Browser tests use API fixtures; the live pilot proves Telegram API acceptance and destination, not visual rendering on a phone. Historical failed deliveries to six deleted source topics were not retried; their nine recovered answers remain in the previously delivered archive [5486](https://t.me/c/3981282865/5486).
+
+## Follow-up: continue a Codex session in its own topic
+
+User correction: `/attach` and the `/sessions` picker changed the invoking topic; the desired workflow creates a separate topic for a Codex ID. Continue autonomously under existing implementation/Git/deployment authorization.
+
+- [x] Add `/topic ID` and route forum `/sessions ID`/picker to separate-topic navigation before touching the source session. Keep `/switch` as explicit in-place switching and retain private-chat selection behavior. Validate missing/unknown ID without writes.
+- [x] Reuse existing dedicated destinations, excluding the invoking legacy binding. Persist a stable chat/thread creation intent using existing TaskProvisioningService; concurrent/repeated requests and unknown creation outcomes must never create duplicates. Bind only the created destination durably; do not start a Codex turn.
+- [x] Update command/help/README wording, regression tests, independent review and required full tests/build/checks.
+- [ ] Publish main, update local checkout, deploy exact tested build after safe preflight/backup, verify health and command registration.
+
+Implementation: bot.ts routing and projects.ts topic resolution/provisioning; projects and bot-topic-liveness integration tests. Help and README explicitly distinguish separate-topic navigation from current-context switching. Existing dedicated-topic receipts may be reused even from that dedicated topic; no topic-per-click behavior.
+
+Follow-up implementation/review: forum `/sessions` uses separate pagination state (`topicsess`) from `/switch`; generic Codex buttons also navigate to dedicated topics. Creation shares `sync:<chat>:<thread>` and the existing provisioning service with automatic sync. Confirmed receipts require a matching session binding; accepted 429 retries honor the persisted deadline; uncertain operations remain fenced. Dashboard callbacks refresh the launcher without posting extra messages. Menu entries are unique. Focused tests: 85/85, server build passed. Initial full suite overlapped the RED stage of two added regressions; final full suite is rerun against frozen implementation before release.
+
+Final frozen-implementation Vitest run passed: 3541 tests / 213 files (`/var/tmp/telecodex-topic-open-final-full.log`). Both regressions that were still RED during the overlapping initial run now pass in the fresh full suite. No source changes were made during this final run. Physical Telegram creation was not triggered for an unspecified user session; route tests intercept Telegram calls and explicitly prove source preservation. Release verification will use real command-menu/health reads and compare the existing binding snapshot.
+
+Final server/web build and Svelte check passed (0 errors, 0 warnings); diff check clean. Logs: `/var/tmp/telecodex-topic-open-build.log`, `/var/tmp/telecodex-topic-open-webcheck.log`.

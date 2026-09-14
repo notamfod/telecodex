@@ -24,10 +24,10 @@ describe("bot-ui", () => {
       expect(plain).not.toContain("/model");
     });
 
-    it("lists all 25 commands", () => {
+    it("lists all 27 commands", () => {
       const { plain } = renderHelpMessage();
       const commandMatches = plain.match(/^  \/\w+/gm) ?? [];
-      expect(commandMatches.length).toBe(25);
+      expect(commandMatches.length).toBe(27);
     });
 
     it("explains task controls without confusing a session or MR draft with task completion", () => {

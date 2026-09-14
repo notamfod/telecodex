@@ -55,7 +55,7 @@ User correction: `/attach` and the `/sessions` picker changed the invoking topic
 - [x] Add `/topic ID` and route forum `/sessions ID`/picker to separate-topic navigation before touching the source session. Keep `/switch` as explicit in-place switching and retain private-chat selection behavior. Validate missing/unknown ID without writes.
 - [x] Reuse existing dedicated destinations, excluding the invoking legacy binding. Persist a stable chat/thread creation intent using existing TaskProvisioningService; concurrent/repeated requests and unknown creation outcomes must never create duplicates. Bind only the created destination durably; do not start a Codex turn.
 - [x] Update command/help/README wording, regression tests, independent review and required full tests/build/checks.
-- [ ] Publish main, update local checkout, deploy exact tested build after safe preflight/backup, verify health and command registration.
+- [x] Publish main, update local checkout, deploy exact tested build after safe preflight/backup, verify health and command registration.
 
 Implementation: bot.ts routing and projects.ts topic resolution/provisioning; projects and bot-topic-liveness integration tests. Help and README explicitly distinguish separate-topic navigation from current-context switching. Existing dedicated-topic receipts may be reused even from that dedicated topic; no topic-per-click behavior.
 
@@ -64,3 +64,7 @@ Follow-up implementation/review: forum `/sessions` uses separate pagination stat
 Final frozen-implementation Vitest run passed: 3541 tests / 213 files (`/var/tmp/telecodex-topic-open-final-full.log`). Both regressions that were still RED during the overlapping initial run now pass in the fresh full suite. No source changes were made during this final run. Physical Telegram creation was not triggered for an unspecified user session; route tests intercept Telegram calls and explicitly prove source preservation. Release verification will use real command-menu/health reads and compare the existing binding snapshot.
 
 Final server/web build and Svelte check passed (0 errors, 0 warnings); diff check clean. Logs: `/var/tmp/telecodex-topic-open-build.log`, `/var/tmp/telecodex-topic-open-webcheck.log`.
+
+Follow-up released 2026-09-14 09:43 UTC: implementation `20f001bde42c3571ac444a19614cb03f3a4b36da` pushed to fork/main and pulled into main checkout. Exact tested build installed (178 SHA256 matches). Backup `/var/backups/telecodex/20260914T094256Z-topic-session-open`: 529 verified files and four valid SQLite copies; prior source snapshot `012edfe`. No schema/config change.
+
+TeleCodex PID 689407 and Guardian PID 2007728 active, NRestarts=0; healthz/readyz=200/ok. Real Telegram getMyCommands confirms `/topic` and unique `/sessions`, `/switch`, `/attach` entries with updated descriptions. All 276 existing context-to-thread bindings exactly match the pre-release snapshot. Preflight retains the historical delivery baseline with queued/running/sending/uncertain=0 and guardian ready. Fresh logs: 16 entries, no error/failure/exception patterns. No user session was switched or test topic created during this follow-up rollout.

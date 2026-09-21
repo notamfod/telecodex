@@ -154,8 +154,11 @@ export async function runDeveloperWorkloadRecipe(
     .sort((a, b) => {
       const aRoles = recipe.developerRoles[a.name] ?? [];
       const bRoles = recipe.developerRoles[b.name] ?? [];
-      const aSpecialist = aRoles.includes(role as DeveloperRole) ? 0 : 1;
-      const bSpecialist = bRoles.includes(role as DeveloperRole) ? 0 : 1;
+      const preferred = (roles: DeveloperRole[]) => role === "analysis"
+        ? (roles.includes("fullstack") ? 0 : 1)
+        : (roles.includes(role) || (role === "backend" && roles.includes("fullstack")) ? 0 : 1);
+      const aSpecialist = preferred(aRoles);
+      const bSpecialist = preferred(bRoles);
       return aSpecialist - bSpecialist || b.spare - a.spare || a.name.localeCompare(b.name, "ru");
     });
 

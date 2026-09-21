@@ -31,7 +31,7 @@ it("does not create a database or send until explicit activation; commands reuse
  expect(api.sendMessage).toHaveBeenCalledTimes(1); expect(api.pinChatMessage).toHaveBeenCalledTimes(1);
 });
 it("rejects foreign chats and keeps off durable", async () => {
- const { tasks, ctx, api } = harness();
+ const { tasks, ctx, api, workspace } = harness();
  await tasks.command({ ...ctx as object, chat: { id: -100456 } } as never);
  expect(api.sendMessage).not.toHaveBeenCalled();
  await tasks.command(ctx);
@@ -41,15 +41,15 @@ it("rejects foreign chats and keeps off durable", async () => {
  expect(api.sendMessage).toHaveBeenCalledTimes(1);
 });
 it("records manual topic title and ignores automatic rename echoes", async () => {
- const { tasks, ctx } = harness(); await tasks.command(ctx);
+ const { tasks, ctx, workspace } = harness(); await tasks.command(ctx);
  await tasks.manualTitle({ chatId: -100123, messageThreadId: 5 }, "Ручное название");
- expect(tasks.getManualTitle({ chatId: -100123, messageThreadId: 5 })).toBe("Ручное название");
+ expect(tasks.getManualTitle({ chatId: -100123, messageThreadId: 5 })).toBe(`💬 [${path.basename(workspace)}] · Ручное название`);
  await tasks.interact({ chatId: -100123, messageThreadId: 5 });
- expect(tasks.getManualTitle({ chatId: -100123, messageThreadId: 5 })).toBe("Ручное название");
+ expect(tasks.getManualTitle({ chatId: -100123, messageThreadId: 5 })).toBe(`💬 [${path.basename(workspace)}] · Ручное название`);
 });
 
 it("retains manual title queued before a stale metadata refresh", async () => {
- const { tasks, ctx, api } = harness();
+ const { tasks, ctx, api, workspace } = harness();
  let finish!: () => void;
  api.sendMessage.mockImplementationOnce(async () => { await new Promise<void>(resolve => { finish = resolve; }); return { message_id: 42 }; });
  const activation = tasks.command(ctx);
@@ -57,7 +57,7 @@ it("retains manual title queued before a stale metadata refresh", async () => {
  const manual = tasks.manualTitle({ chatId: -100123, messageThreadId: 5 }, "Ручное");
  const automatic = tasks.interact({ chatId: -100123, messageThreadId: 5 });
  finish(); await Promise.all([activation, manual, automatic]);
- expect(tasks.getManualTitle({ chatId: -100123, messageThreadId: 5 })).toBe("Ручное");
+ expect(tasks.getManualTitle({ chatId: -100123, messageThreadId: 5 })).toBe(`💬 [${path.basename(workspace)}] · Ручное`);
 });
 it("refreshes automatic titles and gates probes as well as card writes", async () => {
  const { tasks, ctx, api, metadata, gate, reply } = harness(); await tasks.command(ctx);
@@ -94,13 +94,13 @@ it("bounds an edit waiting for gate admission and never dispatches after cancell
 });
 
 it("a first manual-title activation attempts a rejected send only once", async () => {
- const { tasks, ctx, api } = harness();
+ const { tasks, ctx, api, workspace } = harness();
  api.sendMessage.mockRejectedValue({ error_code: 429, description: "Too Many Requests", parameters: { retry_after: 1 } });
  await tasks.command({ ...ctx as object, message: { message_thread_id: 5, text: "/task title Имя" } } as never);
  expect(api.sendMessage).toHaveBeenCalledTimes(1);
 });
 it("serializes automatic and manual remote renames so manual wins", async () => {
- const { tasks, ctx, api } = harness(); await tasks.command(ctx);
+ const { tasks, ctx, api, workspace } = harness(); await tasks.command(ctx);
  const destination = { chatId: -100123, messageThreadId: 5 };
  let finish!: () => void;
  api.editForumTopic.mockImplementationOnce(async () => { await new Promise<void>(resolve => { finish = resolve; }); return true; });
@@ -108,22 +108,22 @@ it("serializes automatic and manual remote renames so manual wins", async () => 
  await vi.waitFor(() => expect(finish).toBeDefined());
  const manual = tasks.renameManually(destination, "Ручное");
  finish(); await Promise.all([automatic, manual]);
- expect(api.editForumTopic.mock.calls.map(call => call[2])).toEqual([{ name: "Автоматическое" }, { name: "Ручное" }]);
- expect(tasks.getManualTitle(destination)).toBe("Ручное");
+ expect(api.editForumTopic.mock.calls.map(call => call[2])).toEqual([{ name: `💬 [${path.basename(workspace)}] · Автоматическое` }, { name: `💬 [${path.basename(workspace)}] · Ручное` }]);
+ expect(tasks.getManualTitle(destination)).toBe(`💬 [${path.basename(workspace)}] · Ручное`);
  expect(await tasks.renameAutomatically(destination, "Позднее авто")).toBe(false);
  expect(api.editForumTopic).toHaveBeenCalledTimes(2);
 });
 it("restores a manual Telegram name observed during an automatic request", async () => {
- const { tasks, ctx, api } = harness(); await tasks.command(ctx);
+ const { tasks, ctx, api, workspace } = harness(); await tasks.command(ctx);
  const destination = { chatId: -100123, messageThreadId: 5 };
  let finish!: () => void;
  api.editForumTopic.mockImplementationOnce(async () => { await new Promise<void>(resolve => { finish = resolve; }); return true; });
  const automatic = tasks.renameAutomatically(destination, "Авто");
  await vi.waitFor(() => expect(finish).toBeDefined());
  const manualEvent = tasks.observeTopic(destination, undefined, "Из Telegram");
- await vi.waitFor(() => expect(tasks.getManualTitle(destination)).toBe("Из Telegram"));
+ await vi.waitFor(() => expect(tasks.getManualTitle(destination)).toBe(`💬 [${path.basename(workspace)}] · Из Telegram`));
  finish(); await Promise.all([automatic, manualEvent]);
- expect(api.editForumTopic.mock.calls.at(-1)?.[2]).toEqual({ name: "Из Telegram" });
+ expect(api.editForumTopic.mock.calls.at(-1)?.[2]).toEqual({ name: `💬 [${path.basename(workspace)}] · Из Telegram` });
 });
 
 it("keeps callback handles stable and skips identical keyboard writes", async () => {
@@ -169,13 +169,13 @@ it("filters stored service and foreign-chat tasks and reads ticket metadata with
 });
 
 it("registers an explicitly created task without an implicit Telegram send", async () => {
-  const { tasks, api } = harness();
+  const { tasks, api, workspace } = harness();
   const destination = { chatId: -100123, messageThreadId: 55 };
   tasks.registerTask(destination, "Новая работа");
   tasks.registerTask(destination, "Повтор");
   const rows = await tasks.dashboardTasks();
   expect(rows.filter(row => row.messageThreadId === 55)).toHaveLength(1);
-  expect(rows.find(row => row.messageThreadId === 55)?.title).toBe("Новая работа");
+  expect(rows.find(row => row.messageThreadId === 55)?.title).toBe(`💬 [${path.basename(workspace)}] · Новая работа`);
   expect(api.sendMessage).not.toHaveBeenCalled();
 });
 
@@ -238,4 +238,15 @@ it("loads the real Dashboard consumer with a confirmed result and no actions aft
   expect(api.closeForumTopic).not.toHaveBeenCalled();
   expect(api.reopenForumTopic).not.toHaveBeenCalled();
   expect(api.sendMessage).toHaveBeenCalledOnce();
+});
+
+it("preserves a native manual title before the inbox task card was ever opened", async () => {
+  const { tasks, api, workspace } = harness();
+  const destination = { chatId: -100123, messageThreadId: 55 };
+  await tasks.observeTopic(destination, undefined, "Мой заголовок");
+  expect(tasks.shouldPreserveTitle(destination)).toBe(true);
+  expect(tasks.getManualTitle(destination)).toBe(`💬 [${path.basename(workspace)}] · Мой заголовок`);
+  expect(await tasks.renameAutomatically(destination, "Название после разбора")).toBe(false);
+  expect(tasks.enabled(destination)).toBe(false);
+  expect(api.sendMessage).not.toHaveBeenCalled();
 });

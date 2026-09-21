@@ -45,6 +45,7 @@ const mockSessionState = vi.hoisted(() => {
     dispose: ReturnType<typeof vi.fn>;
     isProcessing: ReturnType<typeof vi.fn>;
     applyDeferredDefaults: ReturnType<typeof vi.fn>;
+    setTopicName: ReturnType<typeof vi.fn>;
     setInfo: (next: Partial<{
       threadId: string | null;
       workspace: string;
@@ -116,6 +117,75 @@ vi.mock("../src/codex-session.js", () => ({
 import { SessionRegistry } from "../src/session-registry.js";
 
 describe("SessionRegistry", () => {
+  it("preserves the canonical topic name when a session refreshes metadata", async () => {
+    const registry = new SessionRegistry(createConfig());
+    registry.setContextDefaultsDurably("-1001:42", { workspace: "/repo", topicName: "🔎 [repo] #7 · Проверка" });
+    const session = await registry.getOrCreate("-1001:42");
+    registry.updateMetadata("-1001:42", session);
+    expect(registry.listContexts()[0].topicName).toBe("🔎 [repo] #7 · Проверка");
+    expect(new SessionRegistry(createConfig()).listContexts()[0].topicName).toBe("🔎 [repo] #7 · Проверка");
+  });
+
+  it("renames an active session without changing its thread or launch settings", async () => {
+    const registry = new SessionRegistry(createConfig());
+    const session = await registry.getOrCreate("-1001:42");
+    mockSessionState.sessions[0].setInfo({ threadId: "active-thread" });
+    registry.updateMetadata("-1001:42", session);
+    const before = registry.listContexts()[0];
+    registry.setTopicNameDurably("-1001:42", "🔎 [repo] · Проверка");
+    expect(registry.listContexts()[0]).toEqual({ ...before, topicName: "🔎 [repo] · Проверка" });
+    expect(session.setTopicName).toHaveBeenCalledWith("🔎 [repo] · Проверка");
+    mockFsState.failNextRename(new Error("disk full"));
+    expect(() => registry.setTopicNameDurably("-1001:42", "Other")).toThrow("disk full");
+    expect(new SessionRegistry(createConfig()).listContexts()[0].topicName).toBe("🔎 [repo] · Проверка");
+    expect(session.setTopicName).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains the inbox title when the launch button updates only workspace and profile", async () => {
+    const registry = new SessionRegistry(createConfig());
+    registry.setContextDefaultsDurably("-1001:42", { workspace: "/repo", topicName: "🔎 [repo] #7 · Проверка" });
+    registry.setContextDefaults("-1001:42", { workspace: "/repo", launchProfileId: "readonly" });
+    await registry.getOrCreate("-1001:42");
+    expect(mockSessionState.create).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({
+      topicName: "🔎 [repo] #7 · Проверка", launchProfileId: "readonly",
+    }), expect.anything());
+  });
+
+  it("applies the newest name to a session that was still being created during rename", async () => {
+    const registry = new SessionRegistry(createConfig());
+    registry.setContextDefaultsDurably("-1001:42", { workspace: "/repo", topicName: "Old title" });
+    const original = mockSessionState.create.getMockImplementation()!;
+    let finish!: () => void;
+    mockSessionState.create.mockImplementationOnce(async (...args: unknown[]) => {
+      const session = await original(...args);
+      await new Promise<void>(resolve => { finish = resolve; });
+      return session;
+    });
+    const pending = registry.getOrCreate("-1001:42", { deferThreadStart: true });
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    registry.setTopicNameDurably("-1001:42", "New title");
+    finish();
+    const session = await pending;
+    expect(session.setTopicName).toHaveBeenCalledWith("New title");
+  });
+
+  it("moves deferred topic settings without starting a Codex thread", () => {
+    const registry = new SessionRegistry(createConfig());
+    registry.setContextDefaultsDurably("-1001:42", { workspace: "/repo", launchProfileId: "default", topicName: "Task" });
+    registry.rebindThreadTopic("-1001:42", "-1001:43");
+    expect(registry.listContexts()).toEqual([expect.objectContaining({ contextKey: "-1001:43", threadId: null, topicName: "Task", workspace: "/repo" })]);
+    expect(new SessionRegistry(createConfig()).listContexts()).toEqual(registry.listContexts());
+    expect(mockSessionState.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects moving a missing context or overwriting a destination", () => {
+    const registry = new SessionRegistry(createConfig());
+    expect(() => registry.rebindThreadTopic("-1001:42", "-1001:43")).toThrow();
+    registry.setContextDefaultsDurably("-1001:42", { workspace: "/repo" });
+    registry.setContextDefaultsDurably("-1001:43", { workspace: "/other" });
+    expect(() => registry.rebindThreadTopic("-1001:42", "-1001:43")).toThrow();
+    expect(registry.listContexts()).toHaveLength(2);
+  });
   it("preserves removed topic bindings for automatic sync across restart", () => {
     const registry = new SessionRegistry(createConfig());
     registry.bindThread("-100123:42", { id: "deleted-topic-thread", cwd: "/project", title: "old", firstUserMessage: "", createdAt: new Date(), updatedAt: new Date(), model: null });
@@ -214,6 +284,7 @@ describe("SessionRegistry", () => {
       getInfo: vi.fn(() => ({ ...currentInfo })),
       dispose: vi.fn(),
       isProcessing: vi.fn(() => false),
+      setTopicName: vi.fn(),
       applyDeferredDefaults: vi.fn((defaults: { workspace: string; launchProfileId?: string }) => {
         currentInfo = {
           ...currentInfo,
@@ -365,7 +436,7 @@ describe("SessionRegistry", () => {
     expect(restored.isThreadBoundInChat("thread-visible", -100123)).toBe(true);
   });
 
-  it("atomically rebinds a thread and removes the stale active context", async () => {
+  it.each([false, true])("atomically rebinds a thread and removes the stale active context (metadata only=%s)", async (metadataOnly) => {
     const config = createConfig();
     const registry = new SessionRegistry(config);
     const thread: CodexThreadRecord = {
@@ -383,7 +454,7 @@ describe("SessionRegistry", () => {
     const removed: string[] = [];
     registry.onRemove((contextKey) => removed.push(contextKey));
 
-    registry.rebindThreadTopic("-100123:41", "-100123:99", thread);
+    registry.rebindThreadTopic("-100123:41", "-100123:99", metadataOnly ? undefined : thread);
 
     expect(registry.listContexts()).toEqual([
       expect.objectContaining({ contextKey: "-100123:99", threadId: thread.id }),

@@ -128,6 +128,13 @@ describe("Telegram delivery policy", () => {
 });
 
 describe("TeleCodex command menu", () => {
+  it("registers full topic history clearing", async () => {
+    const setMyCommands = vi.fn().mockResolvedValue(undefined);
+    await registerCommands({ api: { setMyCommands } } as never);
+    expect(setMyCommands).toHaveBeenCalledWith(expect.arrayContaining([
+      { command: "clear_all", description: "Очистить всю историю, пересоздав топик" },
+    ]));
+  });
   it("exposes persistent task cards in the command menu", async () => {
     const setMyCommands = vi.fn().mockResolvedValue(undefined);
     await registerCommands({ api: { setMyCommands } } as never);

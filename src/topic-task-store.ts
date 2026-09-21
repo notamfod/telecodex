@@ -196,6 +196,27 @@ export class TopicTaskStore {
     return row ? decode(row) : null;
   }
 
+  moveTopic(contextKey: string, messageThreadId: number): void {
+    integer(messageThreadId, 2);
+    this.database.transaction(() => {
+      const task = this.get(contextKey);
+      if (!task) return; // A completed move is safe to replay after a restart.
+      const nextKey = `${task.chatId}:${messageThreadId}`;
+      requireValid(nextKey !== contextKey && !this.get(nextKey));
+      const intent = this.getLifecycleIntent(contextKey);
+      requireValid(!intent || intent.phase === "complete" || intent.outcome === "failed");
+      const next: TopicTaskRecord = { ...task, contextKey: nextKey, messageThreadId,
+        version: task.version + 1, actionVersion: task.actionVersion + 1, presence: "open",
+        cardMessageId: null, cardState: "none", cardAttemptId: null, contentHash: null, pinState: "none",
+        lastResultMessageId: null, latestJobId: null, latestJobAt: 0, latestJobVersion: 0, latestJobOrder: 0,
+        agentState: "idle", lastEventAt: null, updatedAt: Date.now() };
+      validate(next);
+      this.database.prepare("INSERT INTO topic_tasks(context_key, version, payload) VALUES (?, ?, ?)").run(nextKey, next.version, JSON.stringify(next));
+      this.database.prepare("DELETE FROM topic_tasks WHERE context_key = ?").run(contextKey);
+      this.database.prepare("DELETE FROM lifecycle_intents WHERE context_key = ?").run(contextKey);
+    }).immediate();
+  }
+
   update(contextKey: string, expectedVersion: number, patch: TopicTaskPatch): TopicTaskRecord | null {
     integer(expectedVersion, 1);
     requireValid(patch && typeof patch === "object" && !Array.isArray(patch) && Object.keys(patch).every((key) => fields.has(key) && !immutable.has(key)));

@@ -48,7 +48,7 @@ describe("recipe review digest", () => {
     expect(html).toContain("заглушено: 1");
   });
 
-  it("renders the requested page and creates detail plus bounded navigation callbacks", () => {
+  it("renders the requested page and creates one launch button per finding plus bounded navigation callbacks", () => {
     const all = findings();
     const html = renderRecipeDigestHTML({ project: "mir-survey", findings: all, page: 1 });
     const keyboard = recipeDigestKeyboard(16, all, 1);
@@ -58,11 +58,9 @@ describe("recipe review digest", () => {
     expect(html).not.toContain("Описание 5");
     expect(html).not.toContain("Описание 11");
     expect(keyboard.inline_keyboard[0]).toEqual([
-      { text: "6 · P2 · category-6", callback_data: "rdetail:16:5" },
-      { text: "🔧", callback_data: "rfix:16:5" },
-      { text: "🔇", callback_data: "rdmute:16:5" },
+      { text: "▶ 6 · P2 · category-6", callback_data: "rfix:16:5" },
     ]);
-    expect(keyboard.inline_keyboard.slice(0, 5).every((row) => row.length === 3)).toBe(true);
+    expect(keyboard.inline_keyboard.slice(0, 5).every((row) => row.length === 1)).toBe(true);
     expect(keyboard.inline_keyboard.at(-1)?.map((button) => button.callback_data)).toEqual([
       "rpage:16:0",
       "rnoop:16",
@@ -70,20 +68,17 @@ describe("recipe review digest", () => {
     ]);
   });
 
-  it("marks only a muted digest row and keeps its detail and fix actions", () => {
+  it("keeps only launch buttons even for previously muted findings", () => {
     const all = findings();
     const muted = mutedRecipeFindingIndices(all, [fingerprintFinding(all[5]!)]);
     const keyboard = recipeDigestKeyboard(16, all, 1, muted);
 
     expect(keyboard.inline_keyboard[0]).toEqual([
-      { text: "6 · P2 · category-6", callback_data: "rdetail:16:5" },
-      { text: "🔧", callback_data: "rfix:16:5" },
-      { text: "✅", callback_data: "rnoop:16" },
+      { text: "▶ 6 · P2 · category-6", callback_data: "rfix:16:5" },
     ]);
-    expect(keyboard.inline_keyboard[1]?.[2]).toEqual({
-      text: "🔇",
-      callback_data: "rdmute:16:6",
-    });
+    expect(keyboard.inline_keyboard.slice(0, 5).every((row) =>
+      row.length === 1 && row[0]?.callback_data.startsWith("rfix:"),
+    )).toBe(true);
   });
 
   it("renders one selected finding and keeps its actions in the same message", () => {
@@ -97,14 +92,11 @@ describe("recipe review digest", () => {
     expect(html).toContain("Автор: Автор 6");
     expect(keyboard.inline_keyboard).toEqual([
       [
-        { text: "🔧 Тред-фикс", callback_data: "rfix:16:5" },
-        { text: "🔇 Игнорировать", callback_data: "rmute:16:5" },
+        { text: "▶ Запустить", callback_data: "rfix:16:5" },
       ],
       [{ text: "← К списку", callback_data: "rpage:16:1" }],
     ]);
-    expect(recipeFindingDetailKeyboard(16, 5, true).inline_keyboard).toEqual([
-      [{ text: "← К списку", callback_data: "rpage:16:1" }],
-    ]);
+    expect(recipeFindingDetailKeyboard(16, 5, true)).toEqual(keyboard);
   });
 
   it("keeps a five-finding page within Telegram's message limit", () => {

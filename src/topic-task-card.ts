@@ -48,6 +48,10 @@ export class TopicTaskCardService {
     return this.enqueue(key, () => this.render(key, explicit));
   }
 
+  moveTopic(key: string, messageThreadId: number): Promise<void> {
+    return this.enqueue(key, async () => { this.store.moveTopic(key, messageThreadId); });
+  }
+
   observe(job: TelegramJob, projection: TelegramJobStatusProjection, deliveries: readonly DeliveryPart[], destination: TaskDestination, waitingOn?: "input" | "approval", acceptanceOrder = job.acceptedAt): Promise<void> {
     const key = keyOf(destination);
     return this.enqueue(key, async () => {

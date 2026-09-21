@@ -59,7 +59,7 @@ describe("canonical Inbox completion", () => {
       { kind: "text", text: "Use SQLite." },
       { kind: "attachment", attachment: { kind: "file", path: "outputs/report.md" } },
     ]);
-    expect(renameTopic).toHaveBeenCalledWith(-1001, 77, "MIR-7000 durable queue");
+    expect(renameTopic).toHaveBeenCalledWith(-1001, 77, "💬 [work] MIR-7000 · durable queue");
     expect(setTopicTitle).toHaveBeenCalledWith(12, "durable queue");
     expect(saveAnswer).toHaveBeenCalledWith("/telecodex", 12, "Use SQLite.");
     expect(prepared.supplementalParts).toEqual([{

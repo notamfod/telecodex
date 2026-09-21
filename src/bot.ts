@@ -1,6 +1,10 @@
+import { loadServiceTopicKeys } from "./service-topics.js";
+import { TopicTitleSynchronizer } from "./topic-title-sync.js";
+import { taskTopicName } from "./task-title.js";
 import { isSyncedTopicAttemptBlocked } from "./topic-sync-provisioning.js";
 import { TaskProvisioningService, TaskProvisioningStore } from "./task-provisioning.js";
 import { registerTaskCreationCommands } from "./task-creation-commands.js";
+import { registerClearTopicCommand, type ClearTopicApi } from "./bot-clear-topic.js";
 import { registerTopicSyncPolicyCommands } from "./bot-topic-sync-policy.js";
 import type { TopicSyncPolicyStore } from "./topic-sync-policy.js";
 import { taskActionLabel } from "./topic-task-controls.js";
@@ -12,7 +16,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { autoRetry } from "@grammyjs/auto-retry";
-import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
+import { Api, Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 
 import {
   buildFileInstructions,
@@ -52,7 +56,7 @@ import {
   formatLaunchProfileLabel,
 } from "./codex-launch.js";
 import { getThread, listRecentRootThreads, listUserThreads, listWorkspaces } from "./codex-state.js";
-import { threadLabel } from "./topic-sync.js";
+import { buildTopicName, threadLabel } from "./topic-sync.js";
 import {
   GitLabClient,
   buildDoneComment,
@@ -69,7 +73,6 @@ import {
   InboxStore,
   extractTicketKey,
   ticketActionButtons,
-  ticketHeading,
   type Ticket,
 } from "./inbox.js";
 import { registerInboxHandlers } from "./bot-inbox.js";
@@ -95,7 +98,7 @@ import {
 } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, splitTelegramMarkdown } from "./format.js";
-import { formatTelegramErrorLog, isTelegramTopicNotModified } from "./telegram-error-log.js";
+import { formatTelegramErrorLog, isTelegramTopicNotModified, sanitizeTelegramLogText } from "./telegram-error-log.js";
 import { createForumTopicLivenessProbe } from "./telegram-topic-liveness.js";
 import { createTelegramTopicLivenessApi, type TelegramTopicLivenessApi }
   from "./telegram-topic-liveness-api.js";
@@ -180,7 +183,7 @@ import {
   TopicActivityIndicator,
   topicIconChangeFromMessage,
 } from "./topic-activity.js";
-import { extractTopicRename, renamedTicketTopic } from "./topic-naming.js";
+import { extractTopicRename, renamedTicketTopic, resolvedTicketTopic } from "./topic-naming.js";
 import {
   buildCodexThreadKeyboard,
   finalChunkThreadKeyboard,
@@ -397,9 +400,11 @@ type RenderedChunk = RenderedText & {
 
 export interface TeleCodexBot extends Bot<Context> {
   taskCards?: BotTopicTasks;
+  topicTitles?: TopicTitleSynchronizer;
   disposeTaskProvisioning?: () => Promise<void>;
   getTaskProvisioning?: () => TaskProvisioningService;
   recoverPendingJobs(): Promise<void>;
+  recoverUnstartedTicketTopics(): Promise<number[]>;
   statusBoard?: StatusBoard;
   dashboard?: DashboardController;
   jiraPanel?: JiraPanel;
@@ -407,6 +412,7 @@ export interface TeleCodexBot extends Bot<Context> {
 }
 
 export interface TeleCodexBotOptions {
+  readonly clearTopicApi?: ClearTopicApi;
   readonly topicSyncPolicy?: TopicSyncPolicyStore;
   readonly backgroundWriteGate?: Pick<TelegramBackgroundWriteGate, "run">;
   readonly topicLivenessApi?: TelegramTopicLivenessApi;
@@ -647,7 +653,7 @@ export function createBot(
     new TaskProvisioningStore(path.join(config.workspace, ".telecodex", "task-provisioning.sqlite")),
   );
   bot.getTaskProvisioning = getProvisioning;
-  bot.disposeTaskProvisioning = async () => { await disposeInbox?.(); await provisioning?.dispose(); };
+  bot.disposeTaskProvisioning = async () => { await bot.topicTitles?.dispose(); await disposeInbox?.(); await provisioning?.dispose(); };
   // JSON storage is a rollback-only compatibility path. Canonical mode must not
   // construct a second correctness owner beside the SQLite ledger.
   const jobStore = reliability
@@ -726,9 +732,56 @@ export function createBot(
     { processing: boolean; switching: boolean; transcribing: boolean }
   >();
   const inbox = new InboxStore(path.join(config.workspace, ".telecodex", "inbox.json"));
+  const serviceTopicKeys = loadServiceTopicKeys(config.workspace);
+  bot.topicTitles = new TopicTitleSynchronizer({
+    registry,
+    eligible: metadata => {
+      const { chatId, messageThreadId } = parseContextKey(metadata.contextKey);
+      return chatId === config.telegramForumChatId && !!messageThreadId && messageThreadId > 1
+        && !serviceTopicKeys.has(metadata.contextKey)
+        && !inbox.get(metadata.contextKey) && !bot.statusBoard?.isDashboardTopic(chatId, messageThreadId)
+        && !bot.jiraPanel?.matches(chatId, messageThreadId);
+    },
+    ticketKey: metadata => {
+      const { chatId, messageThreadId } = parseContextKey(metadata.contextKey);
+      const ticket = messageThreadId ? inbox.findTicketByTopic(messageThreadId) : undefined;
+      return ticket && parseContextKey(ticket.inboxContextKey).chatId === chatId
+        ? ticket.externalKey ?? `#${ticket.id}` : undefined;
+    },
+    title: metadata => {
+      const { chatId, messageThreadId } = parseContextKey(metadata.contextKey);
+      const manual = bot.taskCards?.getManualTitle({ chatId, messageThreadId: messageThreadId! });
+      const candidate = messageThreadId ? inbox.findTicketByTopic(messageThreadId) : undefined;
+      const ticket = candidate && parseContextKey(candidate.inboxContextKey).chatId === chatId ? candidate : undefined;
+      if (ticket) return resolvedTicketTopic({ ...ticket, workspace: metadata.workspace }, metadata.topicName, manual);
+      const thread = !metadata.topicName && metadata.threadId ? getThread(metadata.threadId) : undefined;
+      const title = manual ?? metadata.topicName ?? (thread ? threadLabel(thread) : undefined);
+      return title ? taskTopicName(title, metadata.workspace) : undefined;
+    },
+    edit: async (contextKey, name) => {
+      const { chatId, messageThreadId } = parseContextKey(contextKey);
+      const signal = AbortSignal.timeout(15_000);
+      const edit = async () => {
+        try { await bot.api.editForumTopic(chatId, messageThreadId!, { name }, signal as never); }
+        catch (error) { if (!isTelegramTopicNotModified(error)) throw error; }
+      };
+      if (options.backgroundWriteGate) await options.backgroundWriteGate.run(chatId, "ordinary", edit, signal);
+      else await edit();
+    },
+    report: error => console.warn(formatTelegramErrorLog("topic", error)),
+  });
   if (reliability) bot.taskCards = createBotTopicTasks({
     api: bot.api, workspace: config.workspace, forumChatId: config.telegramForumChatId,
     gate: options.backgroundWriteGate,
+    renameTitle: async ({ chatId, messageThreadId }, title) => {
+      const contextKey = contextKeyFromMessage(chatId, messageThreadId);
+      if (!registry.hasMetadata(contextKey)) {
+        const ticket = inbox.findTicketByTopic(messageThreadId);
+        const workspace = ticket && parseContextKey(ticket.inboxContextKey).chatId === chatId ? ticket.workspace : config.workspace;
+        registry.setContextDefaultsDurably(contextKey, { workspace, topicName: title });
+      }
+      await bot.topicTitles!.rename(contextKey, title);
+    },
     controls: reliability.readTaskContext && reliability.withTaskContext ? {
       read: async task => {
         const state = await reliability.readTaskContext!({ botId: String(bot.botInfo.id), chatId: task.chatId, messageThreadId: task.messageThreadId });
@@ -756,7 +809,7 @@ export function createBot(
     } : undefined,
     report: (error) => console.warn(formatTelegramErrorLog("topic", error)),
     isExcluded: ({ chatId, messageThreadId }) => Boolean(
-      inbox.get(`${chatId}:${messageThreadId}`)
+      serviceTopicKeys.has(`${chatId}:${messageThreadId}`) || inbox.get(`${chatId}:${messageThreadId}`)
       || bot.statusBoard?.isDashboardTopic(chatId, messageThreadId)
       || bot.jiraPanel?.matches(chatId, messageThreadId)),
     metadata: ({ chatId, messageThreadId }) => {
@@ -764,7 +817,7 @@ export function createBot(
       const candidate = inbox.findTicketByTopic(messageThreadId);
       const ticket = candidate && parseContextKey(candidate.inboxContextKey).chatId === chatId ? candidate : undefined;
       return { workspace: metadata?.workspace ?? ticket?.workspace ?? config.workspace,
-        threadId: metadata?.threadId ?? null, topicName: ticket?.topicTitle ?? metadata?.topicName,
+        threadId: metadata?.threadId ?? null, topicName: metadata?.topicName ?? ticket?.topicTitle,
         ticketId: ticket?.id, ticketKey: ticket?.externalKey ?? (ticket ? `#${ticket.id}` : undefined) };
     },
   });
@@ -822,7 +875,7 @@ export function createBot(
       try {
         if (bot.taskCards) {
           if (!await bot.taskCards.renameAutomatically({ chatId: inboxContext.chatId, messageThreadId: current.workTopicId }, topicName)) return extracted.text;
-        } else await bot.api.editForumTopic(inboxContext.chatId, current.workTopicId, { name: topicName });
+        } else await bot.topicTitles!.rename(contextKeyFromMessage(inboxContext.chatId, current.workTopicId), topicName);
         inbox.setTopicTitle(current.id, extracted.title);
       } catch (error) {
         if (isTelegramTopicNotModified(error)) {
@@ -877,7 +930,7 @@ export function createBot(
       if (bot.taskCards?.shouldPreserveTitle({ chatId, messageThreadId })) return false;
       try {
         if (bot.taskCards) return await bot.taskCards.renameAutomatically({ chatId, messageThreadId }, name);
-        await bot.api.editForumTopic(chatId, messageThreadId, { name });
+        await bot.topicTitles!.rename(contextKeyFromMessage(chatId, messageThreadId), name);
         return true;
       } catch (error) {
         if (isTelegramTopicNotModified(error)) return true;
@@ -1684,6 +1737,10 @@ export function createBot(
         const presence = message?.forum_topic_closed ? "closed" as const
           : message?.forum_topic_reopened || message?.forum_topic_created ? "open" as const : undefined;
         const title = !ctx.from?.is_bot ? message?.forum_topic_edited?.name : undefined;
+        const observedName = title ?? message?.forum_topic_created?.name;
+        if (observedName) getProvisioning().store.setPending(`topic-name:${ctx.chat.id}:${messageThreadId}`, observedName);
+        if (title && !bot.taskCards) void bot.topicTitles?.rename(contextKeyFromMessage(ctx.chat.id, messageThreadId), title)
+          .catch(error => console.warn(formatTelegramErrorLog("topic", error)));
         void bot.taskCards?.observeTopic({ chatId: ctx.chat.id, messageThreadId }, presence, title)
           .catch((error) => console.warn(formatTelegramErrorLog("topic", error)));
       }
@@ -1703,15 +1760,65 @@ export function createBot(
       return;
     }
 
+    if (await clearTopicCommand.guard(ctx)) return;
     await next();
     const taskTopic = ctx.message?.message_thread_id ?? ctx.callbackQuery?.message?.message_thread_id;
     if (ctx.chat && taskTopic) {
       const destination = { chatId: ctx.chat.id, messageThreadId: taskTopic };
       void (async () => {
+        await bot.topicTitles?.reconcile(contextKeyFromMessage(destination.chatId, destination.messageThreadId));
         await bot.taskCards?.interact(destination);
         if (bot.taskCards?.enabled(destination)) await reliability?.refreshTopicTask?.({ botId: String(ctx.me.id), ...destination });
       })().catch((error) => console.warn(formatTelegramErrorLog("topic", error)));
     }
+  });
+
+  const clearTopicCommand = registerClearTopicCommand(bot, {
+    // Creation must not inherit auto-retry: a lost response could otherwise create duplicates.
+    api: options.clearTopicApi ?? new Api(config.telegramBotToken),
+    forumChatId: config.telegramForumChatId, registry, store: () => getProvisioning().store,
+    isAllowed: ctx => config.telegramAllowedUserIdSet.has(ctx.from?.id ?? 0),
+    isExcluded: (chatId, messageThreadId) => Boolean(inbox.get(`${chatId}:${messageThreadId}`)
+      || bot.statusBoard?.isDashboardTopic(chatId, messageThreadId) || bot.jiraPanel?.matches(chatId, messageThreadId)),
+    title: contextKey => {
+      const { chatId, messageThreadId } = parseContextKey(contextKey);
+      const meta = registry.listContexts().find(c => c.contextKey === contextKey);
+      const ticket = inbox.findTicketByTopic(messageThreadId!);
+      const saved = getProvisioning().store.list().find(p => p.messageThreadId === messageThreadId && parseContextKey(p.sourceContextKey).chatId === chatId);
+      const thread = meta?.threadId ? getThread(meta.threadId) : null;
+      return bot.taskCards?.getManualTitle({ chatId, messageThreadId: messageThreadId! })
+        ?? getProvisioning().store.pending<string>(`topic-name:${contextKey}`)
+        ?? bot.taskCards?.topicTitle({ chatId, messageThreadId: messageThreadId! })
+        ?? (ticket && parseContextKey(ticket.inboxContextKey).chatId === chatId ? ticket.topicTitle : undefined)
+        ?? meta?.topicName ?? saved?.title ?? (thread ? buildTopicName(thread) : undefined);
+    },
+    serialize: (key, operation) => {
+      const { chatId, messageThreadId } = parseContextKey(key);
+      return reliability?.withTaskContext ? reliability.withTaskContext({ botId: String(bot.botInfo.id), chatId, messageThreadId: messageThreadId ?? null }, operation) : operation();
+    },
+    isSafe: async (key, threadId) => {
+      if (isBusy(key)) return false;
+      const { chatId, messageThreadId } = parseContextKey(key);
+      if (reliability) {
+        if (!reliability.readTaskContext || !reliability.withTaskContext) return false;
+        const state = await reliability.readTaskContext({ botId: String(bot.botInfo.id), chatId, messageThreadId: messageThreadId ?? null });
+        if (!state.safe) return false;
+      }
+      if (!threadId) return true;
+      try {
+        const response = await registry.getAppServerClient().request<{ thread?: { id?: string; status?: { type?: string }; turns?: { status?: string }[] } }>(
+          "thread/read", { threadId, includeTurns: true }, { timeoutMs: 2_000 });
+        return response.thread?.id === threadId && response.thread.status?.type === "idle"
+          && Array.isArray(response.thread.turns) && !response.thread.turns.some(turn => turn.status === "inProgress");
+      } catch { return false; }
+    },
+    moveRelated: async (oldKey, newKey) => {
+      const source = parseContextKey(oldKey); const target = parseContextKey(newKey);
+      const ticket = inbox.findTicketByTopic(source.messageThreadId!);
+      if (ticket && parseContextKey(ticket.inboxContextKey).chatId === source.chatId) inbox.attachTopic(ticket.id, target.messageThreadId!);
+      await bot.taskCards?.moveTopic({ chatId: source.chatId, messageThreadId: source.messageThreadId! }, target.messageThreadId!);
+    },
+    report: error => console.warn(formatTelegramErrorLog("topic", error)),
   });
 
   registerTaskCreationCommands(bot, {
@@ -2773,7 +2880,7 @@ export function createBot(
       source: `рецепт ${run.recipe}`,
     });
 
-    const topicName = fixTopicName(finding);
+    const topicName = fixTopicName(finding, run.cwd);
     const topic = await bot.api.createForumTopic(chatId, topicName);
     inbox.attachTopic(ticket.id, topic.message_thread_id);
     registry.setContextDefaults(contextKeyFromMessage(chatId, topic.message_thread_id), {
@@ -2796,7 +2903,7 @@ export function createBot(
     });
 
     const url = topicUrl(chatId, topic.message_thread_id);
-    await safeReply(ctx, `Тред заведён: <a href="${url}">${escapeHTML(fixTopicName(finding))}</a>`, {
+    await safeReply(ctx, `Тред заведён: <a href="${url}">${escapeHTML(fixTopicName(finding, run.cwd))}</a>`, {
       fallbackText: url,
     });
   });
@@ -2833,7 +2940,7 @@ export function createBot(
       }
 
       if (reliability) {
-        const topicName = sentryTaskTopicName(callback.shortId);
+        const topicName = sentryTaskTopicName(callback.shortId, recipe.cwd);
         const rawSource = canonicalWorkSource(
           ctx,
           "confirmation",
@@ -2886,7 +2993,7 @@ export function createBot(
           const session = await registry.getOrCreate(workContextKey, { deferThreadStart: true });
           void handleUserPrompt(ctx, workContextKey, chatId, session, prompt);
         },
-      }, recipe.realm);
+      }, recipe.realm, recipe.cwd);
 
       const url = topicUrl(chatId, result.topicId);
       await safeReply(
@@ -3078,8 +3185,8 @@ export function createBot(
     }
     launchedMergeRequestMessages.add(launchKey);
     try {
-      const topicName = mergeRequestTopicName(mr);
       const workspace = repoWorkspace(mr.project);
+      const topicName = mergeRequestTopicName(mr, workspace);
       if (reliability) {
         const rawSource = canonicalWorkSource(
           ctx,
@@ -3366,7 +3473,7 @@ export function createBot(
           registry.setContextDefaults(contextKeyFromMessage(panelConfig.chatId, topicId), {
             workspace,
             launchProfileId: config.defaultLaunchProfileId,
-            topicName: jiraTaskTopicName(task),
+            topicName: jiraTaskTopicName(task, workspace),
           });
           await sendTextMessage(bot.api, panelConfig.chatId, renderJiraTaskCardHTML(task), {
             messageThreadId: topicId,
@@ -3467,7 +3574,7 @@ export function createBot(
           registry.setContextDefaults(contextKeyFromMessage(chatId, topicId), {
             workspace: recipe.cwd,
             launchProfileId: config.defaultLaunchProfileId,
-            topicName: jiraTaskTopicName(task),
+            topicName: jiraTaskTopicName(task, recipe.cwd),
           });
           await sendTextMessage(bot.api, chatId, renderJiraTaskCardHTML(task), {
             messageThreadId: topicId,
@@ -3834,7 +3941,9 @@ export function createBot(
 
   const inboxHandlers = registerInboxHandlers({
     provisioning: getProvisioning,
-    renameTopicManually: bot.taskCards ? (chatId, messageThreadId, title) => bot.taskCards!.renameManually({ chatId, messageThreadId }, title).then(() => {}) : undefined,
+    renameTopicManually: (chatId, messageThreadId, title) => bot.taskCards
+      ? bot.taskCards.renameManually({ chatId, messageThreadId }, title).then(() => {})
+      : bot.topicTitles!.rename(contextKeyFromMessage(chatId, messageThreadId), title),
     onManualTopicTitle: (chatId, messageThreadId, title) => bot.taskCards?.manualTitle({ chatId, messageThreadId }, title).catch((error) => console.warn(formatTelegramErrorLog("topic", error))) ?? Promise.resolve(),
     bot,
     config,
@@ -3855,17 +3964,30 @@ export function createBot(
         ticketPromptOptions(ticket.workTopicId),
       ),
     handleCanonicalTicketPrompt: reliability
-      ? async (ctx, ticket) => {
+      ? async (ctx, ticket, targetContext) => {
+          const metadata = registry.listContexts().find(entry => entry.contextKey === contextKeyFromMessage(ctx.chat!.id, ticket.workTopicId));
           const source = canonicalWorkSource(ctx, "confirmation", ticket.prompt, null, {
             workspace: ticket.workspace,
             launchProfileId: ticket.launchProfileId ?? config.defaultLaunchProfileId,
-            topicName: ticketHeading(ticket),
-          });
+            topicName: resolvedTicketTopic(ticket, metadata?.topicName,
+              bot.taskCards?.getManualTitle({ chatId: ctx.chat!.id, messageThreadId: ticket.workTopicId })),
+          }, undefined, targetContext);
           if (!source) throw new Error("Invalid canonical Telegram ticket source");
-          await reliability.handleWork({
-            ...source,
-            completion: { kind: "inbox_ticket", ticketId: ticket.id },
-          });
+          const work = { ...source, completion: { kind: "inbox_ticket" as const, ticketId: ticket.id } };
+          try {
+            await reliability.handleWork(work);
+          } catch (error) {
+            console.error(formatTelegramErrorLog("bot_handler", error));
+            console.error(`ticketSource=${sanitizeTelegramLogText(JSON.stringify({
+              botId: typeof work.botId, updateId: typeof work.updateId, chatId: typeof work.chatId,
+              messageThreadId: work.messageThreadId, messageId: work.messageId, kind: work.kind,
+              textLength: work.text?.length ?? null, workspace: work.sessionDefaults?.workspace,
+              launchProfileId: work.sessionDefaults?.launchProfileId,
+              topicNameLength: work.sessionDefaults?.topicName?.length ?? null,
+              completionTicketId: work.completion.ticketId,
+            }))}`);
+            throw error;
+          }
         }
       : undefined,
     topicIsAlive,
@@ -3873,6 +3995,7 @@ export function createBot(
     safeReply,
   });
   disposeInbox = () => inboxHandlers.dispose();
+  bot.recoverUnstartedTicketTopics = () => inboxHandlers.recoverUnstartedTicketTopics();
 
   bot.on("message:text", async (ctx) => {
     const userText = ctx.message.text.trim();
@@ -4534,7 +4657,8 @@ export function createBot(
   }
 
   bot.catch((error) => {
-    console.error(formatTelegramErrorLog("bot_handler", error.error));
+    const detail = error.error instanceof Error ? error.error.message : String(error.error);
+    console.error(`${formatTelegramErrorLog("bot_handler", error.error)} detail=${sanitizeTelegramLogText(detail)}`);
   });
 
   return bot;
@@ -4542,6 +4666,7 @@ export function createBot(
 
 export async function registerCommands(bot: Bot<Context>): Promise<void> {
   await bot.api.setMyCommands([
+    { command: "clear_all", description: "Очистить всю историю, пересоздав топик" },
     { command: "task", description: "Карточка задачи в этом топике" },
     { command: "start", description: "Приветствие и состояние" },
     { command: "help", description: "Справка по командам" },

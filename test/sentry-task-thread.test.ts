@@ -34,7 +34,7 @@ describe("Sentry task thread", () => {
   });
 
   it("uses the short id in a Telegram-safe topic name", () => {
-    expect(sentryTaskTopicName("MIR-BACK-2TC")).toBe("🔎 MIR-BACK-2TC · Sentry");
+    expect(sentryTaskTopicName("MIR-BACK-2TC")).toBe("🔎 [mircli] MIR-BACK-2TC · Sentry");
   });
 
   it("creates the topic before starting the Codex analysis", async () => {
@@ -56,13 +56,13 @@ describe("Sentry task thread", () => {
     });
 
     expect(calls).toEqual([
-      "create:🔎 MIR-BACK-2TC · Sentry",
+      "create:🔎 [mircli] MIR-BACK-2TC · Sentry",
       "init:2072",
       "start:2072:true",
     ]);
     expect(result).toEqual({
       topicId: 2072,
-      topicName: "🔎 MIR-BACK-2TC · Sentry",
+      topicName: "🔎 [mircli] MIR-BACK-2TC · Sentry",
     });
   });
 });

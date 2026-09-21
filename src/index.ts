@@ -317,6 +317,7 @@ try {
       chatId: config.telegramForumChatId,
       intervalMs: config.topicSyncIntervalMs ?? 30_000,
       registry,
+      reconcileTitles: () => bot?.topicTitles?.reconcile() ?? Promise.resolve(),
       getPolicy: () => topicSyncPolicy.get(),
       provisionThread: thread => provisionSyncedTopic(bot!.getTaskProvisioning!(), config.telegramForumChatId!, thread,
         (chatId, name) => backgroundWriteGate!.run(chatId, "ordinary", () => {
@@ -426,9 +427,11 @@ async function startPolling(): Promise<void> {
         reliabilityRuntime
             ? async () => {
               await reliabilityRuntime!.reconcile();
+              await bot!.recoverUnstartedTicketTopics();
             }
           : async () => {
               await bot!.recoverPendingJobs();
+              await bot!.recoverUnstartedTicketTopics();
             },
         startTelegramRunner,
         () => !shuttingDown,

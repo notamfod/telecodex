@@ -115,7 +115,7 @@ describe("Telegram topic recovery", () => {
     expect(hashTelegramDeliveryPayload(expectedAttachment)).toBe("0d0efac0224ca45e0bda56bbb248efabfc9b06cf2fafa277ef4efe601ce59d97");
     expect(hashTelegramDeliveryPayload(expectedSummary)).toBe("76c254c4f747d35b61b45c7b21ce03728fd28d645465543bdedfff17428def67");
     expect(candidate).toEqual({
-      jobId: "job-1", expectedVersion: 9, threadId: "thread-1", topicName: "telecodex · Recover topic",
+      jobId: "job-1", expectedVersion: 9, threadId: "thread-1", topicName: "💬 [telecodex] · Recover topic",
       oldDestination: { chatId: -1001, messageThreadId: 7 },
       parts: [
         { partKey: "final:0000", payload: expectedFinal, contentHash: "33f27a6e265acb08edff13defb04510e8b55375d76afaf28ea05ffb27aff0b5f" },

@@ -168,13 +168,13 @@ describe("GitLabClient.listOpenMergeRequests", () => {
 describe("mergeRequestTopicName", () => {
   it("leads with the merge request reference and its project", () => {
     expect(mergeRequestTopicName(mr())).toBe(
-      "!19 api: chore: restrict schema description to M…",
+      "🔎 [api] !19 · chore: restrict schema description to MCP tables",
     );
   });
 
   it("marks a draft so it is obvious in the topic list", () => {
     expect(mergeRequestTopicName(mr({ iid: 1207, title: "Resolve MIR-5476", draft: true }))).toBe(
-      "!1207 api: [draft] Resolve MIR-5476",
+      "🔎 [api] !1207 · [draft] Resolve MIR-5476",
     );
   });
 });

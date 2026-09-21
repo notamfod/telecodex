@@ -10,6 +10,17 @@ let file: string;
 let stores: TopicTaskStore[];
 const input = { chatId: -100123, messageThreadId: 42, title: "Task", workspace: "/srv/project" };
 function open() { const store = new TopicTaskStore(file); stores.push(store); return store; }
+it("moves task identity and title while clearing obsolete message references", () => {
+  const store = open(); const task = store.ensure(input);
+  store.update(task.contextKey, task.version, { title: "Manual", titleSource: "manual", cardState: "ready", cardMessageId: 123, pinState: "pinned", lastResultMessageId: 124 });
+  store.moveTopic(task.contextKey, 43);
+  const moved = store.get("-100123:43");
+  expect(moved).toMatchObject({ taskId: task.taskId, title: "Manual", titleSource: "manual", messageThreadId: 43,
+    cardState: "none", cardMessageId: null, pinState: "none", lastResultMessageId: null });
+  expect(store.get(task.contextKey)).toBeNull();
+  store.moveTopic(task.contextKey, 43);
+  expect(store.get("-100123:43")).toEqual(moved);
+});
 beforeEach(() => { directory = mkdtempSync(path.join(tmpdir(), "topic-task-")); file = path.join(directory, "topic-tasks.sqlite"); stores = []; });
 afterEach(() => { for (const store of stores) store.close(); rmSync(directory, { recursive: true, force: true }); });
 

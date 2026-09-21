@@ -26,20 +26,20 @@ import {
 describe("ticketTopicName", () => {
   it("prefixes the ticket number and trims the summary", () => {
     expect(ticketTopicName(142, "Оплата не проходит по карте Мир, пишет ошибку 05")).toBe(
-      "#142 Оплата не проходит по карте Мир, пише…",
+      "💬 [Codex] #142 · Оплата не проходит по карте Мир, пише…",
     );
   });
 
   it("collapses whitespace so a multi-line complaint stays one line", () => {
-    expect(ticketTopicName(7, "Не грузится\n\n  корзина  ")).toBe("#7 Не грузится корзина");
+    expect(ticketTopicName(7, "Не грузится\n\n  корзина  ")).toBe("💬 [Codex] #7 · Не грузится корзина");
   });
 
   it("falls back to the number when the text is empty", () => {
-    expect(ticketTopicName(9, "   ")).toBe("#9 Без описания");
+    expect(ticketTopicName(9, "   ")).toBe("💬 [Codex] #9 · Без описания");
   });
 
   it("does not put a leaked API key in a topic name", () => {
-    expect(ticketTopicName(3, "ключ sk-ABCDEFGHIJKLMNOPQRSTUV не работает")).toBe("#3 Без описания");
+    expect(ticketTopicName(3, "ключ sk-ABCDEFGHIJKLMNOPQRSTUV не работает")).toBe("💬 [Codex] #3 · Без описания");
   });
 });
 
@@ -62,6 +62,10 @@ describe("extractTicketKey", () => {
     expect(extractTicketKey("Сломалось после ANT-6428, посмотри")).toBe("ANT-6428");
   });
 
+  it("preserves every segment of a Sentry short ID", () => {
+    expect(extractTicketKey("Sentry: MIR-BACK-366")).toBe("MIR-BACK-366");
+  });
+
   it("takes a bare hash number when there is no link", () => {
     expect(extractTicketKey("Смотри #142, там то же самое")).toBe("142");
   });
@@ -78,25 +82,25 @@ describe("extractTicketKey", () => {
 describe("ticketTopicName with a source key", () => {
   it("titles the topic with the source ticket key, not the internal number", () => {
     expect(ticketTopicName(1, PARTNERDEV_FORWARD)).toBe(
-      "#240 Critical Bug: Reclaimed ICCID Retains…",
+      "💬 [Codex] #240 · Critical Bug: Reclaimed ICCID Retains…",
     );
   });
 
   it("does not repeat a key the text already starts with", () => {
     expect(ticketTopicName(4, "ANT-6428 падает импорт партнёров")).toBe(
-      "ANT-6428 падает импорт партнёров",
+      "💬 [Codex] ANT-6428 · падает импорт партнёров",
     );
   });
 
   it("falls back to the internal number when no key is present", () => {
     expect(ticketTopicName(9, "Оплата не проходит по карте")).toBe(
-      "#9 Оплата не проходит по карте",
+      "💬 [Codex] #9 · Оплата не проходит по карте",
     );
   });
 
   it("uses an explicit source key even when it has multiple dashes", () => {
     expect(ticketTopicName(9, "Checkout failed in API", "MIR-BACK-2")).toBe(
-      "MIR-BACK-2 Checkout failed in API",
+      "💬 [Codex] MIR-BACK-2 · Checkout failed in API",
     );
   });
 });

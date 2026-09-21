@@ -240,7 +240,14 @@ function describe(error: unknown): string {
 }
 
 function definitiveDescription(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null || Array.isArray(error)) return undefined;
-  const response = error as { error_code?: unknown; description?: unknown };
-  return response.error_code === 400 && typeof response.description === "string" ? response.description : undefined;
+  const seen = new Set<object>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (typeof current !== "object" || current === null || Array.isArray(current) || seen.has(current)) return undefined;
+    seen.add(current);
+    const response = current as { error_code?: unknown; description?: unknown; cause?: unknown; error?: unknown };
+    if (response.error_code === 400 && typeof response.description === "string") return response.description;
+    current = response.error ?? response.cause;
+  }
+  return undefined;
 }

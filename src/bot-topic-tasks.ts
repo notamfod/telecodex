@@ -21,6 +21,7 @@ interface Options {
   isExcluded(destination: TaskDestination): boolean;
   gate?: Pick<TelegramBackgroundWriteGate, "run">;
   report(error: unknown): void;
+  renameTitle?(destination: TaskDestination, title: string): Promise<void>;
 }
 
 export function createBotTopicTasks(options: Options) {
@@ -87,13 +88,20 @@ export function createBotTopicTasks(options: Options) {
     && Number.isSafeInteger(destination.messageThreadId) && destination.messageThreadId > 1 && !options.isExcluded(destination);
   const key = (destination: TaskDestination) => `${destination.chatId}:${destination.messageThreadId}`;
   const rename = (destination: TaskDestination, requested: string, manual: boolean): Promise<boolean> => {
-    const title = safeTaskText(requested);
+    const metadata = options.metadata(destination);
+    const title = taskTopicName(requested, metadata?.workspace ?? options.workspace, metadata?.ticketKey);
     const context = key(destination);
     const next = (nameWrites.get(context) ?? Promise.resolve()).catch(() => {}).then(async () => {
-      const taskService = getService();
+      const taskService = getService(manual);
+      if (manual && !taskService?.store.get(context)) {
+        taskService?.store.ensure({ ...destination, workspace: metadata?.workspace ?? options.workspace,
+          threadId: metadata?.threadId ?? null, ticketId: metadata?.ticketId, title });
+        await taskService?.update(context, { enabled: false }, { render: false });
+      }
       if (!manual && taskService?.store.get(context)?.titleSource === "manual") return false;
       if (manual) await taskService?.update(context, { title, titleSource: "manual" }, { render: false });
       const change = async (name: string) => {
+        if (options.renameTitle) { await options.renameTitle(destination, name); return; }
         try { await write(destination, signal => options.api.editForumTopic(destination.chatId, destination.messageThreadId, { name }, signal as never)); }
         catch (error) {
           const description = (error as { description?: string })?.description;
@@ -115,13 +123,19 @@ export function createBotTopicTasks(options: Options) {
   };
   const manualTitle = async (destination: TaskDestination, title: string) => {
     if (!eligible(destination)) return;
-    await getService()?.update(key(destination), { title: safeTaskText(title), titleSource: "manual" });
+    const metadata = options.metadata(destination);
+    await getService()?.update(key(destination), { title: taskTopicName(title, metadata?.workspace ?? options.workspace, metadata?.ticketKey), titleSource: "manual" });
   };
   return {
+    topicTitle(destination: TaskDestination): string | undefined { return getService()?.store.get(key(destination))?.title; },
+    async moveTopic(destination: TaskDestination, messageThreadId: number): Promise<void> {
+      await nameWrites.get(key(destination));
+      await getService()?.moveTopic(key(destination), messageThreadId);
+    },
     registerTask(destination: TaskDestination, title: string): void {
       if (!eligible(destination)) return;
       const metadata = options.metadata(destination) ?? { workspace: options.workspace, threadId: null };
-      getService(true)!.store.ensure({ ...destination, ...metadata, title: safeTaskText(title) });
+      getService(true)!.store.ensure({ ...destination, ...metadata, title: taskTopicName(title, metadata.workspace, metadata.ticketKey) });
     },
     dashboardTasks(): import("./dashboard-task-model.js").DashboardTask[] {
       return (getService()?.store.list() ?? []).filter(eligible).map(task => {
@@ -196,7 +210,7 @@ export function createBotTopicTasks(options: Options) {
         if (args && !args.startsWith("title ")) { await reply("/task - карточка задачи\n/task title <название> - переименовать\n/task off - отключить обновления"); return; }
         const metadata = options.metadata(destination) ?? { workspace: options.workspace, threadId: null };
         const current = getService()?.store.get(key(destination));
-        const title = args.startsWith("title ") ? safeTaskText(args.slice(6))
+        const title = args.startsWith("title ") ? taskTopicName(args.slice(6), metadata.workspace, metadata.ticketKey)
           : current?.title ?? taskTopicName(metadata.topicName || "Задача", metadata.workspace, metadata.ticketKey);
         const taskService = getService(true)!;
         // Persist a manual override before activation can render or receive any automatic rename.
@@ -229,13 +243,14 @@ export function createBotTopicTasks(options: Options) {
     },
     async observeTopic(destination: TaskDestination, presence?: "open" | "closed", title?: string): Promise<void> {
       if (!eligible(destination)) return;
-      const namingInFlight = nameWrites.has(key(destination));
+      const metadata = options.metadata(destination);
+      if (title) title = taskTopicName(title, metadata?.workspace ?? options.workspace, metadata?.ticketKey);
       const taskService = getService();
       const intent = taskService?.store.getLifecycleIntent(key(destination));
       const pending = intent && intent.phase !== "complete" && intent.outcome !== "failed";
       await taskService?.update(key(destination), { ...(presence && !pending ? { presence } : {}), ...(title ? { title: safeTaskText(title), titleSource: "manual" as const } : {}) });
       if (pending) await controls?.lifecycle.reconcile(intent.operationId);
-      if (title && namingInFlight) await rename(destination, title, true);
+      if (title) await rename(destination, title, true);
     },
     async observe(job: TelegramJob, projection: TelegramJobStatusProjection, deliveries: readonly DeliveryPart[], destination: TaskDestination, waitingOn?: "input" | "approval", acceptanceOrder?: number): Promise<void> {
       if (eligible(destination)) await getService()?.observe(job, projection, deliveries, destination, waitingOn, acceptanceOrder);

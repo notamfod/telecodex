@@ -1,3 +1,4 @@
+import { taskTopicName } from "./task-title.js";
 import { TaskProvisioningService, TaskProvisioningStore } from "./task-provisioning.js";
 
 import { randomUUID } from "node:crypto";
@@ -61,7 +62,7 @@ export function prepareTicketLaunchPrompt(prompt: string, realm?: string): strin
 /** Ordered by how much each form can be trusted to be a real ticket reference. */
 const KEY_PATTERNS = [
   /\/issues\/(\d+)\b/i,
-  /\b([A-Z][A-Z0-9]{1,15}-\d+)\b/,
+  /\b([A-Z][A-Z0-9]{1,15}(?:-[A-Z][A-Z0-9]{1,15})*-\d+)\b/,
   /(?:^|\s)#(\d+)\b/,
 ];
 
@@ -139,13 +140,13 @@ export function groupTicketsByWorkspace<T extends { workspace: string }>(
   }));
 }
 
-export function ticketTopicName(id: number, text: string, externalKey?: string): string {
+export function ticketTopicName(id: number, text: string, externalKey?: string, workspace = "Codex"): string {
   const key = externalKey ?? extractTicketKey(text);
   const label = key ? formatKey(key) : `#${id}`;
   const summary = ticketSummary(text, key);
 
   if (!summary || containsSecret(summary)) {
-    return `${label} Без описания`;
+    return taskTopicName("Без описания", workspace, label);
   }
 
   const characters = [...summary];
@@ -153,7 +154,7 @@ export function ticketTopicName(id: number, text: string, externalKey?: string):
     characters.length <= MAX_TOPIC_SUMMARY
       ? summary
       : `${characters.slice(0, MAX_TOPIC_SUMMARY - 1).join("")}…`;
-  return `${label} ${trimmed}`;
+  return taskTopicName(trimmed, workspace, label);
 }
 
 function formatKey(key: string): string {
@@ -397,6 +398,7 @@ export interface Ticket {
   source: string;
   createdAt: number;
   startedAt?: number;
+  continuationPending?: boolean;
   resolvedAt?: number;
   supersedesId?: number;
   topicTitle?: string;
@@ -541,6 +543,7 @@ export class InboxStore {
     ticket.prompt = [ticket.prompt, "", "--- продолжение обращения ---", input.prompt].join("\n");
     ticket.source = input.source;
     delete ticket.startedAt;
+    ticket.continuationPending = true;
     delete ticket.resolvedAt;
     if (!this.save()) { this.data.tickets[String(id)] = previous; throw new Error("Inbox continuation persistence failed"); }
     return structuredClone(ticket);
@@ -588,6 +591,7 @@ export class InboxStore {
       return;
     }
     ticket.startedAt = now;
+    delete ticket.continuationPending;
     this.save();
   }
 

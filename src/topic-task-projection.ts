@@ -1,6 +1,6 @@
 import path from "node:path";
 import { escapeHTML } from "./format.js";
-import { containsSecret } from "./topic-sync.js";
+export { safeTaskText, taskTopicName } from "./task-title.js";
 import type { TelegramJobStatusProjection } from "./telegram-status-projection.js";
 import type { TopicTaskAgentState, TopicTaskRecord } from "./topic-task-store.js";
 
@@ -22,21 +22,6 @@ export function taskAgentState(projection: TelegramJobStatusProjection, waitingO
     case "delivery_failed": return "unknown";
     default: return "unknown";
   }
-}
-
-export function safeTaskText(value: string, limit = 128): string {
-  const normalized = value.replace(/\s+/gu, " ").trim();
-  if (!normalized || /[\u0000-\u001f\u007f]/u.test(normalized) || containsSecret(normalized)) {
-    throw new Error("Название должно быть непустым и не содержать секретов");
-  }
-  return [...normalized].slice(0, limit).join("");
-}
-
-export function taskTopicName(title: string, workspace: string, ticketKey?: string): string {
-  const prefix = safeTaskText(ticketKey || path.basename(workspace) || "Задача", 40);
-  const text = safeTaskText(title);
-  const body = text.startsWith(`${prefix} `) ? text.slice(prefix.length).replace(/^[ ·]+/u, "") : text;
-  return safeTaskText(`${prefix} · ${body || "Задача"}`);
 }
 
 const labels: Record<TopicTaskAgentState, string> = {

@@ -119,7 +119,87 @@ describe("registerInboxHandlers", () => {
     expect(getContextSession).not.toHaveBeenCalled();
   });
 
-  it("repairs a stale started flag without launching a second analysis for a bound thread", async () => {
+  it("recreates a deleted unstarted ticket topic before accepting its first Codex job", async () => {
+    const callbacks = new Map<string, (ctx: any) => Promise<void>>();
+    const createForumTopic = vi.fn(async () => ({ message_thread_id: 42 }));
+    const bot = {
+      command: vi.fn(),
+      callbackQuery: (pattern: RegExp, handler: (ctx: any) => Promise<void>) => callbacks.set(pattern.source, handler),
+      on: vi.fn(),
+      api: { createForumTopic },
+    };
+    const ticket = {
+      id: 7, externalKey: "MIR-7124", inboxContextKey: "-1001:3", workTopicId: 7,
+      workspace: "/work", launchProfileId: "default", prompt: "Investigate ticket safely", source: "telegram", createdAt: Date.now(),
+    };
+    const attachTopic = vi.fn((_id: number, workTopicId: number) => { ticket.workTopicId = workTopicId; });
+    const rebindThreadTopic = vi.fn();
+    const accept = vi.fn(async () => undefined);
+
+    registerInboxHandlers({
+      bot: bot as never,
+      config: { workspace: "/work", defaultLaunchProfileId: "default" } as never,
+      registry: {
+        listContexts: vi.fn(() => [{ contextKey: "-1001:7", threadId: null, workspace: "/work", launchProfileId: "default" }]),
+        rebindThreadTopic, setContextDefaults: vi.fn(),
+      } as never,
+      inbox: { getTicket: vi.fn(() => ticket), get: vi.fn(() => ({ launchProfileId: "default" })), attachTopic, markStarted: vi.fn() } as never,
+      topicActivity: { rememberIdleIcon: vi.fn() },
+      getContextSession: vi.fn(), isBusy: vi.fn(), handleTicketPrompt: vi.fn(), handleCanonicalTicketPrompt: accept,
+      topicIsAlive: vi.fn(async () => false), sendText: vi.fn(), safeReply: vi.fn(),
+    });
+    const ctx = {
+      match: ["ticket_start:7", "7"], chat: { id: -1001 }, callbackQuery: { message: { message_thread_id: 7 } },
+      answerCallbackQuery: vi.fn(async () => undefined), editMessageReplyMarkup: vi.fn(async () => undefined),
+    };
+
+    await callbacks.get("^ticket_start:(\\d+)$")!(ctx);
+
+    expect(createForumTopic).toHaveBeenCalledOnce();
+    expect(attachTopic).toHaveBeenCalledWith(7, 42);
+    expect(rebindThreadTopic).toHaveBeenCalledWith("-1001:7", "-1001:42");
+    expect(accept).toHaveBeenCalledWith(ctx, expect.objectContaining({ workTopicId: 42 }), {
+      chatId: -1001, messageThreadId: 42,
+    });
+  });
+
+  it("restores a deleted unstarted ticket topic during startup reconciliation", async () => {
+    const createForumTopic = vi.fn(async () => ({ message_thread_id: 42 }));
+    const ticket = {
+      id: 7, externalKey: "MIR-7124", inboxContextKey: "-1001:3", workTopicId: 7,
+      workspace: "/work", launchProfileId: "default", prompt: "Investigate ticket safely", source: "telegram", createdAt: Date.now(),
+    };
+    const attachTopic = vi.fn((_id: number, workTopicId: number) => { ticket.workTopicId = workTopicId; });
+    const rebindThreadTopic = vi.fn();
+    const sendText = vi.fn(async () => undefined);
+
+    const handlers = registerInboxHandlers({
+      bot: { command: vi.fn(), callbackQuery: vi.fn(), on: vi.fn(), api: { createForumTopic } } as never,
+      config: { workspace: "/work", defaultLaunchProfileId: "default" } as never,
+      registry: {
+        listContexts: vi.fn(() => [{ contextKey: "-1001:7", threadId: null, workspace: "/work", launchProfileId: "default" }]),
+        rebindThreadTopic,
+      } as never,
+      inbox: {
+        getTicket: vi.fn(() => ticket), get: vi.fn(() => ({ launchProfileId: "default" })),
+        listUnresolved: vi.fn(() => [ticket]), attachTopic,
+      } as never,
+      topicActivity: { rememberIdleIcon: vi.fn() },
+      getContextSession: vi.fn(), isBusy: vi.fn(), handleTicketPrompt: vi.fn(),
+      topicIsAlive: vi.fn(async () => false), sendText, safeReply: vi.fn(),
+    });
+
+    await expect(handlers.recoverUnstartedTicketTopics()).resolves.toEqual([7]);
+    expect(createForumTopic).toHaveBeenCalledOnce();
+    expect(attachTopic).toHaveBeenCalledWith(7, 42);
+    expect(rebindThreadTopic).toHaveBeenCalledWith("-1001:7", "-1001:42");
+    expect(sendText).toHaveBeenCalledWith(-1001, expect.stringContaining("Топик восстановлен"), expect.objectContaining({
+      messageThreadId: 42,
+    }));
+    await handlers.dispose();
+  });
+
+  it.each([false, true])("handles a bound thread with pending continuation=%s", async (continuationPending) => {
     const callbacks = new Map<string, (ctx: any) => Promise<void>>();
     const bot = {
       command: vi.fn(),
@@ -131,6 +211,7 @@ describe("registerInboxHandlers", () => {
     };
     const ticket = {
       id: 9,
+      continuationPending,
       inboxContextKey: "-1001:3",
       workTopicId: 11,
       workspace: "/work",
@@ -153,7 +234,7 @@ describe("registerInboxHandlers", () => {
       bot: bot as never,
       config: { workspace: "/work", defaultLaunchProfileId: "default" } as never,
       registry: {
-        listContexts: vi.fn(() => [{ contextKey: "-1001:11", threadId: "thread-existing" }]),
+        listContexts: vi.fn(() => [{ contextKey: "-1001:11", threadId: "thread-existing", workspace: "/existing-work", launchProfileId: "existing-profile" }]),
         setContextDefaults: vi.fn(),
       } as never,
       inbox: { getTicket: vi.fn(() => ticket), get: vi.fn(() => undefined), markStarted } as never,
@@ -170,8 +251,11 @@ describe("registerInboxHandlers", () => {
     await callbacks.get("^ticket_start:(\\d+)$")!(ctx);
 
     expect(markStarted).toHaveBeenCalledWith(9);
-    expect(accept).not.toHaveBeenCalled();
-    expect(ctx.answerCallbackQuery).toHaveBeenCalledWith({ text: "Разбор уже запускали" });
+    expect(accept).toHaveBeenCalledTimes(continuationPending ? 1 : 0);
+    if (continuationPending) expect(accept).toHaveBeenCalledWith(ctx, expect.objectContaining({ workspace: "/existing-work", launchProfileId: "existing-profile" }));
+    expect(ctx.answerCallbackQuery).toHaveBeenCalledWith({ text: continuationPending ? "Запускаю разбор..." : "Разбор уже запускали" });
+    await callbacks.get("^ticket_start:(\\d+)$")!(ctx);
+    expect(accept).toHaveBeenCalledTimes(continuationPending ? 1 : 0);
   });
 
   it.each([

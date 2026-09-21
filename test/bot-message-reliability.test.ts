@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -32,7 +32,11 @@ describe("canonical Telegram message routing", () => {
     expect(subject.getOrCreate).not.toHaveBeenCalled();
     expect(subject.apiCalls.filter(([method]) => method === "pinChatMessage")).toHaveLength(1);
     await subject.bot.handleUpdate(messageUpdate(902, { forum_topic_edited: { name: "Ручное имя" } }));
-    await vi.waitFor(() => expect(subject.bot.taskCards?.getManualTitle({ chatId: -1001, messageThreadId: 7 })).toBe("Ручное имя"));
+    await vi.waitFor(() => expect(subject.bot.taskCards?.getManualTitle({ chatId: -1001, messageThreadId: 7 })).toBe(`💬 [${path.basename(subject.workspace)}] · Ручное имя`));
+    await vi.waitFor(() => expect(subject.apiCalls).toContainEqual(["editForumTopic", {
+      chat_id: -1001, message_thread_id: 7, name: `💬 [${path.basename(subject.workspace)}] · Ручное имя`,
+    }]));
+    expect(subject.contexts.get("-1001:7")?.topicName).toBe(`💬 [${path.basename(subject.workspace)}] · Ручное имя`);
     await subject.bot.taskCards?.dispose();
   });
   it("does not construct the legacy JSON job store or prompt correctness owner", () => {
@@ -375,6 +379,23 @@ describe("canonical Telegram control routing", () => {
 });
 
 describe("canonical callback work routing", () => {
+  it.each([undefined, "289"])("launches inbox tickets with content in the title (key %s)", async externalKey => {
+    const subject = harness({ telegramForumChatId: -1001 }, {}, workspace => {
+      mkdirSync(path.join(workspace, ".telecodex"), { recursive: true });
+      writeFileSync(path.join(workspace, ".telecodex/inbox.json"), JSON.stringify({
+        nextTicketId: 318, inboxes: {}, tickets: { "317": {
+          id: 317, externalKey, workTopicId: 7, inboxContextKey: "-1001:9",
+          workspace: "/repo/antwerp", createdAt: 1,
+          prompt: "--- начало обращения ---\nDashboard date filter broken\n--- конец обращения ---",
+        } },
+      }));
+    });
+    await subject.bot.handleUpdate(callbackUpdate(906, "ticket_start:317"));
+    expect(subject.reliability.handleWork).toHaveBeenCalledWith(expect.objectContaining({
+      sessionDefaults: expect.objectContaining({ topicName: `💬 [antwerp] #${externalKey ?? 317} · Dashboard date filter broken` }),
+    }));
+    await subject.bot.disposeTaskProvisioning?.();
+  });
   it("validates the Sentry recipe and durably targets a dedicated readonly topic", async () => {
     const recipePath = path.join(mkdtempSync(path.join(tmpdir(), "telecodex-recipes-")), "recipes.json");
     workspaces.push(path.dirname(recipePath));
@@ -406,7 +427,7 @@ describe("canonical callback work routing", () => {
       attachment: null,
       retryOfJobId: null,
       sessionDefaults: expect.objectContaining({ workspace: "/srv/mircli", launchProfileId: "readonly" }),
-      targetProvision: { kind: "forum_topic", topicName: "🔎 MIR-BACK-2VY · Sentry", state: "planned" },
+      targetProvision: { kind: "forum_topic", topicName: "🔎 [mircli] MIR-BACK-2VY · Sentry", state: "planned" },
     }));
     expect(subject.reliability.handleWork.mock.calls[0]![0].updateId).toBeGreaterThanOrEqual(
       5_000_000_000_000_000,
@@ -485,11 +506,17 @@ describe("canonical callback work routing", () => {
 function harness(
   configOverrides: Record<string, unknown> = {},
   botOptions: TeleCodexBotOptions = {},
+  setup?: (workspace: string) => void,
 ) {
   const workspace = mkdtempSync(path.join(tmpdir(), "telecodex-message-routing-"));
   workspaces.push(workspace);
+  setup?.(workspace);
   const getOrCreate = vi.fn(async () => { throw new Error("session must not be opened"); });
-  const setContextDefaults = vi.fn();
+  const contexts = new Map<string, { contextKey: string; workspace: string; threadId: string | null; topicName?: string }>();
+  const setContextDefaults = vi.fn((key: string, defaults: { workspace: string; topicName?: string }) => {
+    contexts.set(key, { contextKey: key, threadId: null, ...defaults });
+  });
+  const nameRequest = vi.fn(async () => ({}));
   const reliability = {
     handleWork: vi.fn(async (source: TelegramWorkSource) => source.targetProvision
       ? { chatId: source.chatId, messageThreadId: 91 }
@@ -509,7 +536,10 @@ function harness(
   } satisfies TelegramBotReliability;
   const bot = createBot(
     { ...config(workspace), ...configOverrides },
-    { onRemove: vi.fn(), getOrCreate, setContextDefaults, listContexts: () => [] } as never,
+    { onRemove: vi.fn(), getOrCreate, setContextDefaults, setContextDefaultsDurably: setContextDefaults,
+      listContexts: () => [...contexts.values()], hasMetadata: (key: string) => contexts.has(key),
+      setTopicNameDurably: (key: string, topicName: string) => { contexts.get(key)!.topicName = topicName; },
+      getAppServerClient: () => ({ request: nameRequest }) } as never,
     reliability,
     botOptions,
   );
@@ -527,7 +557,7 @@ function harness(
   });
   bot.api.config.use(apiCall as never);
   expect(reliability.registerCompletionProcessor).toHaveBeenCalledOnce();
-  return { bot, reliability, getOrCreate, setContextDefaults, apiCalls, apiCall, workspace };
+  return { bot, reliability, getOrCreate, setContextDefaults, apiCalls, apiCall, workspace, contexts, nameRequest };
 }
 
 function config(workspace: string) {

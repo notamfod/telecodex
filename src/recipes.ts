@@ -1,3 +1,4 @@
+import { taskTopicName } from "./task-title.js";
 import { escapeHTML } from "./format.js";
 
 /**
@@ -273,17 +274,10 @@ export function renderRunHTML(run: {
   return [header, blocks.join("\n\n"), footer].filter(Boolean).join("\n\n");
 }
 
-/** Telegram rejects a longer forum topic name. */
-const MAX_TOPIC_NAME = 128;
-
-export function fixTopicName(finding: Finding): string {
+export function fixTopicName(finding: Finding, workspace = "Codex"): string {
   const file = finding.file.split("/").at(-1) ?? finding.file;
   const location = finding.line === undefined ? file : `${file}:${finding.line}`;
-  const name = `\u{1F527} ${location} \u00B7 ${finding.category}`;
-  const characters = [...name];
-  return characters.length <= MAX_TOPIC_NAME
-    ? name
-    : `${characters.slice(0, MAX_TOPIC_NAME - 1).join("")}\u2026`;
+  return taskTopicName(`🛠 ${location} · ${finding.category}`, workspace);
 }
 
 /**

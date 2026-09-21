@@ -22,7 +22,7 @@ describe("buildTopicName", () => {
   it("uses the workspace basename and a normalized title", () => {
     const value = buildTopicName(thread({ title: "  Multi-line\n\n title  " }));
 
-    expect(value).toBe(`${basename("/srv/projects/storefront")} · Multi-line title`);
+    expect(value).toBe(`💬 [${basename("/srv/projects/storefront")}] · Multi-line title`);
   });
 
   it("does not expose Telegram bot tokens in topic names", () => {
@@ -30,7 +30,7 @@ describe("buildTopicName", () => {
       thread({ title: "Configure bot 1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghi" }),
     );
 
-    expect(value).toBe("storefront · Session 019fda52");
+    expect(value).toBe("💬 [storefront] · Session 019fda52");
     expect(value).not.toContain("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
   });
 
@@ -42,7 +42,7 @@ describe("buildTopicName", () => {
       }),
     );
 
-    expect(value).toBe("Codex · Session 019fda52");
+    expect(value).toBe("💬 [Codex] · Session 019fda52");
     expect(value).not.toContain("8603016081");
   });
 
@@ -78,7 +78,7 @@ describe("TopicSynchronizer", () => {
     const result = await synchronizer.syncOnce();
 
     expect(result).toEqual({ created: 1, skipped: 1, failed: 0 });
-    expect(createForumTopic).toHaveBeenCalledWith(-100123, "storefront · Second");
+    expect(createForumTopic).toHaveBeenCalledWith(-100123, "💬 [storefront] · Second");
     expect(bindThread).toHaveBeenCalledWith("-100123:42", second);
   });
 

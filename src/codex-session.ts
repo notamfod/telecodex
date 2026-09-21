@@ -227,6 +227,10 @@ export class CodexSessionService {
     return this.currentWorkspace;
   }
 
+  setTopicName(name: string): void {
+    this.topicName = name;
+  }
+
   applyDeferredDefaults(input: {
     readonly workspace: string;
     readonly launchProfileId?: string;

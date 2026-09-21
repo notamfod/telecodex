@@ -1,3 +1,4 @@
+import { safeTaskText } from "./task-title.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -89,6 +90,8 @@ export class SessionRegistry {
         session.dispose();
         throw new Error("Telegram session context changed");
       }
+      const latestName = this.metadata.get(contextKey)?.topicName;
+      if (latestName && latestName !== meta?.topicName) session.setTopicName(latestName);
       this.sessions.set(contextKey, session);
       if (session.getInfo().threadId) {
         this.updateMetadata(contextKey, session);
@@ -118,6 +121,7 @@ export class SessionRegistry {
     this.metadata.set(contextKey, {
       contextKey,
       threadId: info.threadId,
+      topicName: this.metadata.get(contextKey)?.topicName,
       workspace: info.workspace,
       model: info.model,
       modelProvider: info.modelProvider,
@@ -127,6 +131,16 @@ export class SessionRegistry {
       updatedAt: Date.now(),
     });
     this.persistMetadata();
+  }
+
+  setTopicNameDurably(contextKey: TelegramContextKey, title: string): void {
+    const name = safeTaskText(title);
+    const previous = this.metadata.get(contextKey);
+    if (!previous) throw new Error("Topic context missing");
+    this.metadata.set(contextKey, { ...previous, topicName: name });
+    try { this.persistMetadataReplaceSafe(); }
+    catch (error) { this.metadata.set(contextKey, previous); throw error; }
+    this.sessions.get(contextKey)?.setTopicName(name);
   }
 
   /** The shared app-server connection, for callers that ask it about threads we did not start. */
@@ -174,7 +188,7 @@ export class SessionRegistry {
       threadId: null,
       workspace: defaults.workspace,
       launchProfileId: defaults.launchProfileId,
-      topicName: defaults.topicName,
+      topicName: defaults.topicName ?? this.metadata.get(contextKey)?.topicName,
       updatedAt: Date.now(),
     });
     this.persistMetadata();
@@ -190,7 +204,7 @@ export class SessionRegistry {
     if (defaults.launchProfileId && !findLaunchProfile(this.config.launchProfiles, defaults.launchProfileId)) throw new Error("Unknown launch profile");
     const previous = this.metadata.get(contextKey);
     this.metadata.set(contextKey, {
-      contextKey, threadId: null, ...defaults, updatedAt: Date.now(),
+      contextKey, threadId: null, ...defaults, topicName: defaults.topicName ?? previous?.topicName, updatedAt: Date.now(),
     });
     try { this.persistMetadataReplaceSafe(); }
     catch (error) {
@@ -220,16 +234,19 @@ export class SessionRegistry {
   rebindThreadTopic(
     oldContextKey: TelegramContextKey,
     newContextKey: TelegramContextKey,
-    thread: CodexThreadRecord,
+    thread?: CodexThreadRecord,
   ): void {
     if (oldContextKey === newContextKey) {
       throw new Error("Telegram topic rebind requires a new context");
     }
     const previous = new Map(this.metadata);
     const oldMetadata = this.metadata.get(oldContextKey);
-    const reboundMetadata = oldMetadata?.threadId === thread.id
+    if (!thread && (!oldMetadata || this.metadata.has(newContextKey))) {
+      throw new Error("Topic context missing or destination already bound");
+    }
+    const reboundMetadata = oldMetadata && (!thread || oldMetadata.threadId === thread.id)
       ? { ...oldMetadata, contextKey: newContextKey }
-      : this.threadMetadata(newContextKey, thread);
+      : this.threadMetadata(newContextKey, thread!);
     this.metadata.delete(oldContextKey);
     this.metadata.set(newContextKey, reboundMetadata);
     try {

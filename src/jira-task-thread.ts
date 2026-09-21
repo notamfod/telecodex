@@ -1,3 +1,4 @@
+import { taskTopicName } from "./task-title.js";
 import { ForumTopicAvailabilityUnknownError } from "./telegram-topic-liveness.js";
 import type { InboxStore, Ticket } from "./inbox.js";
 import type { JiraIssue } from "./jira-client.js";
@@ -12,7 +13,6 @@ export interface JiraTaskCallback {
 const CALLBACK_PREFIX = "jtask:";
 const RECIPE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const ISSUE_KEY_PATTERN = /^[A-Z][A-Z0-9]{1,15}-\d+$/;
-const MAX_TOPIC_NAME_LENGTH = 128;
 const pendingThreads = new WeakMap<InboxStore, Map<string, Promise<JiraTaskThreadResult>>>();
 
 export interface JiraTaskThreadInput {
@@ -105,15 +105,15 @@ async function createJiraTaskThread(
   if (existing?.workTopicId) {
     try {
       if (await dependencies.topicIsAlive(existing.workTopicId)) {
-        return makeResult(false, input.chatId, existing, jiraTaskTopicName(input.issue));
+        return makeResult(false, input.chatId, existing, jiraTaskTopicName(input.issue, input.workspace));
       }
     } catch (error) {
       if (!(error instanceof ForumTopicAvailabilityUnknownError)) throw error;
-      return { ...makeResult(false, input.chatId, existing, jiraTaskTopicName(input.issue)), availability: "unknown" };
+      return { ...makeResult(false, input.chatId, existing, jiraTaskTopicName(input.issue, input.workspace)), availability: "unknown" };
     }
   }
 
-  const topicName = jiraTaskTopicName(input.issue);
+  const topicName = jiraTaskTopicName(input.issue, input.workspace);
   const ticket = dependencies.inbox.createTicket({
     externalKey: input.issue.key,
     inboxContextKey: input.sourceContextKey,
@@ -156,11 +156,8 @@ function makeResult(
   };
 }
 
-export function jiraTaskTopicName(issue: JiraIssue): string {
-  const base = `${issue.key.toUpperCase()} · ${issue.summary.replace(/\s+/g, " ").trim()}`;
-  const characters = [...base];
-  if (characters.length <= MAX_TOPIC_NAME_LENGTH) return base;
-  return `${characters.slice(0, MAX_TOPIC_NAME_LENGTH - 1).join("")}…`;
+export function jiraTaskTopicName(issue: JiraIssue, workspace = "Codex"): string {
+  return taskTopicName(issue.summary, workspace, issue.key.toUpperCase());
 }
 
 function buildJiraTaskPrompt(issue: JiraIssue, jiraClient: string): string {

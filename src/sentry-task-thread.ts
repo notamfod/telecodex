@@ -1,3 +1,4 @@
+import { taskTopicName } from "./task-title.js";
 const CALLBACK_PREFIX = "sentry_task:";
 const SHORT_ID_PATTERN = /^[A-Z0-9][A-Z0-9-]{1,40}$/;
 
@@ -37,11 +38,11 @@ export function parseSentryTaskCallback(data: string): SentryTaskCallback | null
   return { issueId, shortId };
 }
 
-export function sentryTaskTopicName(shortId: string): string {
+export function sentryTaskTopicName(shortId: string, workspace = "mircli"): string {
   if (!SHORT_ID_PATTERN.test(shortId)) {
     throw new Error("Invalid Sentry short id");
   }
-  return `🔎 ${shortId} · Sentry`;
+  return taskTopicName("Sentry", workspace, shortId);
 }
 
 export function buildSentryAnalysisPrompt(issueId: string, shortId: string, realm = "mircli"): string {
@@ -63,8 +64,9 @@ export async function openSentryTaskThread(
   issue: SentryTaskCallback,
   dependencies: OpenSentryTaskDependencies,
   realm = "mircli",
+  workspace = realm,
 ): Promise<{ topicId: number; topicName: string }> {
-  const topicName = sentryTaskTopicName(issue.shortId);
+  const topicName = sentryTaskTopicName(issue.shortId, workspace);
   const topicId = await dependencies.createTopic(topicName);
   await dependencies.initializeTopic(topicId, topicName);
   await dependencies.startAnalysis(

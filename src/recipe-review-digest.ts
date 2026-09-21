@@ -136,19 +136,15 @@ export function recipeDigestKeyboard(
   runId: number,
   findings: Finding[],
   page: number,
-  mutedIndices: ReadonlySet<number> = new Set(),
+  _mutedIndices: ReadonlySet<number> = new Set(),
 ): RecipeDigestKeyboard {
   const current = boundedPage(findings, page);
   const totalPages = pageCount(findings);
   const rows = pageSlice(findings, current).map(({ finding, index }) => [
     {
-      text: `${index + 1} · ${finding.priority ?? finding.severity} · ${finding.category}`.slice(0, 40),
-      callback_data: `rdetail:${runId}:${index}`,
+      text: `▶ ${index + 1} · ${finding.priority ?? finding.severity} · ${finding.category}`.slice(0, 64),
+      callback_data: `rfix:${runId}:${index}`,
     },
-    { text: "🔧", callback_data: `rfix:${runId}:${index}` },
-    mutedIndices.has(index)
-      ? { text: "✅", callback_data: `rnoop:${runId}` }
-      : { text: "🔇", callback_data: `rdmute:${runId}:${index}` },
   ]);
   if (totalPages > 1) {
     rows.push([
@@ -178,17 +174,16 @@ export function renderRecipeFindingDetailHTML(
 export function recipeFindingDetailKeyboard(
   runId: number,
   index: number,
-  muted = false,
+  _muted = false,
 ): RecipeDigestKeyboard {
   const back = [{
     text: "← К списку",
     callback_data: `rpage:${runId}:${Math.floor(index / RECIPE_DIGEST_PAGE_SIZE)}`,
   }];
   return {
-    inline_keyboard: muted ? [back] : [
+    inline_keyboard: [
       [
-        { text: "🔧 Тред-фикс", callback_data: `rfix:${runId}:${index}` },
-        { text: "🔇 Игнорировать", callback_data: `rmute:${runId}:${index}` },
+        { text: "▶ Запустить", callback_data: `rfix:${runId}:${index}` },
       ],
       back,
     ],

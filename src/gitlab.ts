@@ -1,9 +1,8 @@
+import { taskTopicName } from "./task-title.js";
 import { escapeHTML } from "./format.js";
 
 /** Telegram truncates button labels past 64 code points. */
 const MAX_BUTTON_LABEL = 64;
-/** Shorter than Telegram's 128 limit, so the topic list stays readable. */
-const MAX_TOPIC_TITLE = 40;
 
 export interface MergeRequestSummary {
   projectId: number;
@@ -121,8 +120,8 @@ function projectFromReference(reference?: string): string {
   return withoutIid.split("/").filter(Boolean).pop() ?? "проект";
 }
 
-export function mergeRequestTopicName(mr: MergeRequestSummary): string {
-  return `!${mr.iid} ${mr.project}: ${shorten(titleWithDraft(mr), MAX_TOPIC_TITLE)}`;
+export function mergeRequestTopicName(mr: MergeRequestSummary, workspace = mr.project): string {
+  return taskTopicName(`🔎 ${titleWithDraft(mr)}`, workspace, `!${mr.iid}`);
 }
 
 export function mergeRequestButtons(

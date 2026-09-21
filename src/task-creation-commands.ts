@@ -1,3 +1,4 @@
+import { taskTopicName } from "./task-title.js";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { InlineKeyboard, type Bot, type Context } from "grammy";
@@ -131,11 +132,12 @@ export function registerTaskCreationCommands(bot: Bot, deps: TaskCreationDepende
     }
     if (!selectionValid) { await ctx.editMessageText("Проект или стартовый режим изменился. Создайте новую заявку командой /newtask или /extract."); return; }
     const selected = draft.choices[draft.selected];
+    const title = taskTopicName(draft.title, selected.workspace);
     draft.state = "creating"; save(draft);
     const result = await deps.provisioning().provision({ operationId: draft.operationId, sourceContextKey: draft.sourceContextKey,
-      sourceMessageIds: [draft.sourceMessageId ?? draft.commandMessageId], title: draft.title, workspace: selected.workspace, launchProfileId: selected.profileId, userId: draft.userId, kind: draft.kind,
+      sourceMessageIds: [draft.sourceMessageId ?? draft.commandMessageId], title, workspace: selected.workspace, launchProfileId: selected.profileId, userId: draft.userId, kind: draft.kind,
       metadata: { previewMessageId: draft.previewMessageId, sourceMessageId: draft.sourceMessageId, sourceContextKey: draft.sourceContextKey } }, {
-      createTopic: async () => (await ctx.api.createForumTopic(draft.chatId, draft.title)).message_thread_id,
+      createTopic: async () => (await ctx.api.createForumTopic(draft.chatId, title)).message_thread_id,
       bind: async record => {
         const messageThreadId = record.messageThreadId!;
         deps.registry.setContextDefaultsDurably(contextKeyFromMessage(draft.chatId, messageThreadId), { workspace: record.workspace, launchProfileId: record.launchProfileId, topicName: record.title });

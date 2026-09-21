@@ -1,4 +1,4 @@
-import { ForumTopicAvailabilityUnknownError } from "./telegram-topic-liveness.js";
+import { reuseInboxTopic } from "./inbox-topic-reuse.js";
 import { registerInboxCommands } from "./bot-inbox-commands.js";
 import { TaskProvisioningService, TaskProvisioningStore } from "./task-provisioning.js";
 
@@ -40,10 +40,11 @@ import {
 import { isSafeProjectContext, loadDofboxRealmContext } from "./project-context.js";
 import { topicUrl } from "./projects.js";
 import type { SessionRegistry } from "./session-registry.js";
-import { formatTelegramErrorLog, type TelegramLogCategory } from "./telegram-error-log.js";
+import { formatTelegramErrorLog, inspectTelegramErrorForLog, type TelegramLogCategory } from "./telegram-error-log.js";
 
 const INBOX_QUIET_MS = 2_000;
 const INBOX_TOPIC_PAUSE_MS = 3_000;
+const UNSTARTED_TICKET_RECOVERY_WINDOW_MS = 24 * 60 * 60 * 1_000;
 
 type InboxAttemptProgress = InboxProgress & { category?: TelegramLogCategory };
 
@@ -87,13 +88,20 @@ export interface RegisterInboxHandlersDeps {
     session: CodexSessionService,
     ticket: Ticket,
   ): Promise<void>;
-  handleCanonicalTicketPrompt?(ctx: Context, ticket: Ticket): Promise<void>;
+  handleCanonicalTicketPrompt?(
+    ctx: Context,
+    ticket: Ticket,
+    targetContext?: { chatId: number; messageThreadId: number },
+  ): Promise<void>;
   topicIsAlive(chatId: number, messageThreadId: number): Promise<boolean>;
   sendText(chatId: number, text: string, options?: TextOptions): Promise<unknown>;
   safeReply(ctx: Context, text: string, options?: TextOptions): Promise<void>;
 }
 
-export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): { dispose(): Promise<void> } {
+export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): {
+  dispose(): Promise<void>;
+  recoverUnstartedTicketTopics(): Promise<number[]>;
+} {
   const { bot, config, registry, inbox, jiraComment, topicActivity } = deps;
   const provisioning = (typeof deps.provisioning === "function" ? deps.provisioning() : deps.provisioning) ?? inbox.getProvisioningService?.() ?? new TaskProvisioningService(new TaskProvisioningStore(":memory:"));
   let stopping = false;
@@ -142,16 +150,22 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): { dispos
       await bot.api.forwardMessage(first.chatId, first.chatId, item.messageId, { message_thread_id: threadId });
     }
   };
-  const appendToTicket = async (ticket: Ticket, group: InboxItem[], text: string, source: string): Promise<void> => {
+  const appendToTicket = async (ticket: Ticket, group: InboxItem[], text: string, source: string): Promise<boolean> => {
     const first = group[0]!;
     const card = [`➕ <b>Дополнение к ${escapeHTML(ticketHeading(ticket))}</b>`, `Источник: ${escapeHTML(source)}`, "", escapeHTML(text || "(без текста, см. пересланные сообщения ниже)")].join("\n");
-    await deps.sendText(first.chatId, card, { messageThreadId: ticket.workTopicId, fallbackText: `Дополнение к ${ticketHeading(ticket)}. Источник: ${source}` });
-    await forwardAttachments(group, ticket.workTopicId);
+    try {
+      await deps.sendText(first.chatId, card, { messageThreadId: ticket.workTopicId, fallbackText: `Дополнение к ${ticketHeading(ticket)}. Источник: ${source}` });
+      await forwardAttachments(group, ticket.workTopicId);
+    } catch (error) {
+      if (inspectTelegramErrorForLog(error, "inbox").category === "topic_missing") return false;
+      throw error;
+    }
     const url = topicUrl(first.chatId, ticket.workTopicId);
     await deps.sendText(first.chatId, `Уже заведён <a href="${url}">${escapeHTML(ticketHeading(ticket))}</a> — добавил туда.`, {
       messageThreadId: parseContextKey(first.contextKey).messageThreadId,
       fallbackText: `${ticketHeading(ticket)}: ${url}`,
     });
+    return true;
   };
   const createTicketAttempt = async (group: InboxItem[], options: {
     skipDuplicateCheck?: boolean;
@@ -170,34 +184,17 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): { dispos
     if (previousOperation?.state === "ready") return;
     if (externalKey && !options.skipDuplicateCheck && !previousOperation) {
       const candidates = inbox.listTicketsByKey(first.contextKey, externalKey);
-      for (const candidate of candidates) {
-        if (candidate.resolvedAt !== undefined || !candidate.workTopicId) continue;
-        let reusable: boolean;
-        try { reusable = await deps.topicIsAlive(first.chatId, candidate.workTopicId); }
-        catch (error) {
-          if (!(error instanceof ForumTopicAvailabilityUnknownError)) throw error;
-          // The binding chooses the destination; the requested append establishes delivery.
-          // Its durable bound intent below prevents replay after an ambiguous response.
-          reusable = true;
-        }
-        if (reusable) {
-          progress.outcome = "topic_exists";
-          progress.workTopicId = candidate.workTopicId;
-          provisioning.store.accept({ operationId, sourceContextKey: first.contextKey, sourceMessageIds: group.map(item => item.messageId), title: ticketTopicName(candidate.id, text, candidate.externalKey), workspace: settings.workspace, launchProfileId: settings.launchProfileId, kind: "inbox", metadata: { ticketId: candidate.id } });
-          provisioning.store.patch(operationId, { state: "bound", messageThreadId: candidate.workTopicId });
-          try { await appendToTicket(candidate, group, text, source); }
-          catch (error) {
-            // Several sends may already have succeeded, even if a later one was rejected.
-            provisioning.store.patch(operationId, { state: "unknown", failureStage: "ready" });
-            progress.outcome = "processing_failed";
-            throw error;
-          }
-          provisioning.store.patch(operationId, { state: "ready" });
-          return;
-        }
-      }
+      const reuse = await reuseInboxTopic({
+        candidates, store: provisioning.store,
+        input: { operationId, sourceContextKey: first.contextKey, sourceMessageIds: group.map(item => item.messageId), title: ticketTopicName(candidates[0]?.id ?? 1, text, externalKey, settings.workspace), workspace: settings.workspace, launchProfileId: settings.launchProfileId, kind: "inbox" },
+        topicIsAlive: topicId => deps.topicIsAlive(first.chatId, topicId),
+        append: candidate => appendToTicket(candidate, group, text, source),
+        onDestination: candidate => { progress.outcome = "processing_failed"; progress.workTopicId = candidate.workTopicId; },
+      });
+      if (reuse.appended) return;
+      if (reuse.continueTicketId) options = { ...options, continueTicketId: reuse.continueTicketId };
       const previous = candidates[0];
-      if (previous) {
+      if (previous && !options.continueTicketId) {
         const decisionId = nextDuplicateDecisionId++;
         pendingDuplicateDecisions.set(decisionId, { group, previousTicketId: previous.id });
         provisioning.store.setPending(`duplicate:${decisionId}`, { group, previousTicketId: previous.id });
@@ -211,8 +208,9 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): { dispos
       }
     }
     const prompt = buildTicketPrompt(settings.template, { source, message: text, projectContext: projectContextForTicket(settings) });
-    const continued = options.continueTicketId ? inbox.getTicket(options.continueTicketId) : undefined;
-    if (options.continueTicketId && !continued) throw new Error(`Ticket ${options.continueTicketId} no longer exists`);
+    const continueTicketId = options.continueTicketId ?? (Number(previousOperation?.metadata?.continueTicketId) || undefined);
+    const continued = continueTicketId ? inbox.getTicket(continueTicketId) : undefined;
+    if (continueTicketId && !continued) throw new Error(`Ticket ${continueTicketId} no longer exists`);
     const existingTicket = previousOperation?.metadata?.ticketId ? inbox.getTicket(Number(previousOperation.metadata.ticketId)) : undefined;
     const pending = existingTicket ?? continued ?? inbox.createTicket({
       inboxContextKey: first.contextKey,
@@ -224,12 +222,12 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): { dispos
       source,
       supersedesId: options.supersedesId,
     });
-    const topicName = ticketTopicName(pending.id, text, pending.externalKey);
+    const topicName = ticketTopicName(pending.id, text, pending.externalKey, settings.workspace);
     let ticket = pending;
     const result = await provisioning.provision({
       operationId, sourceContextKey: first.contextKey, sourceMessageIds: group.map(item => item.messageId),
       title: topicName, workspace: settings.workspace, launchProfileId: settings.launchProfileId,
-      kind: "inbox", metadata: { ticketId: pending.id },
+      kind: "inbox", metadata: { ticketId: pending.id, continueTicketId, previousWorkTopicId: previousOperation?.metadata?.previousWorkTopicId ?? continued?.workTopicId },
     }, {
       createTopic: async () => {
         progress.outcome = "creation_unknown";
@@ -241,11 +239,24 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): { dispos
         progress.outcome = "topic_exists";
         progress.workTopicId = threadId;
         topicActivity.rememberIdleIcon(first.chatId, threadId, settings.iconCustomEmojiId ?? null);
-        ticket = continued ? inbox.continueTicket(continued.id, { workTopicId: threadId, prompt, source })! : pending;
-        if (!continued) inbox.attachTopic(ticket.id, threadId);
-        (registry.setContextDefaultsDurably ?? registry.setContextDefaults).call(registry, contextKeyFromMessage(first.chatId, threadId), {
-          workspace: settings.workspace, launchProfileId: settings.launchProfileId, topicName,
-        });
+        const newKey = contextKeyFromMessage(first.chatId, threadId);
+        const oldKey = contextKeyFromMessage(first.chatId, Number(record.metadata?.previousWorkTopicId) || threadId);
+        const contexts = registry.listContexts?.() ?? [];
+        const moveThread = continued && oldKey !== newKey && contexts.some(entry => entry.contextKey === oldKey && entry.threadId);
+        const alreadyBound = contexts.some(entry => entry.contextKey === newKey && entry.threadId);
+        if (moveThread) registry.rebindThreadTopic(oldKey, newKey);
+        try {
+          ticket = continued ? inbox.continueTicket(continued.id, { workTopicId: threadId, prompt, source })! : pending;
+          if (!continued) inbox.attachTopic(ticket.id, threadId);
+        } catch (error) {
+          if (moveThread) registry.rebindThreadTopic(newKey, oldKey);
+          throw error;
+        }
+        if (!moveThread && !alreadyBound) {
+          (registry.setContextDefaultsDurably ?? registry.setContextDefaults).call(registry, newKey, {
+            workspace: settings.workspace, launchProfileId: settings.launchProfileId, topicName,
+          });
+        }
       },
       ready: async (record) => {
         const topic = { message_thread_id: record.messageThreadId! };
@@ -385,8 +396,9 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): { dispos
       return;
     }
     const workContextKey = contextKeyFromMessage(inboxContext.chatId, ticket.workTopicId);
-    const boundThread = registry.listContexts().find((entry) => entry.contextKey === workContextKey)?.threadId;
-    if (boundThread) {
+    const boundContext = registry.listContexts().find((entry) => entry.contextKey === workContextKey);
+    const boundThread = boundContext?.threadId;
+    if (boundThread && !ticket.continuationPending) {
       inbox.markStarted(ticket.id);
       await ctx.answerCallbackQuery({ text: "Разбор уже запускали" });
       await ctx.editMessageReplyMarkup({ reply_markup: ticketKeyboard(inbox.getTicket(ticket.id)!) }).catch(() => {});
@@ -395,15 +407,42 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): { dispos
     const currentInbox = inbox.get(ticket.inboxContextKey);
     const launchTicket = {
       ...ticket,
-      launchProfileId: currentInbox?.launchProfileId ?? ticket.launchProfileId,
+      workspace: boundThread ? boundContext.workspace : ticket.workspace,
+      launchProfileId: boundThread ? boundContext.launchProfileId : currentInbox?.launchProfileId ?? ticket.launchProfileId,
       prompt: prepareTicketLaunchPrompt(ticket.prompt, currentInbox?.realm),
     };
-    registry.setContextDefaults(workContextKey, {
-      workspace: launchTicket.workspace,
-      launchProfileId: launchTicket.launchProfileId,
-    });
+    let ticketForLaunch = launchTicket;
+    let targetContext: { chatId: number; messageThreadId: number } | undefined;
+    let topicMissing = false;
+    if (!boundThread) {
+      try {
+        topicMissing = await deps.topicIsAlive(inboxContext.chatId, ticket.workTopicId) === false;
+      } catch { /* A transient probe failure must not prevent the durable launch. */ }
+    }
+    if (!boundThread && topicMissing) {
+      const replacement = await bot.api.createForumTopic(
+        inboxContext.chatId,
+        ticket.topicTitle ?? ticketTopicName(ticket.id, ticket.prompt, ticket.externalKey, ticket.workspace),
+      );
+      const replacementContextKey = contextKeyFromMessage(inboxContext.chatId, replacement.message_thread_id);
+      inbox.attachTopic(ticket.id, replacement.message_thread_id);
+      try {
+        registry.rebindThreadTopic(workContextKey, replacementContextKey);
+      } catch (error) {
+        inbox.attachTopic(ticket.id, ticket.workTopicId);
+        throw error;
+      }
+      ticketForLaunch = { ...launchTicket, workTopicId: replacement.message_thread_id };
+      targetContext = { chatId: inboxContext.chatId, messageThreadId: replacement.message_thread_id };
+    } else if (!boundThread) {
+      registry.setContextDefaults(workContextKey, {
+        workspace: launchTicket.workspace,
+        launchProfileId: launchTicket.launchProfileId,
+      });
+    }
     if (deps.handleCanonicalTicketPrompt) {
-      await deps.handleCanonicalTicketPrompt(ctx, launchTicket);
+      if (targetContext) await deps.handleCanonicalTicketPrompt(ctx, ticketForLaunch, targetContext);
+      else await deps.handleCanonicalTicketPrompt(ctx, ticketForLaunch);
       await ctx.answerCallbackQuery({ text: "Запускаю разбор..." });
       inbox.markStarted(ticket.id);
       await ctx.editMessageReplyMarkup({ reply_markup: ticketKeyboard(inbox.getTicket(ticket.id)!) }).catch(() => {});
@@ -415,7 +454,7 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): { dispos
     await ctx.answerCallbackQuery({ text: "Запускаю разбор..." });
     inbox.markStarted(ticket.id);
     await ctx.editMessageReplyMarkup({ reply_markup: ticketKeyboard(inbox.getTicket(ticket.id)!) }).catch(() => {});
-    await deps.handleTicketPrompt(ctx, contextSession.contextKey, ctx.chat!.id, contextSession.session, launchTicket);
+    await deps.handleTicketPrompt(ctx, contextSession.contextKey, ctx.chat!.id, contextSession.session, ticketForLaunch);
   });
   bot.callbackQuery(/^jira_post:(\d+)$/, async (ctx) => {
     const ticketId = Number.parseInt(ctx.match?.[1] ?? "", 10);
@@ -474,5 +513,58 @@ export function registerInboxHandlers(deps: RegisterInboxHandlersDeps): { dispos
     provisioning.store.setPending(ingressId, { item, buffered: true });
     inboxBuffer.add(contextKey, item);
   });
-  return { dispose: async () => { stopping = true; inboxBuffer.dispose(); await Promise.allSettled([...background]); } };
+  const recoverUnstartedTicketTopics = async (): Promise<number[]> => {
+    const recovered: number[] = [];
+    const oldestRecoverableTicket = Date.now() - UNSTARTED_TICKET_RECOVERY_WINDOW_MS;
+    for (const ticket of inbox.listUnresolved()) {
+      if (ticket.startedAt !== undefined
+        || ticket.createdAt < oldestRecoverableTicket
+        || !Number.isSafeInteger(ticket.workTopicId)
+        || ticket.workTopicId <= 0) continue;
+      const inboxContext = parseContextKey(ticket.inboxContextKey);
+      if (!inboxContext) continue;
+      try {
+        const alive = await deps.topicIsAlive(inboxContext.chatId, ticket.workTopicId);
+        if (alive !== false) continue;
+      } catch {
+        continue;
+      }
+      const oldContextKey = contextKeyFromMessage(inboxContext.chatId, ticket.workTopicId);
+      const replacement = await bot.api.createForumTopic(
+        inboxContext.chatId,
+        ticket.topicTitle ?? ticketTopicName(ticket.id, ticket.prompt, ticket.externalKey, ticket.workspace),
+      );
+      const replacementContextKey = contextKeyFromMessage(inboxContext.chatId, replacement.message_thread_id);
+      inbox.attachTopic(ticket.id, replacement.message_thread_id);
+      try {
+        registry.rebindThreadTopic(oldContextKey, replacementContextKey);
+      } catch (error) {
+        inbox.attachTopic(ticket.id, ticket.workTopicId);
+        throw error;
+      }
+      topicActivity.rememberIdleIcon(
+        inboxContext.chatId,
+        replacement.message_thread_id,
+        inbox.get(ticket.inboxContextKey)?.iconCustomEmojiId ?? null,
+      );
+      const card = [
+        `🎫 <b>${escapeHTML(ticketHeading(ticket))}</b>`,
+        `Источник: ${escapeHTML(ticket.source)}`,
+        `Проект: <code>${escapeHTML(ticket.workspace)}</code>`,
+        "",
+        "Топик восстановлен после удаления. Нажми кнопку, чтобы запустить разбор.",
+      ].join("\n");
+      await deps.sendText(inboxContext.chatId, card, {
+        messageThreadId: replacement.message_thread_id,
+        fallbackText: `${ticketHeading(ticket)}. Топик восстановлен.`,
+        replyMarkup: ticketKeyboard(ticket),
+      });
+      recovered.push(ticket.id);
+    }
+    return recovered;
+  };
+  return {
+    dispose: async () => { stopping = true; inboxBuffer.dispose(); await Promise.allSettled([...background]); },
+    recoverUnstartedTicketTopics,
+  };
 }

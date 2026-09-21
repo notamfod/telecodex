@@ -67,6 +67,12 @@ describe("forum topic liveness", () => {
     })(destination)).resolves.toBe("closed");
   });
 
+  it("uses a nested typed definitive description for resume topic classification", async () => {
+    await expect(createForumTopicLivenessClassifier({ requireDefinitiveErrors: true,
+      sendChatAction: vi.fn().mockRejectedValue({ error: { error_code: 400, description: "message thread not found" } }),
+    })(destination)).resolves.toBe("missing");
+  });
+
   it("classifies a deleted topic as missing", async () => {
     await expect(createForumTopicLivenessClassifier({
       sendChatAction: vi.fn().mockRejectedValue(new Error("TOPIC_DELETED")),

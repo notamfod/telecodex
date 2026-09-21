@@ -1,14 +1,12 @@
 import path from "node:path";
+import { containsSecret, taskTopicName } from "./task-title.js";
+export { containsSecret } from "./task-title.js";
 
 import { listUserThreads as readUserThreads, type CodexThreadRecord } from "./codex-state.js";
 import { contextKeyFromMessage, type TelegramContextKey } from "./context-key.js";
 
 import { telegramRetryAfterMs } from "./telegram-rate-limit.js";
 import { matchesTopicSyncPolicy, type TopicSyncPolicy } from "./topic-sync-policy.js";
-
-const MAX_TOPIC_NAME_LENGTH = 128;
-const TELEGRAM_BOT_TOKEN_PATTERN = /\b\d{6,12}:[A-Za-z0-9_-]{30,}\b/;
-const API_KEY_PATTERN = /\b(?:sk|ghp|github_pat)-?[A-Za-z0-9_-]{16,}\b/i;
 
 type TopicSyncRegistry = {
   isThreadBoundInChat(threadId: string, chatId: number): boolean;
@@ -33,6 +31,7 @@ export type TopicSynchronizerOptions = {
   getPolicy?: () => TopicSyncPolicy;
   provisionThread?: (thread: CodexThreadRecord) => Promise<"created" | "skipped">;
   maxCreatesPerSync?: number;
+  reconcileTitles?: () => Promise<void>;
 };
 
 export function threadLabel(thread: CodexThreadRecord): string {
@@ -46,11 +45,7 @@ export function workspaceLabel(cwd: string): string {
 }
 
 export function buildTopicName(thread: CodexThreadRecord): string {
-  return truncateUnicode(`${workspaceLabel(thread.cwd)} · ${threadLabel(thread)}`, MAX_TOPIC_NAME_LENGTH);
-}
-
-export function containsSecret(value: string): boolean {
-  return TELEGRAM_BOT_TOKEN_PATTERN.test(value) || API_KEY_PATTERN.test(value);
+  return taskTopicName(threadLabel(thread), thread.cwd);
 }
 
 export class TopicSynchronizer {
@@ -72,6 +67,7 @@ export class TopicSynchronizer {
     if (this.inFlight || Date.now() < this.cooldownUntil) return result;
     this.inFlight = true;
     try {
+      await this.options.reconcileTitles?.();
       for (const thread of this.listUserThreads()) {
         if (result.created + result.failed >= (this.options.maxCreatesPerSync ?? 10)) break;
         if (!matchesTopicSyncPolicy(this.options.getPolicy?.() ?? { mode: "all", projects: [] }, thread.cwd)) {
@@ -148,9 +144,4 @@ export class TopicSynchronizer {
       this.running = false;
     }
   }
-}
-
-function truncateUnicode(value: string, maxLength: number): string {
-  const characters = [...value];
-  return characters.length <= maxLength ? value : characters.slice(0, maxLength).join("");
 }

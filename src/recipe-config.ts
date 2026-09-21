@@ -1,3 +1,7 @@
+import path from "node:path";
+import type { DeveloperWorkloadRecipe } from "./developer-workload-recipe.js";
+import type { WeeklyProject } from "./weekly-activity.js";
+
 /**
  * Which reviews run, where, and where their findings go. Deployment-specific, so
  * it lives in a file rather than in the code: see recipes/recipes.example.json.
@@ -42,7 +46,15 @@ export interface SentryTopRecipe extends RecipeBase {
   deliver: { chatId: number; messageThreadId: number };
 }
 
-export type Recipe = ReviewRecipe | MircliReviewRecipe | JiraFilterRecipe | SentryTopRecipe;
+export interface WeeklySummaryRecipe extends RecipeBase {
+  kind: "weekly-summary";
+  databasePath: string;
+  projects: WeeklyProject[];
+  model?: string;
+  deliver: { chatId: number; messageThreadId: number };
+}
+
+export type Recipe = ReviewRecipe | MircliReviewRecipe | JiraFilterRecipe | SentryTopRecipe | WeeklySummaryRecipe | DeveloperWorkloadRecipe;
 
 export const RECIPE_CONFIG_PATH = "recipes/recipes.json";
 
@@ -89,8 +101,55 @@ function parseRecipe(value: unknown, index: number): Recipe {
     && kind !== "jira-filter"
     && kind !== "sentry-top"
     && kind !== "mircli-review"
+    && kind !== "weekly-summary"
+    && kind !== "developer-workload"
   ) {
     throw new Error(`Invalid recipes config: ${where} has an unknown kind "${String(kind)}"`);
+  }
+
+  if (kind === "developer-workload") {
+    if (entry.deliver === undefined) throw new Error(`Invalid recipes config: ${where} needs a deliver target`);
+    const capacityHours = requireNumber(entry.capacityHours, "capacityHours", where);
+    if (!Number.isInteger(capacityHours) || capacityHours < 1 || capacityHours > 80) {
+      throw new Error(`Invalid recipes config: ${where} needs capacityHours from 1 to 80`);
+    }
+    const completionStatuses = entry.completionStatuses;
+    if (!Array.isArray(completionStatuses) || completionStatuses.length === 0 || completionStatuses.length > 20
+      || completionStatuses.some((status) => typeof status !== "string" || !status.trim())) {
+      throw new Error(`Invalid recipes config: ${where} needs 1-20 completionStatuses`);
+    }
+    return {
+      id, kind, cwd,
+      jiraClient: requireString(entry.jiraClient, "jiraClient", where),
+      capacityHours,
+      fromStatus: requireString(entry.fromStatus, "fromStatus", where),
+      completionStatuses: completionStatuses as string[],
+      deliver: parseDeliver(entry.deliver, where),
+    };
+  }
+
+  if (kind === "weekly-summary") {
+    if (entry.deliver === undefined) throw new Error(`Invalid recipes config: ${where} needs a deliver target`);
+    if (!Array.isArray(entry.projects) || entry.projects.length === 0 || entry.projects.length > 20) {
+      throw new Error(`Invalid recipes config: ${where} needs 1-20 projects`);
+    }
+    const names = new Set<string>();
+    const projects = entry.projects.map((value: unknown): WeeklyProject => {
+      const project = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+      const name = requireString(project.name, "project name", where);
+      if (name.length > 60 || names.has(name)) throw new Error(`Invalid recipes config: ${where} has an invalid or duplicate project name`);
+      names.add(name);
+      if (!Array.isArray(project.roots) || project.roots.length === 0
+        || project.roots.some((root: unknown) => typeof root !== "string" || !path.isAbsolute(root) || root === "/")) {
+        throw new Error(`Invalid recipes config: ${where} needs absolute project roots`);
+      }
+      return { name, roots: project.roots as string[] };
+    });
+    const databasePath = requireString(entry.databasePath, "databasePath", where);
+    if (!path.isAbsolute(databasePath)) throw new Error(`Invalid recipes config: ${where} needs an absolute databasePath`);
+    const recipe: WeeklySummaryRecipe = { id, kind, cwd, databasePath, projects, deliver: parseDeliver(entry.deliver, where) };
+    if (typeof entry.model === "string") recipe.model = entry.model;
+    return recipe;
   }
 
   if (kind === "jira-filter") {

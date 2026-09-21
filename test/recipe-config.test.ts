@@ -170,3 +170,21 @@ describe("parseRecipes", () => {
     expect(() => parseRecipes(JSON.stringify(clashing))).toThrow(/daily/);
   });
 });
+
+it("parses weekly summaries and validates project roots", () => {
+  const recipe = { id: "weekly-project-summary", kind: "weekly-summary", cwd: "/srv", databasePath: "/srv/state.sqlite", projects: [{ name: "MirCli", roots: ["/projects/mircli"] }], deliver: { chatId: -100123, messageThreadId: 42 } };
+  expect(parseRecipes(JSON.stringify({ recipes: [recipe] }))).toEqual([recipe]);
+  for (const projects of [[], [{ name: "x", roots: [] }], [{ name: "x", roots: ["relative"] }], [recipe.projects[0], recipe.projects[0]]]) {
+    expect(() => parseRecipes(JSON.stringify({ recipes: [{ ...recipe, projects }] }))).toThrow();
+  }
+});
+
+it("parses a developer workload recipe with explicit capacity and completion statuses", () => {
+  const recipe = {
+    id: "weekly-developer-workload", kind: "developer-workload", cwd: "/srv/mircli",
+    jiraClient: "/usr/bin/jira-client", capacityHours: 30, fromStatus: "In Progress",
+    completionStatuses: ["For QA", "For Verification"], deliver: { chatId: -100123, messageThreadId: 42 },
+  };
+  expect(parseRecipes(JSON.stringify({ recipes: [recipe] }))).toEqual([recipe]);
+  expect(() => parseRecipes(JSON.stringify({ recipes: [{ ...recipe, capacityHours: 0 }] }))).toThrow(/capacityHours/);
+});

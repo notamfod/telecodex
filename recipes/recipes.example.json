@@ -54,6 +54,24 @@
         "chatId": -1001111111111,
         "messageThreadId": 42
       }
+    },
+    {
+      "id": "weekly-project-summary",
+      "kind": "weekly-summary",
+      "cwd": "/srv/projects/example",
+      "databasePath": "/root/.codex/state_5.sqlite",
+      "projects": [
+        {
+          "name": "Example",
+          "roots": [
+            "/srv/projects/example"
+          ]
+        }
+      ],
+      "deliver": {
+        "chatId": -1001111111111,
+        "messageThreadId": 42
+      }
     }
   ]
 }

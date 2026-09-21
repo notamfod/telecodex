@@ -20,6 +20,8 @@ import type { PendingRun } from "./recipe-store.js";
 import type { Finding } from "./recipes.js";
 import { prepareDependencyReview } from "./dependency-review.js";
 import { runJiraFilterRecipe } from "./jira-recipe.js";
+import { runDeveloperWorkloadRecipe } from "./developer-workload-recipe.js";
+import { runWeeklySummaryRecipe } from "./weekly-recipe.js";
 import { runSentryTopRecipe } from "./sentry-recipe.js";
 import {
   RECIPE_CONFIG_PATH,
@@ -184,11 +186,35 @@ async function runRecipe(): Promise<void> {
 
   // Checked before the agent runs: finding out about a missing token after a
   // twenty-minute review means the whole run is wasted.
-  if (recipe.deliver && !probe && !process.env.TELEGRAM_BOT_TOKEN) {
+  const preview = process.argv.includes("--preview");
+  if (preview && recipe.kind !== "weekly-summary") throw new Error("--preview only applies to weekly summaries");
+  if (recipe.deliver && !probe && !preview && !process.env.TELEGRAM_BOT_TOKEN) {
     throw new Error(
       `${recipe.id} delivers to Telegram but TELEGRAM_BOT_TOKEN is unset; ` +
         "run it through telecodex-recipe@.service, which loads .env",
     );
+  }
+
+  if (recipe.kind === "weekly-summary") {
+    if (probe) throw new Error(`${recipe.id} has no commit range; --from does not apply`);
+    const atIndex = process.argv.indexOf("--at");
+    const now = atIndex === -1 ? undefined : new Date(process.argv[atIndex + 1] ?? "");
+    if (now && (!preview || !Number.isFinite(now.getTime()))) throw new Error("--at requires --preview and a valid date");
+    const result = await runWeeklySummaryRecipe(recipe, async (html) => {
+      await sendRecipeMessage(recipe, html);
+    }, { preview, now });
+    if (preview) console.log(result.messages.join("\n\n"));
+    console.log(`${recipe.id}: ${result.delivered} delivered${preview ? " (preview)" : ""}`);
+    return;
+  }
+
+  if (recipe.kind === "developer-workload") {
+    if (probe || preview) throw new Error(`${recipe.id} has no commit range or preview mode`);
+    const result = await runDeveloperWorkloadRecipe(recipe, async (html) => {
+      await sendRecipeMessage(recipe, html);
+    });
+    console.log(`${recipe.id}: workload report delivered (${result.message.length} chars)`);
+    return;
   }
 
   if (recipe.kind === "jira-filter") {

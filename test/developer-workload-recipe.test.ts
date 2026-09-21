@@ -70,3 +70,16 @@ it("routes tasks without a usable description to the full-stack analyst", async 
   const report = send.mock.calls[0]?.[0] ?? "";
   expect(report).toContain("нужен анализ: Anton");
 });
+
+it("prioritizes the full-stack developer for backend work", async () => {
+  const execute = vi.fn(async (_command: string, args: string[]) => {
+    const jql = args[1] ?? "";
+    if (jql.includes("updated >=") || jql.includes('status = "In Progress"')) return response([]);
+    return response([{ key: "MIR-7", summary: "Backend import", url: "https://jira/MIR-7", original_estimate_seconds: 3_600, description_length: 200 }]);
+  });
+  const send = vi.fn(async () => undefined);
+
+  await runDeveloperWorkloadRecipe(recipe, send, { now: new Date("2026-09-20T17:00:00Z"), execute });
+
+  expect(send.mock.calls[0]?.[0]).toContain("→ Anton · свободно 30,0 ч");
+});

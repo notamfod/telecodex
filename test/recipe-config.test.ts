@@ -183,8 +183,9 @@ it("parses a developer workload recipe with explicit capacity and completion sta
   const recipe = {
     id: "weekly-developer-workload", kind: "developer-workload", cwd: "/srv/mircli",
     jiraClient: "/usr/bin/jira-client", capacityHours: 30, fromStatus: "In Progress",
-    completionStatuses: ["For QA", "For Verification"], deliver: { chatId: -100123, messageThreadId: 42 },
+    completionStatuses: ["For QA", "For Verification"], developerRoles: { Alice: ["frontend"] }, deliver: { chatId: -100123, messageThreadId: 42 },
   };
   expect(parseRecipes(JSON.stringify({ recipes: [recipe] }))).toEqual([recipe]);
   expect(() => parseRecipes(JSON.stringify({ recipes: [{ ...recipe, capacityHours: 0 }] }))).toThrow(/capacityHours/);
+  expect(() => parseRecipes(JSON.stringify({ recipes: [{ ...recipe, developerRoles: { Alice: ["mobile"] } }] }))).toThrow(/developerRoles/);
 });

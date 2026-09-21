@@ -6,6 +6,10 @@ import { weeklyPeriod } from "./weekly-activity.js";
 
 const run = promisify(execFile);
 const LIMIT = 500;
+const DESCRIPTION_MINIMUM_LENGTH = 80;
+
+export type DeveloperRole = "design" | "frontend" | "backend" | "fullstack";
+type IssueRole = Exclude<DeveloperRole, "fullstack"> | "analysis";
 
 export interface DeveloperWorkloadRecipe {
   id: string;
@@ -15,6 +19,7 @@ export interface DeveloperWorkloadRecipe {
   capacityHours: number;
   fromStatus: string;
   completionStatuses: string[];
+  developerRoles: Record<string, DeveloperRole[]>;
   deliver: { chatId: number; messageThreadId: number };
 }
 
@@ -23,6 +28,8 @@ interface Issue {
   summary: string;
   url: string;
   assignee?: string;
+  components?: string[];
+  description_length?: number;
   original_estimate_seconds?: number;
   status_transitions?: unknown[];
 }
@@ -44,7 +51,7 @@ function validIssue(value: unknown): value is Issue {
     && typeof issue.url === "string";
 }
 
-function parseIssues(raw: string): Issue[] {
+function parseIssues(raw: string, allowTruncated = false): Issue[] {
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { throw new Error("jira-client workload returned invalid JSON"); }
   const response = parsed as { issues?: unknown; total?: unknown; returned?: unknown };
@@ -52,7 +59,8 @@ function parseIssues(raw: string): Issue[] {
   if (!Array.isArray(issues) || !issues.every(validIssue)) {
     throw new Error("jira-client workload response needs issues");
   }
-  if (typeof response.total !== "number" || typeof response.returned !== "number" || response.total > response.returned) {
+  if (typeof response.total !== "number" || typeof response.returned !== "number"
+    || (!allowTruncated && response.total > response.returned)) {
     throw new Error("jira-client workload result is truncated");
   }
   return issues;
@@ -65,6 +73,15 @@ function estimate(issue: Issue): number {
 
 function link(issue: Issue): string {
   return `<a href="${escapeHTML(issue.url)}">${escapeHTML(issue.key)}</a> - ${escapeHTML(issue.summary)}`;
+}
+
+function issueRole(issue: Issue): IssueRole {
+  if ((issue.description_length ?? 0) < DESCRIPTION_MINIMUM_LENGTH) return "analysis";
+  const text = `${issue.summary} ${(issue.components ?? []).join(" ")}`.toLocaleLowerCase("ru");
+  if (/design|дизайн|figma|макет/.test(text)) return "design";
+  if (/backend|бэкенд|бэк/.test(text)) return "backend";
+  if (/frontend|фронтенд|фронт|\bui\b/.test(text)) return "frontend";
+  return "analysis";
 }
 
 function completedWithin(issue: Issue, start: number, end: number): boolean {
@@ -80,6 +97,8 @@ async function query(
   startDate: string,
   endDate: string,
   execute: Execute,
+  allowTruncated = false,
+  limit = LIMIT,
 ): Promise<Issue[]> {
   const raw = await execute(recipe.jiraClient, [
     "workload", jql,
@@ -87,10 +106,10 @@ async function query(
     "--end-date", endDate,
     "--from-status", recipe.fromStatus,
     ...recipe.completionStatuses.flatMap((status) => ["--to-status", status]),
-    "--limit", String(LIMIT),
+    "--limit", String(limit),
     "--refresh",
   ], recipe.cwd);
-  return parseIssues(raw);
+  return parseIssues(raw, allowTruncated);
 }
 
 export async function runDeveloperWorkloadRecipe(
@@ -105,10 +124,11 @@ export async function runDeveloperWorkloadRecipe(
     const { stdout } = await run(command, args, { cwd, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
     return stdout;
   });
-  const [completed, active, backlog] = await Promise.all([
+  const [completed, active, unassignedBacklog, assignedBacklog] = await Promise.all([
     query(recipe, `project = MIR AND updated >= "${startDate}" AND updated <= "${endDate}"`, startDate, endDate, execute),
     query(recipe, `project = MIR AND status = "${recipe.fromStatus}" AND assignee IS NOT EMPTY`, startDate, endDate, execute),
-    query(recipe, "project = MIR AND statusCategory = new", startDate, endDate, execute),
+    query(recipe, "project = MIR AND statusCategory = new AND assignee IS EMPTY ORDER BY created DESC", startDate, endDate, execute, true, 10),
+    query(recipe, "project = MIR AND statusCategory = new AND assignee IS NOT EMPTY ORDER BY created DESC", startDate, endDate, execute, true, 10),
   ]);
 
   const capacity = recipe.capacityHours * 3600;
@@ -122,38 +142,55 @@ export async function runDeveloperWorkloadRecipe(
   for (const issue of active) {
     if (issue.assignee) load.set(issue.assignee, (load.get(issue.assignee) ?? 0) + estimate(issue));
   }
-  const people = [...new Set([...done.keys(), ...load.keys()])].sort((a, b) => a.localeCompare(b, "ru"));
-  const freePeople = () => people
+  const people = [...new Set([...Object.keys(recipe.developerRoles), ...done.keys(), ...load.keys()])]
+    .sort((a, b) => a.localeCompare(b, "ru"));
+  const freePeople = (role: IssueRole) => people
     .map((name) => ({ name, spare: capacity - (load.get(name) ?? 0) }))
     .filter((person) => person.spare > 0)
-    .sort((a, b) => b.spare - a.spare || a.name.localeCompare(b.name, "ru"));
+    .filter((person) => {
+      const roles = recipe.developerRoles[person.name] ?? [];
+      return role === "analysis" ? roles.includes("fullstack") : roles.includes(role) || roles.includes("fullstack");
+    })
+    .sort((a, b) => {
+      const aRoles = recipe.developerRoles[a.name] ?? [];
+      const bRoles = recipe.developerRoles[b.name] ?? [];
+      const aSpecialist = aRoles.includes(role as DeveloperRole) ? 0 : 1;
+      const bSpecialist = bRoles.includes(role as DeveloperRole) ? 0 : 1;
+      return aSpecialist - bSpecialist || b.spare - a.spare || a.name.localeCompare(b.name, "ru");
+    });
 
-  const unassigned = backlog.filter((issue) => !issue.assignee).slice(0, 10);
-  const reassigned = backlog.filter((issue) => issue.assignee && (load.get(issue.assignee) ?? 0) > capacity).slice(0, 10);
+  const proposal = (issue: Issue, excludedName?: string): string => {
+    const role = issueRole(issue);
+    const candidates = freePeople(role).filter((person) => person.name !== excludedName);
+    const target = candidates.find((person) => person.spare >= estimate(issue)) ?? candidates[0];
+    if (!target) return "нет подходящей свободной ёмкости";
+    if (role === "analysis") return `нужен анализ: ${escapeHTML(target.name)} · свободно ${hours(target.spare)} ч`;
+    return `${escapeHTML(target.name)} · свободно ${hours(target.spare)} ч`;
+  };
+
+  const unassigned = unassignedBacklog.slice(0, 5);
+  const reassigned = assignedBacklog.slice(0, 5);
+  const loadMarker = (seconds: number) => seconds > capacity ? "🔴" : seconds >= capacity * 0.8 ? "🟡" : "🟢";
   const lines = [
-    `<b>Нагрузка разработчиков</b>\n${startDate} - ${endDate}`,
-    "<b>Сделано за неделю</b>",
-    ...(people.length ? people.map((name) => {
-      const value = done.get(name) ?? { count: 0, seconds: 0 };
-      return `• ${escapeHTML(name)}: ${value.count} задач, ${hours(value.seconds)} ч`;
-    }) : ["• Нет задач с подтверждённым переходом."]),
-    "<b>В работе</b>",
+    `<b>📊 Нагрузка разработчиков</b>\n<i>${startDate} - ${endDate}</i>`,
+    "<b>✅ Сделано за неделю</b>",
+    ...(done.size ? [...done.entries()].sort(([a], [b]) => a.localeCompare(b, "ru")).map(([name, value]) =>
+      `• <b>${escapeHTML(name)}</b> · ${value.count} задач · ${hours(value.seconds)} ч`) : ["• Нет задач с подтверждённым переходом."]),
+    `<b>🧩 В работе</b> <i>норма ${recipe.capacityHours} ч</i>`,
     ...(people.length ? people.map((name) => {
       const seconds = load.get(name) ?? 0;
       const balance = capacity - seconds;
-      return `• ${escapeHTML(name)}: ${hours(seconds)} ч, ${balance >= 0 ? `свободно ${hours(balance)} ч` : `перегрузка ${hours(-balance)} ч`}`;
+      return `${loadMarker(seconds)} <b>${escapeHTML(name)}</b> · ${hours(seconds)} ч · ${balance >= 0 ? `свободно ${hours(balance)} ч` : `<b>перегрузка ${hours(-balance)} ч</b>`}`;
     }) : ["• Нет назначенных задач в работе."]),
-    "<b>К выдаче из бэклога</b>",
+    "<b>🆕 К выдаче из бэклога</b> <i>5 новых задач</i>",
     ...(unassigned.length ? unassigned.map((issue) => {
-      const target = freePeople().find((person) => person.spare >= estimate(issue)) ?? freePeople()[0];
-      return `• ${link(issue)}${target ? ` - предложить ${escapeHTML(target.name)} (${hours(target.spare)} ч свободно)` : " - нет свободной ёмкости"}`;
+      return `• ${link(issue)}\n  → ${proposal(issue)}`;
     }) : ["• Нет нераспределённых задач с начальным статусом."]),
-    "<b>К перераспределению</b>",
+    "<b>🔁 К перераспределению</b>",
     ...(reassigned.length ? reassigned.map((issue) => {
-      const target = freePeople().find((person) => person.name !== issue.assignee && person.spare >= estimate(issue)) ?? freePeople().find((person) => person.name !== issue.assignee);
-      return `• ${link(issue)} - снять с ${escapeHTML(issue.assignee ?? "исполнителя")}${target ? `, предложить ${escapeHTML(target.name)}` : ""}`;
-    }) : ["• Нет не начатых задач у перегруженных исполнителей."]),
-    `<i>Расчёт: ${recipe.capacityHours} ч плановой ёмкости на человека. Предложения не меняют Jira и требуют подтверждения руководителя.</i>`,
+      return `• ${link(issue)}\n  → сейчас ${escapeHTML(issue.assignee ?? "не назначена")}, ${proposal(issue, issue.assignee)}`;
+    }) : ["• Нет назначенных, но не начатых задач."]),
+    `<i>Плановая ёмкость: ${recipe.capacityHours} ч на человека. Предложения не меняют Jira.</i>`,
   ];
   const message = lines.join("\n");
   if (message.length > 3900) throw new Error("Developer workload report exceeds Telegram message limit");

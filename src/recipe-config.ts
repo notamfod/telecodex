@@ -118,12 +118,21 @@ function parseRecipe(value: unknown, index: number): Recipe {
       || completionStatuses.some((status) => typeof status !== "string" || !status.trim())) {
       throw new Error(`Invalid recipes config: ${where} needs 1-20 completionStatuses`);
     }
+    const developerRoles = entry.developerRoles;
+    const validRoles = new Set(["design", "frontend", "backend", "fullstack"]);
+    if (typeof developerRoles !== "object" || developerRoles === null || Array.isArray(developerRoles)
+      || Object.keys(developerRoles).length === 0 || Object.keys(developerRoles).length > 100
+      || Object.entries(developerRoles).some(([name, roles]) => !name.trim()
+        || !Array.isArray(roles) || roles.length === 0 || roles.some((role) => typeof role !== "string" || !validRoles.has(role)))) {
+      throw new Error(`Invalid recipes config: ${where} needs developerRoles with supported roles`);
+    }
     return {
       id, kind, cwd,
       jiraClient: requireString(entry.jiraClient, "jiraClient", where),
       capacityHours,
       fromStatus: requireString(entry.fromStatus, "fromStatus", where),
       completionStatuses: completionStatuses as string[],
+      developerRoles: developerRoles as DeveloperWorkloadRecipe["developerRoles"],
       deliver: parseDeliver(entry.deliver, where),
     };
   }

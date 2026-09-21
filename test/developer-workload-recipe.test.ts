@@ -9,6 +9,7 @@ const recipe = {
   capacityHours: 30,
   fromStatus: "In Progress",
   completionStatuses: ["For QA", "For Verification"],
+  developerRoles: { Alice: ["frontend"], Bob: ["backend"], Anton: ["fullstack"] },
   deliver: { chatId: -100123, messageThreadId: 42 },
 };
 
@@ -43,12 +44,29 @@ it("reports completed work, capacity and non-mutating allocation proposals", asy
   expect(send).toHaveBeenCalledOnce();
   const report = send.mock.calls[0]?.[0] ?? "";
   expect(report).toContain("Нагрузка разработчиков");
-  expect(report).toContain("Alice: 1 задач");
-  expect(report).toContain("Alice: 20,0 ч, свободно 10,0 ч");
-  expect(report).toContain("Bob: 40,0 ч, перегрузка 10,0 ч");
+  expect(report).toContain("<b>Alice</b> · 1 задач");
+  expect(report).toContain("<b>Alice</b> · 20,0 ч · свободно 10,0 ч");
+  expect(report).toContain("<b>Bob</b> · 40,0 ч · <b>перегрузка 10,0 ч</b>");
   expect(report).toContain('MIR-4');
   expect(report).toContain('MIR-5');
   expect(report).toContain("Предложения не меняют Jira");
-  expect(execute).toHaveBeenCalledTimes(3);
+  expect(execute).toHaveBeenCalledTimes(4);
   expect(execute.mock.calls.every(([, args]) => args[0] === "workload")).toBe(true);
+});
+
+it("routes tasks without a usable description to the full-stack analyst", async () => {
+  const execute = vi.fn(async (_command: string, args: string[]) => {
+    const jql = args[1] ?? "";
+    if (jql.includes("updated >=")) return response([]);
+    if (jql.includes('status = "In Progress"')) {
+      return response([{ key: "MIR-2", summary: "Existing", url: "https://jira/MIR-2", assignee: "Alice", original_estimate_seconds: 3_600, description_length: 200 }]);
+    }
+    return response([{ key: "MIR-6", summary: "Investigate", url: "https://jira/MIR-6", original_estimate_seconds: 3_600, description_length: 0 }]);
+  });
+  const send = vi.fn(async () => undefined);
+
+  await runDeveloperWorkloadRecipe(recipe, send, { now: new Date("2026-09-20T17:00:00Z"), execute });
+
+  const report = send.mock.calls[0]?.[0] ?? "";
+  expect(report).toContain("нужен анализ: Anton");
 });

@@ -26,7 +26,7 @@ afterEach(() => {
 it("launches the developer workload recipe without allowing Jira writes", async () => {
   const directory = mkdtempSync(path.join(tmpdir(), "telecodex-workload-run-"));
   const config = path.join(directory, "recipes.json");
-  writeFileSync(config, JSON.stringify({ recipes: [{ id: "weekly-developer-workload", kind: "developer-workload", cwd: directory, jiraClient: "/usr/bin/jira-client", capacityHours: 30, fromStatus: "In Progress", completionStatuses: ["For QA"], deliver: { chatId: -100123, messageThreadId: 42 } }] }));
+  writeFileSync(config, JSON.stringify({ recipes: [{ id: "weekly-developer-workload", kind: "developer-workload", cwd: directory, jiraClient: "/usr/bin/jira-client", capacityHours: 30, fromStatus: "In Progress", completionStatuses: ["For QA"], developerRoles: { Alice: ["frontend"] }, deliver: { chatId: -100123, messageThreadId: 42 } }] }));
   process.argv = ["node", "src/recipe-run.ts", "weekly-developer-workload"];
   process.env.RECIPES_CONFIG = config; process.env.TELEGRAM_BOT_TOKEN = "bot-token"; process.chdir(directory);
   try {

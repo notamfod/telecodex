@@ -4,6 +4,7 @@ import { matchesTopicSyncPolicy, TopicSyncPolicyStore } from "./topic-sync-polic
 import path from "node:path";
 
 import { createBot, registerCommands } from "./bot.js";
+import { startReviewPipelineWorker } from "./bot-review-pipeline.js";
 import type { TelegramBotReliability } from "./bot.js";
 import { checkAuthStatus } from "./codex-auth.js";
 import { findLaunchProfile, formatLaunchProfileBehavior } from "./codex-launch.js";
@@ -84,6 +85,7 @@ let recoveryStarted = false;
 let reconciliationComplete = false;
 let pollingOwned = false;
 let shuttingDown = false;
+let reviewPipeline: ReturnType<typeof startReviewPipelineWorker>;
 
 const lifecycle = createTeleCodexLifecycle({
   onBegin: () => {
@@ -92,6 +94,7 @@ const lifecycle = createTeleCodexLifecycle({
   },
   resources: () => ({
     topicSynchronizer,
+    reviewPipeline,
     statusBoard: bot?.statusBoard,
     miniAppServer,
     runner,
@@ -342,6 +345,7 @@ try {
 
   if (bot.jiraPanel && config.jiraPanel) {
     console.log(`Jira panel: configured for ${config.jiraPanel.chatId}:${config.jiraPanel.topicId}`);
+    reviewPipeline = startReviewPipelineWorker(config, bot.api);
   }
 
   if (config.miniApp) {

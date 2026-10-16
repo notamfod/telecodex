@@ -121,6 +121,12 @@ export class GitlabReviewFeedbackStore {
     return { pending: pending.length, nextAttemptAt: next.length > 0 ? Math.min(...next) : null };
   }
 
+  hasDeliveredCompletion(requestId: string, feedback: GitlabReviewFeedback | undefined): boolean {
+    if (feedback?.phase !== "completed") return false;
+    const entry = this.state.entries.find((candidate) => candidate.requestId === requestId);
+    return entry?.status === "idle" && entry.delivered === feedbackKey(feedback);
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;

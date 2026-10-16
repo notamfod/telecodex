@@ -1,6 +1,10 @@
 import { vi } from "vitest";
 
-import { runTeleCodexReleaseCli } from "../src/telecodex-release-cli.js";
+import {
+  releaseGuardianStatus,
+  runTeleCodexReleaseCli,
+  usesLegacyReleaseStore,
+} from "../src/telecodex-release-cli.js";
 import type { TeleCodexReleasePreflightReport } from "../src/telecodex-release-preflight.js";
 import type {
   TelegramQuarantineAuditReport,
@@ -93,6 +97,21 @@ function quarantineReport(
 }
 
 describe("TeleCodex release CLI", () => {
+  it("omits Guardian only when its socket setting is absent", () => {
+    expect(releaseGuardianStatus({}, "/srv/telecodex")).toBeUndefined();
+    expect(() => releaseGuardianStatus({ SESSION_GUARDIAN_SOCKET_PATH: "" }, "/srv/telecodex"))
+      .toThrow("SESSION_GUARDIAN_SOCKET_PATH must be non-empty");
+    expect(releaseGuardianStatus({
+      SESSION_GUARDIAN_SOCKET_PATH: "/run/user/1000/guardian.sock",
+    }, "/srv/telecodex")).toEqual(expect.any(Function));
+  });
+
+  it("uses the legacy store for json and shadow modes", () => {
+    expect(usesLegacyReleaseStore("json")).toBe(true);
+    expect(usesLegacyReleaseStore("shadow")).toBe(true);
+    expect(usesLegacyReleaseStore("sqlite")).toBe(false);
+  });
+
   it("prints one JSON report and exits zero when restart is safe", async () => {
     const subject = fixture();
 

@@ -20,6 +20,8 @@ export interface PersistedLaunchOffer {
   notifyAttempt: number;
   messageId: number | null;
   activationAt: number | null;
+  pipelineStatus?: "activating" | "activated";
+  pipelineAt?: number;
 }
 
 export interface PersistedLaunchState {
@@ -68,7 +70,8 @@ export async function persistGitlabReviewLaunchState(
 
 export function isValidGitlabReviewEvent(value: unknown): value is GitlabReviewEvent {
   if (!isRecord(value)) return false;
-  return typeof value.dedupId === "string" && value.dedupId.length > 0 && value.dedupId.length <= 200
+  return (value.pipeline === undefined || value.pipeline === true)
+    && typeof value.dedupId === "string" && value.dedupId.length > 0 && value.dedupId.length <= 200
     && positiveInteger(value.projectId)
     && typeof value.projectPath === "string" && value.projectPath.length > 2 && value.projectPath.length <= 300
     && value.ref === "refs/heads/main"
@@ -108,6 +111,9 @@ function isValidOffer(value: unknown): value is PersistedLaunchOffer {
   if ((status === "notified" || status === "activating" || status === "activated")
     && !positiveInteger(value.messageId)) return false;
   if ((status === "activating" || status === "activated") && !timestamp(value.activationAt)) return false;
+  if (value.pipelineStatus !== undefined
+    && (!["activating", "activated"].includes(String(value.pipelineStatus)) || !timestamp(value.pipelineAt)
+      || !positiveInteger(value.messageId))) return false;
   return status === "offered" ? timestamp(value.nextNotifyAt) : value.nextNotifyAt === null;
 }
 

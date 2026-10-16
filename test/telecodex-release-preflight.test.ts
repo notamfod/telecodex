@@ -75,6 +75,13 @@ function dependencies(
   };
 }
 
+function disabledGuardian(
+  ...args: Parameters<typeof dependencies>
+): Omit<TeleCodexReleasePreflightDependencies, "guardianStatus"> {
+  const { guardianStatus: _guardianStatus, ...withoutGuardian } = dependencies(...args);
+  return withoutGuardian;
+}
+
 function seedBlockedFollowers(store: SqliteTelegramJobStore): string {
   const jobId = "blocked-delivery";
   let current = { ...job(jobId, "accepted"), updatedAt: CHECKED_AT - 1_000 };
@@ -241,6 +248,28 @@ describe("inspectTeleCodexReleasePreflight", () => {
     expect(JSON.stringify(report)).not.toContain("must never enter the report");
   });
 
+  it("permits an idle restart when Guardian is explicitly disabled", async () => {
+    const report = await inspectTeleCodexReleasePreflight(disabledGuardian([]));
+
+    expect(report).toMatchObject({
+      safeToRestart: true,
+      reasons: [],
+      guardian: "disabled",
+    });
+  });
+
+  it("keeps active turns blocked when Guardian is explicitly disabled", async () => {
+    const report = await inspectTeleCodexReleasePreflight(disabledGuardian([
+      job("active", "running"),
+    ]));
+
+    expect(report).toMatchObject({
+      safeToRestart: false,
+      reasons: ["ACTIVE_TURN"],
+      guardian: "disabled",
+    });
+  });
+
   it("blocks genuinely schedulable due delivery work", async () => {
     const delivering = job("due", "delivering");
     const pending = delivery("due", "pending", CHECKED_AT);
@@ -259,6 +288,22 @@ describe("inspectTeleCodexReleasePreflight", () => {
     expect(report.reasons).toEqual(["DELIVERY_PENDING"]);
     expect(report.jobs).toEqual({ queued: 0, running: 0, delivering: 1, attention: 0 });
     expect(report.deliveries).toEqual({ pending: 1, sending: 0, uncertain: 0, failed: 0 });
+  });
+
+  it("keeps due delivery work blocked when Guardian is explicitly disabled", async () => {
+    const delivering = job("due", "delivering");
+    const pending = delivery("due", "pending", CHECKED_AT);
+    const report = await inspectTeleCodexReleasePreflight(disabledGuardian(
+      [delivering],
+      { due: [pending] },
+      [pending],
+    ));
+
+    expect(report).toMatchObject({
+      safeToRestart: false,
+      reasons: ["DELIVERY_PENDING"],
+      guardian: "disabled",
+    });
   });
 
   it("blocks active turns, sending deliveries, and due pending delivery work", async () => {

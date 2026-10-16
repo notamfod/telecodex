@@ -9,6 +9,7 @@ const STATE_VERSION = 1;
 const MAX_EVENTS = 500;
 
 export interface GitlabReviewEvent {
+  readonly pipeline?: true;
   readonly dedupId: string;
   readonly projectId: number;
   readonly projectPath: string;
@@ -434,7 +435,8 @@ function validateEvent(value: GitlabReviewEvent): void {
 
 function isValidEvent(value: unknown): value is GitlabReviewEvent {
   if (!isRecord(value)) return false;
-  return typeof value.dedupId === "string" && /^[A-Za-z0-9._:-]{1,200}$/.test(value.dedupId)
+  return (value.pipeline === undefined || value.pipeline === true)
+    && typeof value.dedupId === "string" && /^[A-Za-z0-9._:-]{1,200}$/.test(value.dedupId)
     && Number.isInteger(value.projectId) && (value.projectId as number) > 0
     && typeof value.projectPath === "string" && /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/.test(value.projectPath)
     && value.projectPath.length <= 300

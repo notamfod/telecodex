@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -26,9 +26,7 @@ import { runSentryTopRecipe } from "./sentry-recipe.js";
 import {
   RECIPE_CONFIG_PATH,
   parseRecipes,
-  type MircliReviewRecipe,
   type Recipe,
-  type ReviewRecipe,
 } from "./recipe-config.js";
 import { sendRecipeMessage } from "./recipe-telegram.js";
 import { deliverReviewDigest } from "./recipe-review-delivery.js";
@@ -49,6 +47,9 @@ import {
 import { prepareReviewWorktree } from "./review-worktree.js";
 import { markerProject, renderGitlabReviewResultMarker } from "./gitlab-review-result-marker.js";
 import type { GitlabReviewMarkerProject } from "./gitlab-review-result-marker.js";
+import { enqueueReviewFindings } from "./review-pipeline-enqueue.js";
+import { writeShadow } from "./recipe-shadow.js";
+import { runRequestedPipeline } from "./review-pipeline-events.js";
 
 /**
  * Scheduled review recipes.
@@ -115,45 +116,6 @@ async function firstBaseline(cwd: string, headSha: string): Promise<string> {
   return sha || (await git(cwd, ["rev-parse", `${headSha}~1`])).trim();
 }
 
-type CodeReviewRecipe = ReviewRecipe | MircliReviewRecipe;
-
-/** The shadow log is read by a human, so undo the Telegram markup and its escaping. */
-function toPlainText(html: string): string {
-  return html
-    .replace(/<[^>]+>/g, "")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, "&");
-}
-
-/** During calibration the findings land here so false positives can be muted by hand. */
-async function writeShadow(
-  recipe: CodeReviewRecipe,
-  project: string,
-  stamp: string,
-  findings: Finding[],
-  html: string,
-): Promise<void> {
-  await mkdir(SHADOW_DIR, { recursive: true });
-  const lines = [
-    `## ${stamp} · ${project}`,
-    "",
-    toPlainText(html),
-    "",
-    "Отпечатки — скопируй в `ignored` в .telecodex/recipes.json, чтобы заглушить:",
-    ...findings.map((finding) => `    ${JSON.stringify(fingerprintFinding(finding))},`),
-    "",
-    "",
-  ];
-  await appendFile(
-    path.join(SHADOW_DIR, `${recipe.id}-${project}.shadow.md`),
-    lines.join("\n"),
-    "utf8",
-  );
-}
-
 /** Which recipes exist is deployment-specific, so it comes from a file. */
 async function loadRecipes(): Promise<Recipe[]> {
   const configPath = process.env.RECIPES_CONFIG ?? RECIPE_CONFIG_PATH;
@@ -196,6 +158,7 @@ async function runRecipe(): Promise<void> {
   // twenty-minute review means the whole run is wasted.
   const preview = process.argv.includes("--preview");
   const webhook = process.argv.includes("--webhook");
+  if (await runRequestedPipeline(recipe, projectNames, { args: process.argv, probe, preview, webhook })) return;
   if (webhook && (recipe.id !== "daily-diff-review" || recipe.kind !== "mircli-review")) {
     throw new Error("--webhook only applies to daily-diff-review");
   }
@@ -293,9 +256,13 @@ async function runRecipe(): Promise<void> {
         seen: projectStateFor(previous, project.name).seen ?? [],
         ignored,
       });
+      if (!webhook && recipe.deliver && triage.fresh.length) {
+        enqueueReviewFindings({ recipe: recipe.id, project: project.name,
+          cwd: project.worktreePath ?? project.sourcePath, headSha: project.headSha }, triage.fresh);
+      }
       webhookResults.push(markerProject(project, triage.fresh.length));
       const html = renderRunHTML({ recipe: `${recipe.id}/${project.name}`, ...triage });
-      await writeShadow(recipe, project.name, stamp, triage.fresh, html);
+      await writeShadow(recipe, project.name, stamp, triage.fresh, html, SHADOW_DIR);
       if (recipe.deliver && triage.shouldDeliver && !webhook) {
         const runId = nextRunId++;
         reservePendingRun(STATE_PATH, runId, {
@@ -441,10 +408,13 @@ async function runRecipe(): Promise<void> {
     seen: previous.seen ?? [],
     ignored,
   });
+  if (!probe && recipe.kind !== "deps" && recipe.deliver && triage.fresh.length && head) {
+    enqueueReviewFindings({ recipe: recipe.id, project, cwd: reviewCwd, headSha: head }, triage.fresh);
+  }
   const html = renderRunHTML({ recipe: recipe.id, ...triage });
 
   // The shadow log is the permanent record either way; delivery is on top of it.
-  await writeShadow(recipe, project, stamp, triage.fresh, html);
+  await writeShadow(recipe, project, stamp, triage.fresh, html, SHADOW_DIR);
 
   // A probe never posts: calibrating on history must not wake the topic up.
   let runId: number | undefined;

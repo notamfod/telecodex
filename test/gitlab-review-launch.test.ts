@@ -112,6 +112,24 @@ describe("GitLab review manual launch store", () => {
     await second.store.close();
   });
 
+  it.each([true, false])("launches and tracks a pipeline once (normal review first: %s)", async (reviewed) => {
+    const first = await open();
+    await first.store.offer(event());
+    await first.store.runDueNotifications();
+    const activation = { requestId: "1".repeat(32), ...target, messageId: 501 };
+    if (reviewed) await first.store.activate(activation);
+    await expect(first.store.activate(activation, true)).resolves.toBe("accepted");
+    expect(first.enqueue).toHaveBeenLastCalledWith(expect.objectContaining({ pipeline: true }));
+    const pipeline = first.enqueue.mock.calls[reviewed ? 1 : 0]![0];
+    expect(pipeline.dedupId).not.toBe("push:one");
+    expect(first.store.feedbackOffers()[0]?.dedupId).toBe(pipeline.dedupId);
+    await first.store.close();
+    const second = await open();
+    await expect(second.store.activate(activation, true)).resolves.toBe("duplicate");
+    expect(second.enqueue).not.toHaveBeenCalled();
+    await second.store.close();
+  });
+
   it("rejects unknown, premature, and mismatched activation coordinates", async () => {
     const { store } = await open();
     await store.offer(event());
@@ -219,6 +237,21 @@ describe("GitLab review manual launch store", () => {
   it("fails closed on malformed or unbounded persisted offers", async () => {
     writeFileSync(statePath, JSON.stringify({ version: 1, offers: [{ summary: { author: "x".repeat(10_000) } }] }));
     await expect(open()).rejects.toThrow("state is invalid");
+  });
+
+  it.each([true, false])("recycles pipeline offers only after terminal feedback is delivered: %s", async (delivered) => {
+    const offers = Array.from({ length: 500 }, (_, index) => ({
+      requestId: (index + 2).toString(16).padStart(32, "0"), dedupId: `push:${index}`,
+      event: event(`push:${index}`), summary: {}, target, status: "notified",
+      createdAt: index, nextNotifyAt: null, notifyAttempt: 0, messageId: index + 1, activationAt: null,
+      pipelineStatus: "activated", pipelineAt: now,
+    }));
+    writeFileSync(statePath, JSON.stringify({ version: 1, offers }));
+    const { store } = await open({ canRecyclePipeline: () => delivered });
+    if (delivered) await expect(store.offer(event("push:new"))).resolves.toMatchObject({ outcome: "accepted" });
+    else await expect(store.offer(event("push:new"))).rejects.toThrow("store is full");
+    expect(store.status().total).toBe(500);
+    await store.close();
   });
 
   it("escapes and bounds every optional card field", () => {

@@ -72,7 +72,12 @@ describe("GitLab review card feedback", () => {
     );
 
     phase = { phase: "completed", result: { outcome: "reviewed", findings: 0, freshFindings: 0 } };
+    expect(store.hasDeliveredCompletion(offer.requestId, phase)).toBe(false);
     await store.runDue();
+    expect(store.hasDeliveredCompletion(offer.requestId, phase)).toBe(true);
+    expect(store.hasDeliveredCompletion(offer.requestId, { phase: "queued" })).toBe(false);
+    expect(store.hasDeliveredCompletion(offer.requestId, { phase: "completed",
+      result: { outcome: "reviewed", findings: 1, freshFindings: 1 } })).toBe(false);
     expect(editCard).toHaveBeenLastCalledWith(
       offer,
       expect.stringContaining("проблем не найдено"),

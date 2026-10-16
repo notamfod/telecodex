@@ -51,6 +51,9 @@ interface ReviewRunnerConfig {
 interface ReviewEventPath {
   readonly projectPath: string;
   readonly dedupId: string;
+  readonly pipeline?: true;
+  readonly after?: string;
+  readonly before?: string;
 }
 
 export function loadGitlabReviewWebhookConfig(
@@ -95,6 +98,11 @@ export async function runDailyDiffReview(
     readonly signal?: AbortSignal;
   } = {},
 ): Promise<GitlabReviewRunResults> {
+  const pipelines = events.filter((event) => event.pipeline);
+  if (pipelines.length && pipelines.length !== events.length) {
+    const normal = await runDailyDiffReview(config, events.filter((event) => !event.pipeline), dependencies);
+    return { ...normal, ...await runDailyDiffReview(config, pipelines, dependencies) };
+  }
   const allowed = new Map(config.projects.map((project) => [project, path.posix.basename(project)]));
   const projectNames = [...new Set(events.map((event) => allowed.get(event.projectPath)))].filter(
     (name): name is string => name !== undefined,
@@ -107,7 +115,10 @@ export async function runDailyDiffReview(
   try {
     const result = await runProcess({
       file: process.execPath,
-      args: [config.runnerPath, "daily-diff-review", "--projects", JSON.stringify(projectNames), "--webhook"],
+      args: [config.runnerPath, "daily-diff-review", "--projects", JSON.stringify(projectNames), "--webhook",
+        ...(pipelines.length ? ["--pipeline-events", JSON.stringify(pipelines.map((event) => ({
+          projectPath: event.projectPath, after: event.after, ...(event.before ? { before: event.before } : {}),
+        })))] : [])],
       cwd: config.runnerCwd,
       timeoutMs: RUNNER_TIMEOUT_MS,
       maxOutputBytes: MAX_RUNNER_OUTPUT_BYTES,
@@ -201,11 +212,13 @@ export async function main(env = process.env): Promise<void> {
   });
   const links = { gitlabUrl: env.GITLAB_URL, miniAppLaunchUrl: env.MINI_APP_LAUNCH_URL };
   let launches: GitlabReviewLaunchStore;
+  let feedback: GitlabReviewFeedbackStore;
   try {
     launches = await GitlabReviewLaunchStore.open({
       statePath: `${config.statePath}.launches.json`,
       target: recipe.deliver!,
       enqueue: (event) => queue.enqueue(event),
+      canRecyclePipeline: (requestId, dedupId) => feedback?.hasDeliveredCompletion(requestId, queue.feedback(dedupId)) === true,
       links,
       sendCard: async (card, target, signal) => {
         const fetchWithSignal: typeof fetch = (input, init) => fetch(input, { ...init, signal });
@@ -222,7 +235,6 @@ export async function main(env = process.env): Promise<void> {
     await queue.close();
     throw error;
   }
-  let feedback: GitlabReviewFeedbackStore;
   try {
     feedback = await GitlabReviewFeedbackStore.open({
       statePath: `${config.statePath}.feedback.json`,
@@ -257,6 +269,7 @@ export async function main(env = process.env): Promise<void> {
       offer: (event, summary) => launches.offer(event, summary),
       launchSecret,
       onLaunch: (activation) => launches.activate(activation),
+      onPipeline: (activation) => launches.activate(activation, true),
       ...(deployments ? {
         onDeployment: (projectPath: string) => deployments!.invalidate(projectPath),
         onDeployView: (request) => deployments!.selectView(request),

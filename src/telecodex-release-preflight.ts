@@ -30,7 +30,7 @@ export interface TeleCodexReleasePreflightReport {
     readonly uncertain: number;
     readonly failed: number;
   };
-  readonly guardian: "ready" | "unavailable";
+  readonly guardian: "ready" | "unavailable" | "disabled";
   readonly releaseId: string | null;
 }
 
@@ -46,7 +46,7 @@ export interface TeleCodexReleasePreflightDependencies {
   checkedAt: () => number;
   releaseId: () => string | null;
   store: TeleCodexReleasePreflightStore;
-  guardianStatus: () => Promise<{ readonly running: boolean }>;
+  readonly guardianStatus?: () => Promise<{ readonly running: boolean }>;
 }
 
 interface MutableCounts {
@@ -73,7 +73,9 @@ export async function inspectTeleCodexReleasePreflight(
   const reasons = new Set<TeleCodexReleasePreflightReason>();
   let jobs = emptyJobCounts();
   let deliveries = emptyDeliveryCounts();
-  const guardianPromise = inspectGuardian(dependencies.guardianStatus);
+  const guardianPromise = dependencies.guardianStatus
+    ? inspectGuardian(dependencies.guardianStatus)
+    : Promise.resolve("disabled" as const);
 
   try {
     dependencies.store.probeReleaseReadable(MAX_UNFINISHED_JOBS);
@@ -143,7 +145,7 @@ function countDelivery(
 }
 
 async function inspectGuardian(
-  status: TeleCodexReleasePreflightDependencies["guardianStatus"],
+  status: NonNullable<TeleCodexReleasePreflightDependencies["guardianStatus"]>,
 ): Promise<"ready" | "unavailable"> {
   try { return (await status()).running ? "ready" : "unavailable"; }
   catch { return "unavailable"; }

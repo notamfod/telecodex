@@ -2,6 +2,7 @@ export type TeleCodexCleanupStep =
   | "begin-shutdown"
   | "topic-synchronizer"
   | "status-board"
+  | "review-pipeline"
   | "mini-app"
   | "runner"
   | "retention-runtime"
@@ -15,6 +16,7 @@ export type TeleCodexCleanupStep =
 export interface TeleCodexLifecycleResources {
   topicSynchronizer?: { stop(): void };
   statusBoard?: { stop(): void };
+  reviewPipeline?: { dispose(): Promise<void> };
   miniAppServer?: { close(): Promise<void> };
   runner?: { stop(): Promise<void> };
   retentionRuntime?: { dispose(): Promise<void> };
@@ -109,6 +111,7 @@ export function createTeleCodexLifecycle(
 
     runSync("topic-synchronizer", resources.topicSynchronizer?.stop.bind(resources.topicSynchronizer));
     runSync("status-board", resources.statusBoard?.stop.bind(resources.statusBoard));
+    if (resources.reviewPipeline) await runAsync("review-pipeline", resources.reviewPipeline.dispose.bind(resources.reviewPipeline));
     await runAsync("mini-app", resources.miniAppServer?.close.bind(resources.miniAppServer));
 
     let runnerStoppedCleanly = true;

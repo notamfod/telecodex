@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 
-import { parseTelegramJobConfig } from "./config.js";
+import { parseSessionGuardianSocketPath, parseTelegramJobConfig, type TelegramJobStoreMode } from "./config.js";
 import { loadSessionGuardianEnvironment, parseSessionGuardianConfig }
   from "./session-guardian-config.js";
 import { SessionGuardianIpcClient } from "./session-guardian-ipc-client.js";
@@ -25,6 +25,7 @@ import {
   type TeleCodexReleasePreflightReport,
   type TeleCodexReleasePreflightStore,
 } from "./telecodex-release-preflight.js";
+import { createLegacyReleasePreflightStore } from "./telecodex-release-legacy-probe.js";
 
 export interface TeleCodexReleaseCliDependencies {
   readonly preflight?: () => Promise<TeleCodexReleasePreflightReport>;
@@ -177,29 +178,48 @@ async function inspectCurrentReleaseState(): Promise<TeleCodexReleasePreflightRe
   let preflightStore: TeleCodexReleasePreflightStore;
   try {
     const telegramJobs = parseTelegramJobConfig(loaded.workspace, loaded.env);
-    store = new SqliteTelegramJobStore(telegramJobs.databasePath, { readOnly: true });
-    preflightStore = store;
+    if (usesLegacyReleaseStore(telegramJobs.storeMode)) {
+      const botLegacyPath = path.join(loaded.workspace, ".telecodex", "jobs.json");
+      if (telegramJobs.legacyJsonPath !== botLegacyPath) {
+        throw new Error("Legacy job path differs from the active bot store");
+      }
+      preflightStore = createLegacyReleasePreflightStore(botLegacyPath);
+    } else {
+      store = new SqliteTelegramJobStore(telegramJobs.databasePath, { readOnly: true });
+      preflightStore = store;
+    }
   } catch {
     preflightStore = unavailableStore();
   }
 
   try {
+    const guardianStatus = releaseGuardianStatus(loaded.env, loaded.workspace);
     return await inspectTeleCodexReleasePreflight({
       checkedAt: Date.now,
       releaseId: () => null,
       store: preflightStore,
-      guardianStatus: async () => {
-        const guardian = parseSessionGuardianConfig(loaded.env, {
-          home: os.homedir(),
-          workspace: loaded.workspace,
-        });
-        const response = await new SessionGuardianIpcClient(guardian.socketPath).status();
-        return { running: response.outcome !== "failed" && response.status?.running === true };
-      },
+      ...(guardianStatus ? { guardianStatus } : {}),
     });
   } finally {
     store?.close();
   }
+}
+
+export function releaseGuardianStatus(
+  env: Readonly<Record<string, string | undefined>>,
+  workspace: string,
+): (() => Promise<{ readonly running: boolean }>) | undefined {
+  if (env.SESSION_GUARDIAN_SOCKET_PATH === undefined) return undefined;
+  parseSessionGuardianSocketPath(env.SESSION_GUARDIAN_SOCKET_PATH);
+  const guardian = parseSessionGuardianConfig(env, { home: os.homedir(), workspace });
+  return async () => {
+    const response = await new SessionGuardianIpcClient(guardian.socketPath).status();
+    return { running: response.outcome !== "failed" && response.status?.running === true };
+  };
+}
+
+export function usesLegacyReleaseStore(mode: TelegramJobStoreMode): boolean {
+  return mode === "json" || mode === "shadow";
 }
 
 function unavailableStore(): TeleCodexReleasePreflightStore {

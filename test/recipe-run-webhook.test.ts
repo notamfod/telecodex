@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({ runReviewPortfolio: vi.fn(), deliverReviewDigest: vi.fn() }));
+const mocks = vi.hoisted(() => ({ runReviewPortfolio: vi.fn(), deliverReviewDigest: vi.fn(), enqueue: vi.fn() }));
+vi.mock("../src/review-pipeline-enqueue.js", () => ({ enqueueReviewFindings: mocks.enqueue }));
 vi.mock("../src/recipe-review-delivery.js", () => ({ deliverReviewDigest: mocks.deliverReviewDigest }));
 vi.mock("../src/review-portfolio.js", async (original) => ({
   ...await original<typeof import("../src/review-portfolio.js")>(),
@@ -28,6 +29,7 @@ describe("webhook recipe runner", () => {
     vi.resetModules();
     mocks.runReviewPortfolio.mockReset();
     mocks.deliverReviewDigest.mockReset();
+    mocks.enqueue.mockReset();
   });
 
   it("reports partial failure to the durable queue after preserving successful progress", async () => {
@@ -111,9 +113,39 @@ describe("webhook recipe runner", () => {
     await import("../src/recipe-run.js");
     await vi.waitFor(() => expect(logs.some((line) => line.startsWith("TELECODEX_GITLAB_REVIEW_RESULT="))).toBe(true));
     expect(mocks.deliverReviewDigest).not.toHaveBeenCalled();
+    expect(mocks.enqueue).not.toHaveBeenCalled();
     const marker = JSON.parse(logs.find((line) => line.startsWith("TELECODEX_GITLAB_REVIEW_RESULT="))!.split("=", 2)[1]);
     expect(marker.projects[0].details.items[0].description).toBe("Missing auth");
     const state = JSON.parse(readFileSync(path.join(directory, ".telecodex", "recipes.json"), "utf8"));
     expect(state.pending).toBeUndefined();
+  });
+
+  it("automatically enqueues fresh scheduled findings with their reviewed SHA", async () => {
+    directory = mkdtempSync(path.join(tmpdir(), "tc-scheduled-pipeline-"));
+    writeFileSync(path.join(directory, "prompt.md"), "review");
+    writeFileSync(path.join(directory, "recipes.json"), JSON.stringify({ recipes: [{
+      id: "daily-diff-review", kind: "mircli-review", cwd: "/srv/mircli", worktreeRoot: "/cache",
+      promptFile: "prompt.md", deliver: { chatId: -1001, messageThreadId: 7 },
+    }] }));
+    const finding = { severity: "high", priority: "P1", file: "x.ts", line: 7, category: "auth", description: "Missing auth" };
+    mocks.runReviewPortfolio.mockResolvedValue({ projects: [{ name: "mir-back", sourcePath: "/srv/mircli/mir-back",
+      worktreePath: "/cache/mir-back", status: "reviewed", headSha: "b".repeat(40), findings: [finding],
+    }] });
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line) => logs.push(String(line)));
+    const oldToken = process.env.TELEGRAM_BOT_TOKEN;
+    process.env.TELEGRAM_BOT_TOKEN = "test-token";
+    process.argv = ["node", "recipe-run.js", "daily-diff-review"];
+    process.env.RECIPES_CONFIG = path.join(directory, "recipes.json");
+    process.chdir(directory);
+    try {
+      await import("../src/recipe-run.js");
+      await vi.waitFor(() => expect(logs.some((line) => line.includes("1 reviewed"))).toBe(true));
+      expect(mocks.enqueue).toHaveBeenCalledWith({ recipe: "daily-diff-review", project: "mir-back",
+        cwd: "/cache/mir-back", headSha: "b".repeat(40) }, [finding]);
+      expect(mocks.deliverReviewDigest).toHaveBeenCalledOnce();
+    } finally {
+      if (oldToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN; else process.env.TELEGRAM_BOT_TOKEN = oldToken;
+    }
   });
 });

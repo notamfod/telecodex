@@ -28,6 +28,7 @@ export function loadGitlabReviewLaunchSecret(
 export async function activateGitlabReview(
   request: GitlabReviewLaunchRequest,
   dependencies: { readonly fetch?: typeof fetch; readonly secret?: string; readonly port?: number } = {},
+  pipeline = false,
 ): Promise<GitlabReviewLaunchOutcome> {
   if (!/^[a-f0-9]{32}$/.test(request.requestId)
     || !Number.isSafeInteger(request.chatId) || request.chatId === 0
@@ -39,7 +40,7 @@ export async function activateGitlabReview(
   if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error("Invalid GitLab review launch port");
   const secret = dependencies.secret ?? loadGitlabReviewLaunchSecret();
   const response = await (dependencies.fetch ?? fetch)(
-    `http://127.0.0.1:${port}/internal/gitlab/review-launch`,
+    `http://127.0.0.1:${port}/internal/gitlab/${pipeline ? "review-pipeline" : "review-launch"}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-telecodex-review-token": secret },

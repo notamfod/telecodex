@@ -120,6 +120,7 @@ export function runCodexReadOnly(
   model: string | undefined,
   prompt: string,
   outputFile: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const args = [
     "exec",
@@ -136,17 +137,22 @@ export function runCodexReadOnly(
   args.push("-");
 
   return new Promise((resolve, reject) => {
-    const child = spawn("codex", args, { stdio: codexStdio() });
+    if (signal?.aborted) { reject(new Error("review agent aborted")); return; }
+    const child = spawn("codex", args, { stdio: codexStdio(), detached: true });
+    const stop = () => { if (child.pid) { try { process.kill(-child.pid, "SIGKILL"); } catch { /* Already closed. */ } } };
+    signal?.addEventListener("abort", stop, { once: true });
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      stop();
       reject(new Error(`codex exec exceeded ${CODEX_TIMEOUT_MS / 60000} minutes`));
     }, CODEX_TIMEOUT_MS);
     child.on("error", (error) => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", stop);
       reject(error);
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", stop);
       code === 0 ? resolve() : reject(new Error(`codex exec exited with ${code}`));
     });
     child.stdin.end(prompt);

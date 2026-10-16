@@ -48,6 +48,10 @@ export function gitlabReviewKeyboard(
   if (!/^[a-f0-9]{32}$/.test(requestId)) throw new Error("Invalid GitLab review request id");
   const rows: ReviewButton[][] = launch
     ? [[{ text: "▶ Запустить ревью", callback_data: `greview:${requestId}` }]] : [];
+  rows.push([
+    { text: "☐ В подборку", callback_data: `gpselect:${requestId}` },
+    { text: "▶ Запустить пайплайн", callback_data: `gpipeline:${requestId}` },
+  ]);
   const navigation: ReviewButton[] = [];
   if (links.miniAppLaunchUrl) {
     const miniApp = safeHttpsUrl(links.miniAppLaunchUrl);

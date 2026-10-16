@@ -32,6 +32,7 @@ export interface GitlabReviewWebhookOptions {
   }>;
   readonly launchSecret?: string;
   readonly onLaunch?: (activation: GitlabReviewLaunchActivation) => Promise<GitlabReviewEnqueueResult>;
+  readonly onPipeline?: (activation: GitlabReviewLaunchActivation) => Promise<GitlabReviewEnqueueResult>;
   readonly onDeployment?: (projectPath: string) => void;
   readonly onDeployView?: (request: DeployViewRequest) => Promise<void>;
   readonly bodyReadTimeoutMs?: number;
@@ -97,7 +98,8 @@ async function handleRequest(
       sendJson(response, 200, { outcome: "ok" });
       return;
     }
-    if (request.method === "POST" && request.url === "/internal/gitlab/review-launch") {
+    if (request.method === "POST" && (request.url === "/internal/gitlab/review-launch"
+      || request.url === "/internal/gitlab/review-pipeline")) {
       await handleLaunchRequest(request, response, options, bodyReadTimeoutMs);
       return;
     }
@@ -219,8 +221,9 @@ async function handleLaunchRequest(
   options: GitlabReviewWebhookOptions,
   bodyReadTimeoutMs: number,
 ): Promise<void> {
+  const launch = request.url === "/internal/gitlab/review-pipeline" ? options.onPipeline : options.onLaunch;
   if (!isLoopback(request.socket.remoteAddress)
-    || !options.launchSecret || !options.onLaunch
+    || !options.launchSecret || !launch
     || !secureEqual(singleHeader(request, "x-telecodex-review-token") ?? "", options.launchSecret)) {
     request.resume();
     sendJson(response, 401, { outcome: "failed" });
@@ -234,7 +237,7 @@ async function handleLaunchRequest(
   try {
     const body = parseObject(await readBody(request, bodyReadTimeoutMs));
     const activation = parseActivation(body);
-    const outcome = await options.onLaunch(activation);
+    const outcome = await launch(activation);
     sendJson(response, 202, { outcome });
   } catch (error) {
     const status = error instanceof GitlabReviewLaunchNotFoundError ? 404

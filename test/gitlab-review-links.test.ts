@@ -10,10 +10,12 @@ describe("review navigation buttons", () => {
     const keyboard = gitlabReviewKeyboard(event, requestId, links, true);
     expect(keyboard.inline_keyboard).toEqual([
       [{ text: "▶ Запустить ревью", callback_data: `greview:${requestId}` }],
+      [{ text: "☐ В подборку", callback_data: `gpselect:${requestId}` },
+        { text: "▶ Запустить пайплайн", callback_data: `gpipeline:${requestId}` }],
       [{ text: "📄 Дифф", url: `https://t.me/ExampleBot/app?startapp=review_${requestId}` },
         { text: "↗ GitLab", url: `https://git.example.test/group/app/-/compare/${event.before}...${event.after}?straight=true` }],
     ]);
-    expect(gitlabReviewKeyboard(event, requestId, links, false).inline_keyboard).toHaveLength(1);
+    expect(gitlabReviewKeyboard(event, requestId, links, false).inline_keyboard).toHaveLength(2);
   });
 
   it("uses actual reviewed SHAs after review and falls back to a commit for old cards", () => {

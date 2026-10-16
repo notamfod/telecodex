@@ -144,6 +144,9 @@ import {
 import { buildFixPrompt, fingerprintFinding, fixTopicName, type Finding } from "./recipes.js";
 import { registerGitlabReviewHandlers } from "./bot-gitlab-review.js";
 import { registerMircliDeployHandlers } from "./bot-mircli-deploy.js";
+import { registerReviewPipelineHandlers } from "./bot-review-pipeline.js";
+import { renderPipelineAnalysisPrompt } from "./review-pipeline-render.js";
+import { preparePipelineSnapshot } from "./review-pipeline-runtime.js";
 import { parseRecipes, RECIPE_CONFIG_PATH } from "./recipe-config.js";
 import {
   buildSentryAnalysisPrompt,
@@ -2740,6 +2743,47 @@ export function createBot(
 
   registerGitlabReviewHandlers(bot, config.telegramAllowedUserIdSet);
   registerMircliDeployHandlers(bot, config);
+  registerReviewPipelineHandlers(bot, config, async (ctx, job) => {
+    const pinned = await preparePipelineSnapshot(job);
+    const workspace = pinned.source.cwd;
+    const topicName = taskTopicName(job.draft?.summary ?? job.source.finding.description, job.source.project);
+    const prompt = renderPipelineAnalysisPrompt(pinned);
+    const profile = config.launchProfiles.find((candidate) => candidate.sandboxMode === "read-only"
+      && candidate.approvalPolicy === "never");
+    if (!profile || !ctx.chat) throw new Error("Read-only analysis profile unavailable");
+    if (reliability) {
+      const raw = canonicalWorkSource(ctx, "confirmation", prompt, null,
+        { workspace, launchProfileId: profile.id, topicName }, undefined, undefined,
+        { kind: "forum_topic", topicName, state: "planned" });
+      if (!raw) throw new Error("Invalid pipeline source");
+      const target = await reliability.handleWork(canonicalCallbackWorkSource(raw, `review-analysis:${job.id}`));
+      if (!target) throw new Error("Analysis topic unavailable");
+      registry.setContextDefaults(contextKeyFromMessage(target.chatId, target.messageThreadId), {
+        workspace, launchProfileId: profile.id, topicName,
+      });
+      return target.messageThreadId;
+    }
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) throw new Error("Analysis source unavailable");
+    const externalKey = `review-${job.id}`;
+    let ticket = inbox.findTicketByKey(contextKey, externalKey);
+    if (ticket && !ticket.workTopicId) throw new Error("Analysis topic creation needs reconciliation");
+    if (!ticket) {
+      ticket = inbox.createTicket({ externalKey, inboxContextKey: contextKey, workTopicId: 0,
+        workspace, launchProfileId: profile.id, prompt, source: "review pipeline" });
+      const topic = await bot.api.createForumTopic(ctx.chat.id, topicName);
+      inbox.attachTopic(ticket.id, topic.message_thread_id);
+      ticket = inbox.getTicket(ticket.id)!;
+    }
+    const key = contextKeyFromMessage(ctx.chat.id, ticket.workTopicId);
+    registry.setContextDefaults(key, { workspace, launchProfileId: profile.id, topicName });
+    if (!ticket.startedAt) {
+      const session = await registry.getOrCreate(key, { deferThreadStart: true });
+      inbox.markStarted(ticket.id);
+      void handleUserPrompt(ctx, key, ctx.chat.id, session, prompt).catch(() => undefined);
+    }
+    return ticket.workTopicId;
+  });
 
   const recipeMutes = new RecipeMutes(RECIPE_MUTES_PATH);
 

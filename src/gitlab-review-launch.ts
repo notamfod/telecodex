@@ -1,7 +1,6 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-
 import { escapeHTML } from "./format.js";
 import { gitlabReviewKeyboard, type GitlabReviewKeyboard, type GitlabReviewLinks } from "./gitlab-review-links.js";
 import { acquireRecipeRunLock } from "./recipe-run-lock.js";
@@ -20,7 +19,6 @@ import type {
 } from "./gitlab-review-queue.js";
 
 const REQUEST_ID_PATTERN = /^[a-f0-9]{32}$/;
-
 export interface GitlabReviewSummary {
   readonly commitTitle?: string;
   readonly commitCount?: number;
@@ -34,17 +32,14 @@ export interface GitlabReviewLaunchCard {
   readonly callbackData: string;
   readonly replyMarkup: GitlabReviewKeyboard;
 }
-
 export interface GitlabReviewLaunchTarget {
   readonly chatId: number;
   readonly messageThreadId: number;
 }
-
 export interface GitlabReviewLaunchActivation extends GitlabReviewLaunchTarget {
   readonly requestId: string;
   readonly messageId: number;
 }
-
 export interface GitlabReviewFeedbackOffer {
   readonly requestId: string;
   readonly dedupId: string;
@@ -53,7 +48,6 @@ export interface GitlabReviewFeedbackOffer {
   readonly target: GitlabReviewLaunchTarget;
   readonly messageId: number;
 }
-
 export interface GitlabReviewLaunchStoreOptions {
   readonly statePath: string;
   readonly target: GitlabReviewLaunchTarget;
@@ -69,12 +63,12 @@ export interface GitlabReviewLaunchStoreOptions {
   readonly retryMaxMs?: number;
   readonly autoSchedule?: boolean;
   readonly links?: GitlabReviewLinks;
+  readonly canRecyclePipeline?: (requestId: string, dedupId: string) => boolean;
 }
 
 export class GitlabReviewLaunchNotFoundError extends Error {}
 export class GitlabReviewLaunchContextError extends Error {}
 export class GitlabReviewLaunchNotReadyError extends Error {}
-
 export class GitlabReviewLaunchStore {
   private readonly now: () => number;
   private readonly createRequestId: () => string;
@@ -128,6 +122,9 @@ export class GitlabReviewLaunchStore {
       for (const offer of state.offers.filter(({ status }) => status === "activating")) {
         await store.completeActivation(offer.requestId);
       }
+      for (const offer of state.offers.filter(({ pipelineStatus }) => pipelineStatus === "activating")) {
+        await store.completeActivation(offer.requestId, true);
+      }
       store.schedule();
       return store;
     } catch (error) {
@@ -177,15 +174,15 @@ export class GitlabReviewLaunchStore {
     });
   }
 
-  activate(input: GitlabReviewLaunchActivation): Promise<GitlabReviewEnqueueResult> {
+  activate(input: GitlabReviewLaunchActivation, pipeline = false): Promise<GitlabReviewEnqueueResult> {
     if (this.closed) return Promise.reject(new Error("GitLab review launch store is closed"));
-    const operation = this.activateInternal(input);
+    const operation = this.activateInternal(input, pipeline);
     this.activationRequests.add(operation);
     void operation.finally(() => this.activationRequests.delete(operation)).catch(() => undefined);
     return operation;
   }
 
-  private async activateInternal(input: GitlabReviewLaunchActivation): Promise<GitlabReviewEnqueueResult> {
+  private async activateInternal(input: GitlabReviewLaunchActivation, pipeline: boolean): Promise<GitlabReviewEnqueueResult> {
     validateActivation(input);
     const phase = await this.mutate(async () => {
       this.assertOpen();
@@ -199,11 +196,17 @@ export class GitlabReviewLaunchStore {
         || offer.messageId !== input.messageId) {
         throw new GitlabReviewLaunchContextError("GitLab review launch context does not match");
       }
-      if (offer.status === "activated") return "duplicate" as const;
-      if (offer.status === "activating") return "resume" as const;
+      const status = pipeline ? offer.pipelineStatus : offer.status;
+      if (status === "activated") return "duplicate" as const;
+      if (status === "activating") return "resume" as const;
       const previous = structuredClone(this.state);
-      offer.status = "activating";
-      offer.activationAt = this.now();
+      if (pipeline) {
+        offer.pipelineStatus = "activating";
+        offer.pipelineAt = this.now();
+      } else {
+        offer.status = "activating";
+        offer.activationAt = this.now();
+      }
       try {
         await this.persist();
       } catch (error) {
@@ -213,7 +216,7 @@ export class GitlabReviewLaunchStore {
       return "accepted" as const;
     });
     if (phase === "duplicate") return "duplicate";
-    await this.completeActivation(input.requestId);
+    await this.completeActivation(input.requestId, pipeline);
     return phase === "accepted" ? "accepted" : "duplicate";
   }
 
@@ -252,10 +255,10 @@ export class GitlabReviewLaunchStore {
   }
 
   feedbackOffers(): GitlabReviewFeedbackOffer[] {
-    return this.state.offers.flatMap((offer) => offer.status === "activated" && offer.messageId !== null
+    return this.state.offers.flatMap((offer) => (offer.status === "activated" || offer.pipelineStatus === "activated") && offer.messageId !== null
       ? [{
         requestId: offer.requestId,
-        dedupId: offer.dedupId,
+        dedupId: offer.pipelineStatus === "activated" ? `pipeline:${createHash("sha256").update(offer.dedupId).digest("hex")}` : offer.dedupId,
         event: { ...offer.event },
         summary: { ...offer.summary },
         target: { ...offer.target },
@@ -346,24 +349,30 @@ export class GitlabReviewLaunchStore {
     });
   }
 
-  private completeActivation(requestId: string): Promise<void> {
-    const existing = this.activationRuns.get(requestId);
+  private completeActivation(requestId: string, pipeline = false): Promise<void> {
+    const key = `${requestId}:${pipeline}`;
+    const existing = this.activationRuns.get(key);
     if (existing) return existing;
-    const operation = this.completeActivationInternal(requestId);
-    this.activationRuns.set(requestId, operation);
-    void operation.finally(() => this.activationRuns.delete(requestId)).catch(() => undefined);
+    const operation = this.completeActivationInternal(requestId, pipeline);
+    this.activationRuns.set(key, operation);
+    void operation.finally(() => this.activationRuns.delete(key)).catch(() => undefined);
     return operation;
   }
 
-  private async completeActivationInternal(requestId: string): Promise<void> {
+  private async completeActivationInternal(requestId: string, pipeline: boolean): Promise<void> {
     const offer = this.state.offers.find((candidate) => candidate.requestId === requestId);
-    if (!offer || offer.status !== "activating" || offer.activationAt === null) return;
-    await this.options.enqueue({ ...offer.event, receivedAt: offer.activationAt });
+    const at = pipeline ? offer?.pipelineAt : offer?.activationAt;
+    if (!offer || (pipeline ? offer.pipelineStatus : offer.status) !== "activating" || at == null) return;
+    await this.options.enqueue({ ...offer.event, receivedAt: at,
+      ...(pipeline ? { pipeline: true as const,
+        dedupId: `pipeline:${createHash("sha256").update(offer.dedupId).digest("hex")}` } : {}),
+    });
     await this.mutate(async () => {
       const current = this.state.offers.find((candidate) => candidate.requestId === requestId);
-      if (!current || current.status !== "activating") return;
+      if (!current || (pipeline ? current.pipelineStatus : current.status) !== "activating") return;
       const previous = structuredClone(this.state);
-      current.status = "activated";
+      if (pipeline) current.pipelineStatus = "activated";
+      else current.status = "activated";
       try {
         await this.persist();
       } catch (error) {
@@ -376,7 +385,9 @@ export class GitlabReviewLaunchStore {
   private makeRoom(): void {
     if (this.state.offers.length < MAX_LAUNCH_OFFERS) return;
     const oldest = this.state.offers
-      .filter(({ status }) => status === "activated")
+      .filter(({ status, pipelineStatus, requestId, dedupId }) => status !== "activating" && pipelineStatus !== "activating"
+        && (pipelineStatus === "activated" ? this.options.canRecyclePipeline?.(requestId,
+          `pipeline:${createHash("sha256").update(dedupId).digest("hex")}`) === true : status === "activated"))
       .sort((left, right) => left.createdAt - right.createdAt)[0];
     if (!oldest) throw new Error("GitLab review launch store is full");
     this.state.offers = this.state.offers.filter(({ requestId }) => requestId !== oldest.requestId);

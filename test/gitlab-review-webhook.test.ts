@@ -90,6 +90,22 @@ describe("GitLab review webhook", () => {
     expect(onLaunch).not.toHaveBeenCalled();
   });
 
+  it("authenticates the separate pipeline action and preserves exact message coordinates", async () => {
+    const onLaunch = vi.fn(async () => "accepted" as const);
+    const onPipeline = vi.fn(async () => "accepted" as const);
+    const started = await start({ onLaunch, onPipeline, launchSecret: "l".repeat(32) });
+    const activation = { requestId: "1".repeat(32), chatId: -1001, messageThreadId: 7, messageId: 9 };
+    expect(await rawSend(started.port, JSON.stringify(activation), {
+      "content-type": "application/json",
+    }, "POST", "/internal/gitlab/review-pipeline")).toMatchObject({ status: 401 });
+    expect(onPipeline).not.toHaveBeenCalled();
+    expect(await rawSend(started.port, JSON.stringify(activation), {
+      "content-type": "application/json", "x-telecodex-review-token": "l".repeat(32),
+    }, "POST", "/internal/gitlab/review-pipeline")).toMatchObject({ status: 202 });
+    expect(onPipeline).toHaveBeenCalledWith(activation);
+    expect(onLaunch).not.toHaveBeenCalled();
+  });
+
   it("authenticates and durably enqueues a normalized push before returning 202", async () => {
     let release!: () => void;
     const persisted = new Promise<void>((resolve) => { release = resolve; });

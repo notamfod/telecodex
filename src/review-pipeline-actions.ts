@@ -3,7 +3,7 @@ import { ReviewPipelineStore, type PipelineJob } from "./review-pipeline-store.j
 
 interface DecisionTarget { chatId: number; topicId: number; messageId: number; }
 interface JiraPort {
-  findByLabel(label: string): Promise<{ key: string; url: string } | undefined>;
+  findByLabel(label: string, job: PipelineJob): Promise<{ key: string; url: string } | undefined>;
   create(job: PipelineJob, label: string): Promise<{ key: string; url: string }>;
 }
 type Outcome = { outcome: "created" | "continuing" | "unknown" | "unavailable"; job?: PipelineJob };
@@ -35,7 +35,7 @@ export class ReviewPipelineActions {
     if (!job || job.status !== "creating") return { outcome: "unavailable" };
     const label = `telecodex-review-${id}`;
     let existing: { key: string; url: string } | undefined;
-    try { existing = await jira.findByLabel(label); }
+    try { existing = await jira.findByLabel(label, job); }
     catch {
       if (fresh) store.releaseDecision(id);
       return { outcome: "unknown", job };

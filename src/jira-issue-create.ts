@@ -3,6 +3,8 @@ import type { PipelineJob } from "./review-pipeline-store.js";
 
 const REQUEST_TIMEOUT_MS = 15_000;
 const SAFE_LABEL = /^telecodex-review-[A-Za-z0-9_-]{1,96}$/;
+const REVIEW_PROPERTY = "telecodex-review";
+const REVIEW_LABEL = "review";
 
 export interface JiraIssueCreateClientOptions {
   server: string;
@@ -27,7 +29,7 @@ export class JiraIssueCreateClient {
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 
-  async findByLabel(label: string): Promise<{ key: string; url: string } | undefined> {
+  async findByLabel(label: string, job?: PipelineJob): Promise<{ key: string; url: string } | undefined> {
     this.validate(label);
     const { response, body } = await this.requestJson("/rest/api/2/search", {
       method: "POST",
@@ -39,8 +41,9 @@ export class JiraIssueCreateClient {
     if (total !== undefined && (typeof total !== "number" || !Number.isSafeInteger(total) || total < 0)) throw new Error("Jira issue lookup returned an invalid response");
     const issues = body.issues;
     if (issues.length > 1 || (typeof total === "number" && total > 1)) throw new Error("Jira issue lookup is ambiguous for review label");
+    if (total !== undefined && total !== issues.length) throw new Error("Jira issue lookup is truncated");
     const key = issues[0]?.key;
-    if (issues.length === 0) return undefined;
+    if (issues.length === 0) return job ? this.findByProperty(label, job) : undefined;
     if (typeof key !== "string" || !/^MIR-\d+$/.test(key)) throw new Error("Jira issue lookup returned an invalid issue key");
     return { key, url: `${this.server}/browse/${key}` };
   }
@@ -52,7 +55,11 @@ export class JiraIssueCreateClient {
     const issueTypeId = await this.resolveMirBugIssueTypeId();
     let result: { response: Response; body: unknown };
     try {
-      result = await this.requestJson("/rest/api/2/issue", { method: "POST", body: JSON.stringify({ fields: { project: { key: "MIR" }, issuetype: { id: issueTypeId }, priority: { name: job.draft.priority }, summary: job.draft.summary, description, labels: [label] } }) });
+      result = await this.requestJson("/rest/api/2/issue", { method: "POST", body: JSON.stringify({
+        fields: { project: { key: "MIR" }, issuetype: { id: issueTypeId }, priority: { name: job.draft.priority },
+          summary: job.draft.summary, description, labels: [REVIEW_LABEL] },
+        properties: [{ key: REVIEW_PROPERTY, value: { id: label } }],
+      }) });
     } catch (error) {
       if (error instanceof JiraIssueCreateUnknownError) throw error;
       throw new JiraIssueCreateUnknownError();
@@ -63,6 +70,36 @@ export class JiraIssueCreateClient {
     }
     if (!isRecord(result.body) || typeof result.body.key !== "string" || !/^MIR-\d+$/.test(result.body.key)) throw new JiraIssueCreateUnknownError();
     return { key: result.body.key, url: `${this.server}/browse/${result.body.key}` };
+  }
+
+  private async findByProperty(label: string, job: PipelineJob): Promise<{ key: string; url: string } | undefined> {
+    if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(job.source.headSha)) throw new Error("Invalid Jira review revision");
+    // The reviewed SHA is already in the human-readable source reference. Use it to
+    // narrow candidates; only the exact issue property establishes identity.
+    const { response, body } = await this.requestJson("/rest/api/2/search", { method: "POST", body: JSON.stringify({
+      jql: `project = MIR AND labels = "${REVIEW_LABEL}" AND description ~ "${job.source.headSha.slice(0, 12)}"`,
+      maxResults: 100, fields: ["key"],
+    }) });
+    if (!response.ok) throw new Error(`Jira property lookup failed: ${response.status}`);
+    if (!isRecord(body) || !Array.isArray(body.issues) || !Number.isSafeInteger(body.total)
+      || (body.total as number) < 0) throw new Error("Jira property lookup returned an invalid response");
+    if (body.total !== body.issues.length || body.issues.length > 100) throw new Error("Jira property lookup is truncated");
+    let found: { key: string; url: string } | undefined;
+    for (const candidate of body.issues) {
+      if (!isRecord(candidate) || typeof candidate.key !== "string" || !/^MIR-\d+$/.test(candidate.key)) throw new Error("Jira property lookup returned an invalid issue key");
+      const key = candidate.key;
+      const issue = await this.requestJson(`/rest/api/2/issue/${key}?fields=labels&properties=${REVIEW_PROPERTY}`, { method: "GET" });
+      if (!issue.response.ok || !isRecord(issue.body) || issue.body.key !== key || !isRecord(issue.body.properties)) {
+        throw new Error("Jira issue property lookup failed");
+      }
+      const property = issue.body.properties[REVIEW_PROPERTY];
+      if (property !== undefined && (!isRecord(property) || typeof property.id !== "string")) throw new Error("Invalid Jira review property");
+      if (isRecord(property) && property.id === label) {
+        if (found) throw new Error("Jira issue property lookup is ambiguous");
+        found = { key, url: `${this.server}/browse/${key}` };
+      }
+    }
+    return found;
   }
 
   private validate(label: string): void {

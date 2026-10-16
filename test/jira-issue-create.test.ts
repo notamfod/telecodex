@@ -19,8 +19,34 @@ describe("JiraIssueCreateClient", () => {
     await client.create(job, "telecodex-review-job-1");
     expect(fetchImpl.mock.calls[1]?.[0]).toBe("https://jira.example.test/rest/api/2/project/MIR");
     const created = JSON.parse(String(fetchImpl.mock.calls[2]?.[1]?.body));
-    expect(created.fields).toMatchObject({ project: { key: "MIR" }, issuetype: { id: "10004" }, priority: { name: "High" }, labels: ["telecodex-review-job-1"] });
+    expect(created.fields).toMatchObject({ project: { key: "MIR" }, issuetype: { id: "10004" }, priority: { name: "High" }, labels: ["review"] });
+    expect(created.properties).toEqual([{ key: "telecodex-review", value: { id: "telecodex-review-job-1" } }]);
     expect(created.fields.description).toBe(pipelineDraftText(job));
+  });
+
+  it("reconciles the internal property after replacing technical labels with the review label", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ issues: [], total: 0 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ issues: [{ key: "MIR-13" }, { key: "MIR-14" }], total: 2 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ key: "MIR-13", properties: { "telecodex-review": { id: "telecodex-review-another" } } }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ key: "MIR-14", properties: { "telecodex-review": { id: "telecodex-review-job-1" } } }), { status: 200 }));
+    const client = new JiraIssueCreateClient({ server: "https://jira.example.test", login: "a", token: "secret", fetchImpl });
+    await expect(client.findByLabel("telecodex-review-job-1", job)).resolves.toEqual({ key: "MIR-14", url: "https://jira.example.test/browse/MIR-14" });
+    expect(JSON.parse(String(fetchImpl.mock.calls[1]?.[1]?.body)).jql).toContain(`description ~ "${job.source.headSha.slice(0, 12)}"`);
+    expect(fetchImpl.mock.calls[2]?.[0]).toContain("properties=telecodex-review");
+  });
+
+  it("fails closed for a truncated property lookup or multiple matching properties", async () => {
+    const empty = () => new Response(JSON.stringify({ issues: [] }), { status: 200 });
+    const candidates = () => new Response(JSON.stringify({ issues: [{ key: "MIR-1" }, { key: "MIR-2" }], total: 2 }), { status: 200 });
+    const fetchImpl = vi.fn().mockResolvedValueOnce(empty())
+      .mockResolvedValueOnce(new Response(JSON.stringify({ issues: [{ key: "MIR-1" }], total: 2 }), { status: 200 }));
+    const client = new JiraIssueCreateClient({ server: "https://jira.example.test", login: "a", token: "secret", fetchImpl });
+    await expect(client.findByLabel("telecodex-review-job-1", job)).rejects.toThrow(/truncated/i);
+    fetchImpl.mockResolvedValueOnce(empty()).mockResolvedValueOnce(candidates())
+      .mockResolvedValueOnce(new Response(JSON.stringify({ key: "MIR-1", properties: { "telecodex-review": { id: "telecodex-review-job-1" } } }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ key: "MIR-2", properties: { "telecodex-review": { id: "telecodex-review-job-1" } } }), { status: 200 }));
+    await expect(client.findByLabel("telecodex-review-job-1", job)).rejects.toThrow(/ambiguous/i);
   });
 
   it("accepts the English Bug type name from MIR project metadata", async () => {
@@ -68,6 +94,10 @@ describe("JiraIssueCreateClient", () => {
     await expect(malformed.findByLabel("telecodex-review-job-1")).rejects.toThrow(/issue key/i);
     const truncated = new JiraIssueCreateClient({ server: "https://jira.example.test", login: "a", token: "b", fetchImpl: vi.fn().mockResolvedValue(new Response(JSON.stringify({ total: 2, issues: [{ key: "MIR-1" }] }), { status: 200 })) });
     await expect(truncated.findByLabel("telecodex-review-job-1")).rejects.toThrow(/ambiguous/i);
+    const inconsistentFetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ total: 1, issues: [] }), { status: 200 }));
+    const inconsistent = new JiraIssueCreateClient({ server: "https://jira.example.test", login: "a", token: "b", fetchImpl: inconsistentFetch });
+    await expect(inconsistent.findByLabel("telecodex-review-job-1", job)).rejects.toThrow(/truncated/i);
+    expect(inconsistentFetch).toHaveBeenCalledOnce();
   });
 
   it("does not retry or hide ambiguous create failures", async () => {

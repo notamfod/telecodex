@@ -7,8 +7,6 @@ export function pipelineDraftText(job: PipelineJob): string {
   if (!job.draft) throw new Error("pipeline job has no draft");
   const source = `${job.source.finding.file}${job.source.finding.line === undefined ? "" : `:${job.source.finding.line}`}`;
   return [
-    job.draft.summary,
-    `Приоритет: ${job.draft.priority}`,
     job.draft.problem,
     `Как исправить: ${job.draft.fix}`,
     `Зачем: ${job.draft.benefit}`,

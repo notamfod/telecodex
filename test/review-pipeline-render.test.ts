@@ -22,7 +22,12 @@ it("renders a safe compact Telegram draft and callback buttons", () => {
 });
 
 it("uses the same draft facts for Jira text and continued analysis", () => {
-  expect(pipelineDraftText(job)).toContain("stop stale polling");
+  const description = pipelineDraftText(job);
+  expect(description).not.toContain(job.draft!.summary);
+  expect(description).not.toContain("Приоритет:");
+  expect(description.split("\n")[0]).toBe(job.draft!.problem);
+  expect(description).toContain(`Как исправить: ${job.draft!.fix}`);
+  expect(description).toContain(`Зачем: ${job.draft!.benefit}`);
   const prompt = renderPipelineAnalysisPrompt(job);
   expect(prompt).toContain(job.source.headSha);
   expect(prompt).toContain("Late response survives cleanup.");

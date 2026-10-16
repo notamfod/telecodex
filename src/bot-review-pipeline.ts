@@ -3,12 +3,14 @@ import type { TeleCodexConfig } from "./config.js";
 import { escapeHTML } from "./format.js";
 import { JiraIssueCreateClient } from "./jira-issue-create.js";
 import { ReviewPipelineActions } from "./review-pipeline-actions.js";
-import { reviewPipelineDbPath } from "./review-pipeline-path.js";
+import { reviewPipelineDbPath, reviewPipelineProgressDbPath } from "./review-pipeline-path.js";
 import { ReviewPipelineRuntime } from "./review-pipeline-runtime.js";
 import { pipelineDraftKeyboard, renderPipelineDraft } from "./review-pipeline-render.js";
 import { ReviewPipelineStore, type PipelineJob } from "./review-pipeline-store.js";
 import { acquireRecipeRunLock } from "./recipe-run-lock.js";
 import { topicUrl } from "./projects.js";
+import { ReviewPipelineProgressStore } from "./review-pipeline-progress-store.js";
+import { ReviewPipelineProgressRuntime } from "./review-pipeline-progress.js";
 
 const CALLBACK = /^(rpcreate|rpcontinue):([a-f0-9]{24})$/;
 const active = new Map<string, Promise<void>>();
@@ -71,7 +73,27 @@ export function startReviewPipelineWorker(config: TeleCodexConfig, api: Api): { 
   let store: ReviewPipelineStore;
   try { store = new ReviewPipelineStore(file); store.recover(); }
   catch (error) { release(); throw error; }
+  let progress: ReviewPipelineProgressStore;
+  try { progress = new ReviewPipelineProgressStore(reviewPipelineProgressDbPath()); progress.recoverMessages(); }
+  catch (error) { store.close(); release(); throw error; }
+  const progressRuntime = new ReviewPipelineProgressRuntime({ progress, jobs: store,
+    jiraUrl: topicUrl(panel.chatId, panel.topicId),
+    send: async (batch, html) => (await api.sendMessage(batch.target.chatId, html, {
+      message_thread_id: batch.target.messageThreadId, parse_mode: "HTML", link_preview_options: { is_disabled: true },
+    }, AbortSignal.timeout(10_000) as never)).message_id,
+    edit: async (batch, html) => {
+      try {
+        await api.editMessageText(batch.target.chatId, batch.messageId!, html, {
+          parse_mode: "HTML", link_preview_options: { is_disabled: true },
+        }, AbortSignal.timeout(10_000) as never);
+      } catch (error) {
+        if (!(error instanceof Error && error.message.includes("message is not modified"))) throw error;
+      }
+    },
+    onError: () => console.warn("Review pipeline progress: delivery unavailable; check progress state"),
+  });
   const runtime = new ReviewPipelineRuntime({ store,
+    onPhase: (job, phase) => progress.markAgent(job.id, phase),
     deliver: async (job) => {
       const message = await api.sendMessage(panel.chatId, renderPipelineDraft(job), {
         message_thread_id: panel.topicId, parse_mode: "HTML", link_preview_options: { is_disabled: true },
@@ -81,6 +103,10 @@ export function startReviewPipelineWorker(config: TeleCodexConfig, api: Api): { 
     },
     onError: () => console.warn("Review pipeline: retry scheduled; check lightweight model configuration and delivery"),
   });
+  progressRuntime.start();
   runtime.start();
-  return { dispose: async () => { try { await runtime.dispose(); } finally { store.close(); release(); } } };
+  return { dispose: async () => {
+    try { await runtime.dispose(); await progressRuntime.dispose(); }
+    finally { progress.close(); store.close(); release(); }
+  } };
 }

@@ -11,6 +11,8 @@ import { enqueueReviewFindings } from "./review-pipeline-enqueue.js";
 import type { Finding } from "./recipes.js";
 import type { PipelineSource } from "./review-pipeline-store.js";
 import { markerProject, renderGitlabReviewResultMarker } from "./gitlab-review-result-marker.js";
+import { ReviewPipelineProgressStore } from "./review-pipeline-progress-store.js";
+import { reviewPipelineProgressDbPath } from "./review-pipeline-path.js";
 
 const exec = promisify(execFile);
 interface PipelineEvent { projectPath: string; after: string; before?: string; }
@@ -26,7 +28,12 @@ export async function runRequestedPipeline(recipe: Recipe, projectNames: readonl
   if (events.some((event) => !projectNames.includes(path.posix.basename(event.projectPath)))) {
     throw new Error("Pipeline event outside selected projects");
   }
-  const results = await runPipelineEvents(recipe, events, await readFile(recipe.promptFile, "utf8"));
+  const progress = new ReviewPipelineProgressStore(reviewPipelineProgressDbPath());
+  let results: PortfolioProjectResult[];
+  try {
+    if (recipe.deliver) progress.trackBatch(events, recipe.deliver);
+    results = await runPipelineEvents(recipe, events, await readFile(recipe.promptFile, "utf8"), { progress });
+  } finally { progress.close(); }
   const byName = new Map(results.map((result) => [result.name, markerProject(result, result.findings.length)]));
   console.log(renderGitlabReviewResultMarker([...byName.values()]));
   if (results.some((result) => result.status === "failed")) throw new Error("Selected pipeline review failed; retry required");
@@ -58,15 +65,22 @@ export async function runPipelineEvents(
     git?: (cwd: string, args: string[]) => Promise<string>;
     reviewChunk?: (input: ReviewChunkInput) => Promise<Finding[]>;
     enqueue?: (input: Omit<PipelineSource, "finding">, findings: readonly Finding[]) => void;
+    progress?: Pick<ReviewPipelineProgressStore, "range" | "markRange">;
   } = {},
 ): Promise<PortfolioProjectResult[]> {
   const git = dependencies.git ?? (async (cwd, args) => (await exec("git", args, { cwd,
     encoding: "utf8", maxBuffer: 128 * 1024 * 1024 })).stdout);
   const results: PortfolioProjectResult[] = [];
   for (const event of events) {
+    const cached = dependencies.progress?.range(event);
+    if (cached?.phase === "reviewed" && cached.result) {
+      results.push(cached.result);
+      continue;
+    }
     const name = path.posix.basename(event.projectPath);
     const sourcePath = path.join(recipe.cwd, name);
     try {
+      dependencies.progress?.markRange(event, { phase: "reviewing" });
       const prepared = await (dependencies.prepare ?? prepareReviewWorktree)({ name, sourcePath }, recipe.worktreeRoot);
       const cwd = await (dependencies.snapshot ?? prepareReviewSnapshot)(prepared.worktreePath, event.after);
       let baseSha = event.before;
@@ -80,6 +94,7 @@ export async function runPipelineEvents(
       const chunks = chunkChangedFiles(files);
       const findings: Finding[] = [];
       for (const [chunkIndex, chunk] of chunks.entries()) {
+        dependencies.progress?.markRange(event, { phase: "reviewing", chunk: chunkIndex + 1, totalChunks: chunks.length });
         const input: ReviewChunkInput = { project: { ...prepared, worktreePath: cwd, headSha: event.after },
           baseSha, headSha: event.after, files: chunk, chunkIndex, totalChunks: chunks.length };
         findings.push(...await (dependencies.reviewChunk ?? ((item) => reviewPortfolioChunk(template, recipe.model,
@@ -87,9 +102,12 @@ export async function runPipelineEvents(
       }
       (dependencies.enqueue ?? enqueueReviewFindings)({ recipe: recipe.id, project: name, cwd,
         headSha: event.after }, findings);
-      results.push({ name, sourcePath, worktreePath: cwd, status: "reviewed", baseSha,
-        headSha: event.after, changedFiles: files, findings });
+      const result: PortfolioProjectResult = { name, sourcePath, worktreePath: cwd, status: "reviewed", baseSha,
+        headSha: event.after, changedFiles: files, findings };
+      dependencies.progress?.markRange(event, { phase: "reviewed", result });
+      results.push(result);
     } catch {
+      dependencies.progress?.markRange(event, { phase: "failed" });
       results.push({ name, sourcePath, status: "failed", headSha: event.after, findings: [], error: "Pipeline review failed" });
     }
   }

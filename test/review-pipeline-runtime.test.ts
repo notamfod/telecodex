@@ -17,8 +17,9 @@ it("reanalyses disagreements and delivers a concise proposal only after both age
     .mockResolvedValueOnce({ verdict: "uncertain", reason: "Нужно проверить отмену", evidence: [] })
     .mockResolvedValue(confirmed);
   const deliver = vi.fn(async () => ({ chatId: -1001, topicId: 7, messageId: 10 }));
+  const onPhase = vi.fn();
   const runtime = new ReviewPipelineRuntime({ store, analyze, deliver, now: () => now,
-    snapshot: async (job) => job });
+    snapshot: async (job) => job, onPhase });
   try {
     const job = store.enqueue({ recipe: "daily", project: "mir-admin", cwd: "/repo", headSha: "a".repeat(40),
       finding: { severity: "medium", priority: "P2", file: "src/view.ts", line: 10,
@@ -30,6 +31,7 @@ it("reanalyses disagreements and delivers a concise proposal only after both age
     await runtime.runOnce();
     expect(analyze).toHaveBeenCalledTimes(4);
     expect(deliver).toHaveBeenCalledOnce();
+    expect(onPhase.mock.calls.map(([, phase]) => phase)).toEqual(["analyst", "verifier", "analyst", "verifier"]);
     expect(store.get(job.id)).toMatchObject({ status: "awaiting", messageId: 10 });
     await runtime.runOnce();
     expect(deliver).toHaveBeenCalledOnce();

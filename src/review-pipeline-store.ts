@@ -94,6 +94,31 @@ export class ReviewPipelineStore {
   }
   close(): void { if (this.database.open) this.database.close(); }
   get(id: string): PipelineJob | undefined { valid(typeof id === "string" && /^[0-9a-f]{24}$/i.test(id)); const row = this.database.prepare("SELECT id, payload FROM review_pipeline_jobs WHERE id = ?").get(id) as Row | undefined; return row && decode(row); }
+  listForSource(project: string, headSha: string, findings?: readonly Finding[]): PipelineJob[] {
+    text(project, 256); valid(/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(headSha));
+    if (!findings) return (this.database.prepare("SELECT id, payload FROM review_pipeline_jobs WHERE project = ? AND head_sha = ? ORDER BY rowid").all(project, headSha) as Row[]).map(decode);
+    const jobs = new Map<string, PipelineJob>();
+    for (const finding of findings) {
+      validateFinding(finding);
+      const key = fingerprintFinding(finding);
+      const row = this.database.prepare("SELECT id, payload FROM review_pipeline_jobs WHERE project = ? AND fingerprint = ? AND status IN ('awaiting', 'creating', 'created', 'continuing') ORDER BY rowid DESC LIMIT 1").get(project, key) as Row | undefined
+        ?? this.database.prepare("SELECT id, payload FROM review_pipeline_jobs WHERE project = ? AND fingerprint = ? AND head_sha = ? ORDER BY rowid DESC LIMIT 1").get(project, key, headSha) as Row | undefined;
+      if (row) { const job = decode(row); jobs.set(job.id, job); }
+    }
+    return [...jobs.values()];
+  }
+  /** Explicit recovery after fixing an analyzer. Approved or externally acted-on drafts stay protected. */
+  resumeSource(project: string, headSha: string): number {
+    return this.database.transaction(() => {
+      let resumed = 0;
+      for (const job of this.listForSource(project, headSha)) {
+        if (job.status !== "queued" && job.status !== "disproved") continue;
+        const next = { ...job, status: "queued" as const, nextAttemptAt: 0 };
+        validateJob(next); if (this.update(job, next)) resumed++;
+      }
+      return resumed;
+    }).immediate();
+  }
   enqueue(source: PipelineSource): PipelineJob {
     validateSource(source); return this.database.transaction(() => {
       const same = this.database.prepare("SELECT id, payload FROM review_pipeline_jobs WHERE project = ? AND fingerprint = ? AND status IN ('awaiting', 'creating', 'created', 'continuing') ORDER BY rowid DESC LIMIT 1").get(source.project, fingerprint(source)) as Row | undefined;

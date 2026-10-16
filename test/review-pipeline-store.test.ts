@@ -31,6 +31,26 @@ it("claims a queued job exactly once across connections and reopens working jobs
   expect(second.get(job.id)).toMatchObject({ status: "working", round: 2 });
 });
 
+it("finds progress jobs at the exact revision and reuses approved findings from older revisions", () => {
+  const store = open(); const first = source(); const job = store.enqueue(first);
+  store.claim(); store.finishRound(job.id, confirmed(), confirmed());
+  const newer = source("b".repeat(40));
+  expect(store.listForSource(first.project, first.headSha).map(item => item.id)).toEqual([job.id]);
+  expect(store.listForSource(newer.project, newer.headSha)).toEqual([]);
+  expect(store.listForSource(newer.project, newer.headSha, [newer.finding]).map(item => item.id)).toEqual([job.id]);
+});
+
+it("resumes affected analysis after a prompt fix without reopening approved drafts", () => {
+  const store = open(); const current = source(); const job = store.enqueue(current);
+  store.claim(); store.finishRound(job.id, disproved(), disproved());
+  expect(store.resumeSource(current.project, current.headSha)).toBe(1);
+  expect(store.get(job.id)).toMatchObject({ status: "queued", nextAttemptAt: 0, round: 1 });
+  expect(store.get(job.id)?.reports).toHaveLength(2);
+  store.claim(); store.finishRound(job.id, confirmed(), confirmed());
+  expect(store.resumeSource(current.project, current.headSha)).toBe(0);
+  expect(store.get(job.id)?.status).toBe("awaiting");
+});
+
 it("keeps disagreement queued until both validators confirm", () => {
   const store = open(); const job = store.enqueue(source());
   store.claim(10);

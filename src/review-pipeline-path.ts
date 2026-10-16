@@ -7,3 +7,7 @@ export function reviewPipelineDbPath(): string {
   }
   return configured || path.resolve(".telecodex/review-pipeline.sqlite");
 }
+
+export function reviewPipelineProgressDbPath(): string {
+  return `${reviewPipelineDbPath()}.progress`;
+}

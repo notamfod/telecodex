@@ -10,6 +10,7 @@ interface RuntimeOptions {
   deliver: (job: PipelineJob) => Promise<{ chatId: number; topicId: number; messageId: number }>;
   now?: () => number;
   onError?: () => void;
+  onPhase?: (job: PipelineJob, phase: "analyst" | "verifier") => void;
 }
 
 /** Two independent jobs at a time; each verifier starts only after its analyst finishes. */
@@ -52,8 +53,10 @@ export class ReviewPipelineRuntime {
         const pinned = await (this.options.snapshot ?? preparePipelineSnapshot)(job);
         if (this.closed) return;
         const analyze = this.options.analyze ?? runPipelineAgent;
+        this.reportPhase(job, "analyst");
         const analyst = await analyze(pinned, "analyst", undefined, { signal: this.controller.signal });
         if (this.closed) return;
+        this.reportPhase(job, "verifier");
         const verifier = await analyze(pinned, "verifier", analyst, { signal: this.controller.signal });
         if (!this.closed) store.finishRound(job.id, analyst, verifier, this.now());
       } catch {
@@ -70,6 +73,11 @@ export class ReviewPipelineRuntime {
   }
 
   private now(): number { return (this.options.now ?? Date.now)(); }
+
+  private reportPhase(job: PipelineJob, phase: "analyst" | "verifier"): void {
+    try { this.options.onPhase?.(job, phase); }
+    catch { this.options.onError?.(); }
+  }
 }
 
 /** Keep queued findings attached to the reviewed revision when the scheduled checkout advances. */

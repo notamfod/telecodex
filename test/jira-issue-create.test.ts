@@ -7,16 +7,51 @@ import type { PipelineJob } from "../src/review-pipeline-store.js";
 const job: PipelineJob = { id: "a".repeat(24), source: { recipe: "review", project: "mir-back", cwd: "/work", headSha: "b".repeat(40), finding: { severity: "high", file: "src/a.ts", line: 3, category: "state", description: "lost" } }, status: "creating", round: 1, reports: [], draft: { summary: "[Backend]: retain state", priority: "High", problem: "State is lost.", fix: "Store the state.", benefit: "Keeps the request valid.", acceptance: ["Retry retains state."] }, nextAttemptAt: 0 };
 
 describe("JiraIssueCreateClient", () => {
-  it("finds an existing label and creates a concise Bug using HTTPS", async () => {
+  it("finds an existing label and creates a concise Bug using the localized MIR type id", async () => {
     const fetchImpl = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ issues: [{ key: "MIR-12" }] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        key: "MIR", issueTypes: [{ id: "10004", name: "Ошибка", subtask: false }],
+      }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ key: "MIR-13" }), { status: 201 }));
     const client = new JiraIssueCreateClient({ server: "https://jira.example.test/", login: "a", token: "secret", fetchImpl });
     await expect(client.findByLabel("telecodex-review-job-1")).resolves.toEqual({ key: "MIR-12", url: "https://jira.example.test/browse/MIR-12" });
     await client.create(job, "telecodex-review-job-1");
-    const created = JSON.parse(String(fetchImpl.mock.calls[1]?.[1]?.body));
-    expect(created.fields).toMatchObject({ project: { key: "MIR" }, issuetype: { name: "Bug" }, priority: { name: "High" }, labels: ["telecodex-review-job-1"] });
+    expect(fetchImpl.mock.calls[1]?.[0]).toBe("https://jira.example.test/rest/api/2/project/MIR");
+    const created = JSON.parse(String(fetchImpl.mock.calls[2]?.[1]?.body));
+    expect(created.fields).toMatchObject({ project: { key: "MIR" }, issuetype: { id: "10004" }, priority: { name: "High" }, labels: ["telecodex-review-job-1"] });
     expect(created.fields.description).toBe(pipelineDraftText(job));
+  });
+
+  it("accepts the English Bug type name from MIR project metadata", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        key: "MIR", issueTypes: [{ id: "10004", name: "Bug", subtask: false }],
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ key: "MIR-13" }), { status: 201 }));
+    const client = new JiraIssueCreateClient({ server: "https://jira.example.test", login: "a", token: "secret", fetchImpl });
+
+    await expect(client.create(job, "telecodex-review-job-1")).resolves.toEqual({
+      key: "MIR-13", url: "https://jira.example.test/browse/MIR-13",
+    });
+    expect(JSON.parse(String(fetchImpl.mock.calls[1]?.[1]?.body)).fields.issuetype).toEqual({ id: "10004" });
+  });
+
+  it("fails before create when MIR issue metadata is unavailable or ambiguous", async () => {
+    const unavailable = vi.fn().mockResolvedValue(new Response("unavailable", { status: 503 }));
+    const unavailableClient = new JiraIssueCreateClient({ server: "https://jira.example.test", login: "a", token: "secret", fetchImpl: unavailable });
+    await expect(unavailableClient.create(job, "telecodex-review-job-1")).rejects.not.toBeInstanceOf(JiraIssueCreateUnknownError);
+    expect(unavailable).toHaveBeenCalledOnce();
+
+    const ambiguous = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      key: "MIR", issueTypes: [
+        { id: "10004", name: "Bug", subtask: false },
+        { id: "10005", name: "Ошибка", subtask: false },
+      ],
+    }), { status: 200 }));
+    const ambiguousClient = new JiraIssueCreateClient({ server: "https://jira.example.test", login: "a", token: "secret", fetchImpl: ambiguous });
+    await expect(ambiguousClient.create(job, "telecodex-review-job-1")).rejects.not.toBeInstanceOf(JiraIssueCreateUnknownError);
+    expect(ambiguous).toHaveBeenCalledOnce();
   });
 
   it("rejects unsafe labels and non-HTTPS servers before transport", async () => {
@@ -36,12 +71,24 @@ describe("JiraIssueCreateClient", () => {
   });
 
   it("does not retry or hide ambiguous create failures", async () => {
-    const client = new JiraIssueCreateClient({ server: "https://jira.example.test", login: "a", token: "b", fetchImpl: vi.fn().mockResolvedValue(new Response("oops", { status: 500 })) });
+    const client = new JiraIssueCreateClient({
+      server: "https://jira.example.test", login: "a", token: "b", fetchImpl: vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          key: "MIR", issueTypes: [{ id: "10004", name: "Ошибка", subtask: false }],
+        }), { status: 200 }))
+        .mockResolvedValueOnce(new Response("oops", { status: 500 })),
+    });
     await expect(client.create(job, "telecodex-review-job-1")).rejects.toBeInstanceOf(JiraIssueCreateUnknownError);
   });
 
   it("treats rejected requests as definitive even if Jira returns non-JSON text", async () => {
-    const client = new JiraIssueCreateClient({ server: "https://jira.example.test", login: "a", token: "b", fetchImpl: vi.fn().mockResolvedValue(new Response("rate limited", { status: 429 })) });
+    const client = new JiraIssueCreateClient({
+      server: "https://jira.example.test", login: "a", token: "b", fetchImpl: vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          key: "MIR", issueTypes: [{ id: "10004", name: "Bug", subtask: false }],
+        }), { status: 200 }))
+        .mockResolvedValueOnce(new Response("rate limited", { status: 429 })),
+    });
     await expect(client.create(job, "telecodex-review-job-1")).rejects.toThrow("rejected: 429");
   });
 });

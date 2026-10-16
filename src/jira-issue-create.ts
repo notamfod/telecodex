@@ -49,9 +49,10 @@ export class JiraIssueCreateClient {
     this.validate(label);
     if (!job.draft) throw new Error("Jira issue creation requires a pipeline draft");
     const description = pipelineDraftText(job);
+    const issueTypeId = await this.resolveMirBugIssueTypeId();
     let result: { response: Response; body: unknown };
     try {
-      result = await this.requestJson("/rest/api/2/issue", { method: "POST", body: JSON.stringify({ fields: { project: { key: "MIR" }, issuetype: { name: "Bug" }, priority: { name: job.draft.priority }, summary: job.draft.summary, description, labels: [label] } }) });
+      result = await this.requestJson("/rest/api/2/issue", { method: "POST", body: JSON.stringify({ fields: { project: { key: "MIR" }, issuetype: { id: issueTypeId }, priority: { name: job.draft.priority }, summary: job.draft.summary, description, labels: [label] } }) });
     } catch (error) {
       if (error instanceof JiraIssueCreateUnknownError) throw error;
       throw new JiraIssueCreateUnknownError();
@@ -71,7 +72,27 @@ export class JiraIssueCreateClient {
     if (!SAFE_LABEL.test(label)) throw new Error("Invalid Jira review label");
   }
 
-  private async requestJson(pathname: string, init: RequestInit): Promise<{ response: Response; body: unknown }> {
+  private async resolveMirBugIssueTypeId(): Promise<string> {
+    const { response, body } = await this.requestJson("/rest/api/2/project/MIR", { method: "GET" }, false);
+    if (!response.ok) throw new Error(`Jira issue metadata lookup failed: ${response.status}`);
+    if (!isRecord(body) || body.key !== "MIR" || !Array.isArray(body.issueTypes)) {
+      throw new Error("Jira issue metadata lookup returned an invalid response");
+    }
+    const matches = body.issueTypes.filter((issueType): issueType is Record<string, unknown> => {
+      if (!isRecord(issueType)) return false;
+      return (issueType.name === "Bug" || issueType.name === "Ошибка")
+        && issueType.subtask === false && typeof issueType.id === "string"
+        && /^[1-9][0-9]{0,18}$/.test(issueType.id);
+    });
+    if (matches.length !== 1) throw new Error("Jira issue metadata did not resolve one Bug type");
+    return matches[0]!.id as string;
+  }
+
+  private async requestJson(
+    pathname: string,
+    init: RequestInit,
+    unknownOnFailure = true,
+  ): Promise<{ response: Response; body: unknown }> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
@@ -79,7 +100,8 @@ export class JiraIssueCreateClient {
       if (!response.ok) return { response, body: undefined };
       return { response, body: await response.json() };
     } catch {
-      throw new JiraIssueCreateUnknownError();
+      if (unknownOnFailure) throw new JiraIssueCreateUnknownError();
+      throw new Error("Jira request failed");
     } finally {
       clearTimeout(timer);
     }

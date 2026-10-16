@@ -10,6 +10,7 @@ interface Options {
   send: (batch: ProgressBatch, text: string) => Promise<number>;
   edit: (batch: ProgressBatch, text: string) => Promise<void>;
   jiraUrl?: string;
+  sessionId?: (batchId: string) => string | undefined;
   onError?: () => void;
 }
 
@@ -98,12 +99,14 @@ function renderPipelineProgress(batch: ProgressBatch, options: Options): { text:
   const jobs = [...allJobs.values()];
   const drafts = jobs.filter((job) => job.messageId !== undefined).length;
   const disproved = jobs.filter((job) => job.status === "disproved").length;
+  const sessionId = options.sessionId?.(batch.id);
   const text = [
     `<b>${finished ? "✅ Пайплайн завершён" : "🔄 Пайплайн ревью"}</b> · уведомлений: ${batch.events.length}`,
     `Изменения проверены: ${checked}/${batch.events.length}`,
     `Замечаний: ${jobs.length} · черновиков: ${drafts} · отклонено: ${disproved}`,
     "",
     ...rows,
+    ...(sessionId ? ["", `Сессия Codex: <code>${escapeHTML(sessionId)}</code>`] : []),
     ...(options.jiraUrl ? ["", `<a href="${escapeHTML(options.jiraUrl)}">Черновики и подтверждение Jira</a>`] : []),
   ].join("\n");
   // A batch may contain up to 30 notifications and many findings. Keep Telegram updates bounded.

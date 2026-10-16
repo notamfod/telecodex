@@ -87,8 +87,7 @@ export async function runPipelineAgent(
   dependencies: PipelineAgentDependencies = {},
 ): Promise<PipelineReport> {
   const env = dependencies.env ?? process.env;
-  const choices = parseModelChoicesJson(env.CODEX_MODEL_CHOICES_JSON);
-  const model = dependencies.model ?? resolvePipelineModel(role, choices, env, availableLightweightModels(env));
+  const model = dependencies.model ?? resolveAvailablePipelineModel(role, env);
   const outputRoot = dependencies.outputRoot ?? path.join(process.cwd(), ".telecodex", "review-pipeline", "output");
   await mkdir(outputRoot, { recursive: true, mode: 0o700 });
   const output = path.join(outputRoot, `${job.id}-${role}-${randomUUID()}.json`);
@@ -235,6 +234,10 @@ function normalizeDraft(draft: PipelineDraft): PipelineDraft {
 function draftEscapedLength(draft: PipelineDraft): number {
   return [draft.summary, draft.problem, draft.fix, draft.benefit, ...draft.acceptance]
     .reduce((total, value) => total + value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").length, 0);
+}
+
+export function resolveAvailablePipelineModel(role: AgentRole, env: NodeJS.ProcessEnv = process.env): string {
+  return resolvePipelineModel(role, parseModelChoicesJson(env.CODEX_MODEL_CHOICES_JSON), env, availableLightweightModels(env));
 }
 
 function availableLightweightModels(env: NodeJS.ProcessEnv): string[] {

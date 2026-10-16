@@ -11,6 +11,7 @@ interface RuntimeOptions {
   now?: () => number;
   onError?: () => void;
   onPhase?: (job: PipelineJob, phase: "analyst" | "verifier") => void;
+  onReport?: (job: PipelineJob, role: "analyst" | "verifier", report: PipelineReport) => void;
 }
 
 /** Two independent jobs at a time; each verifier starts only after its analyst finishes. */
@@ -56,9 +57,13 @@ export class ReviewPipelineRuntime {
         this.reportPhase(job, "analyst");
         const analyst = await analyze(pinned, "analyst", undefined, { signal: this.controller.signal });
         if (this.closed) return;
+        this.reportResult(job, "analyst", analyst);
         this.reportPhase(job, "verifier");
         const verifier = await analyze(pinned, "verifier", analyst, { signal: this.controller.signal });
-        if (!this.closed) store.finishRound(job.id, analyst, verifier, this.now());
+        if (!this.closed) {
+          this.reportResult(job, "verifier", verifier);
+          store.finishRound(job.id, analyst, verifier, this.now());
+        }
       } catch {
         if (!this.closed) { store.failure(job.id, this.now()); this.options.onError?.(); }
       }
@@ -73,6 +78,11 @@ export class ReviewPipelineRuntime {
   }
 
   private now(): number { return (this.options.now ?? Date.now)(); }
+
+  private reportResult(job: PipelineJob, role: "analyst" | "verifier", report: PipelineReport): void {
+    try { this.options.onReport?.(job, role, report); }
+    catch { this.options.onError?.(); }
+  }
 
   private reportPhase(job: PipelineJob, phase: "analyst" | "verifier"): void {
     try { this.options.onPhase?.(job, phase); }

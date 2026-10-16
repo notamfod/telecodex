@@ -13,13 +13,18 @@ it("keeps one visible batch card across restart and finishes only after review a
   const event = { projectPath: "group/mir-back", after: "a".repeat(40) };
   const batch = progress.trackBatch([event], { chatId: -1001, messageThreadId: 7 });
   const send = vi.fn(async () => 12); const edit = vi.fn(async () => undefined);
-  const runtime = new ReviewPipelineProgressRuntime({ progress, jobs, send, edit, jiraUrl: "https://t.me/c/1/9" });
+  let sessionId: string | undefined;
+  const runtime = new ReviewPipelineProgressRuntime({ progress, jobs, send, edit, jiraUrl: "https://t.me/c/1/9",
+    sessionId: () => sessionId });
   try {
     await runtime.runOnce();
     expect(send).toHaveBeenCalledOnce();
     expect(send.mock.calls[0]?.[1]).toContain("0/1");
     await runtime.runOnce();
     expect(edit).not.toHaveBeenCalled();
+    sessionId = "01a144a8-f9be-7962-ae96-5e6af46f906a";
+    await runtime.runOnce();
+    expect(edit.mock.calls.at(-1)?.[1]).toContain(sessionId);
     const finding = { severity: "medium" as const, file: "x.php", line: 2, category: "race", description: "late reply" };
     const job = jobs.enqueue({ recipe: "daily", project: "mir-back", cwd: "/repo", headSha: event.after, finding });
     progress.markRange(event, { phase: "reviewed", result: { name: "mir-back", sourcePath: "/repo", status: "reviewed", headSha: event.after, findings: [finding] } });
@@ -131,13 +136,14 @@ it("keeps a maximum-size batch message within Telegram's limit", async () => {
     after: (index + 1).toString(16).padStart(40, "0") }));
   progress.trackBatch(events, { chatId: -1001, messageThreadId: 7 });
   const send = vi.fn(async () => 12);
-  const runtime = new ReviewPipelineProgressRuntime({ progress, jobs, send, edit: vi.fn() });
+  const runtime = new ReviewPipelineProgressRuntime({ progress, jobs, send, edit: vi.fn(),
+    sessionId: () => "01a144a8-f9be-7962-ae96-5e6af46f906a" });
   try {
     await runtime.runOnce();
     expect(send).toHaveBeenCalledOnce();
     const html = send.mock.calls[0]?.[1] as string;
     expect(html.length).toBeLessThanOrEqual(4096);
     expect((html.match(/<b>/g) ?? []).length).toBe((html.match(/<\/b>/g) ?? []).length);
-    expect((html.match(/<code>/g) ?? []).length).toBe(30);
+    expect((html.match(/<code>/g) ?? []).length).toBe(31);
   } finally { await runtime.dispose(); jobs.close(); progress.close(); rmSync(dir, { recursive: true, force: true }); }
 });

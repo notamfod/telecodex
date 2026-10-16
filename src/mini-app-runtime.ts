@@ -1,6 +1,7 @@
 import type { MiniAppConfig, TelegramJobStoreMode } from "./config.js";
 import type { DashboardController } from "./dashboard-controller.js";
 import type { JiraMiniAppController } from "./jira-mini-app.js";
+import type { GitlabReviewMiniAppController } from "./gitlab-review-mini-app.js";
 import {
   createMiniAppProbeProvider,
   startMiniAppServer,
@@ -18,6 +19,7 @@ export interface MiniAppRuntimeOptions {
   probes?: MiniAppProbeProvider;
   probeTimeoutMs?: number;
   jira?: JiraMiniAppController;
+  gitlabReview?: GitlabReviewMiniAppController;
 }
 
 type MiniAppStarter = (
@@ -115,5 +117,6 @@ export function startConfiguredMiniApp(
     ...(options.probes ? { probes: options.probes } : {}),
     ...(options.probeTimeoutMs === undefined ? {} : { probeTimeoutMs: options.probeTimeoutMs }),
     jira: options.jira,
+    gitlabReview: options.gitlabReview,
   });
 }

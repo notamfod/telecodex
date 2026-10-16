@@ -1,6 +1,7 @@
 import type { DashboardController } from "../src/dashboard-controller.js";
 import type { MiniAppServerOptions } from "../src/mini-app-server.js";
 import type { JiraMiniAppController } from "../src/jira-mini-app.js";
+import type { GitlabReviewMiniAppController } from "../src/gitlab-review-mini-app.js";
 import {
   createModeAwareMiniAppProbeProvider,
   isGuardianReadyResponse,
@@ -23,6 +24,7 @@ describe("Mini App runtime", () => {
       getIssue: vi.fn(),
       ensureThread: vi.fn(),
     } as unknown as JiraMiniAppController;
+    const gitlabReview = { getReview: vi.fn() } as unknown as GitlabReviewMiniAppController;
     let received: MiniAppServerOptions | undefined;
     const running = { url: "http://127.0.0.1:8787", close: vi.fn(async () => {}) };
 
@@ -38,6 +40,7 @@ describe("Mini App runtime", () => {
       allowedUserIds: new Set([42]),
       dashboard,
       jira,
+      gitlabReview,
     }, async (options) => {
       received = options;
       return running;
@@ -50,6 +53,7 @@ describe("Mini App runtime", () => {
       botToken: "token",
       authMaxAgeSeconds: 3600,
       jira,
+      gitlabReview,
     });
     await expect(received!.loadDashboard()).resolves.toEqual({ generatedAt: 1 });
     await expect(received!.ensureTopic("thread-id")).resolves.toEqual({

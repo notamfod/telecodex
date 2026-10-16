@@ -42,10 +42,13 @@ import {
   advancePortfolioState,
   chunkChangedFiles,
   projectStateFor,
+  parseReviewProjectSelection,
   runReviewPortfolio,
   type PortfolioReviewState,
 } from "./review-portfolio.js";
 import { prepareReviewWorktree } from "./review-worktree.js";
+import { markerProject, renderGitlabReviewResultMarker } from "./gitlab-review-result-marker.js";
+import type { GitlabReviewMarkerProject } from "./gitlab-review-result-marker.js";
 
 /**
  * Scheduled review recipes.
@@ -176,6 +179,11 @@ async function runRecipe(): Promise<void> {
     );
   }
 
+  const projectNames = parseReviewProjectSelection(process.argv.slice(3));
+  if (projectNames && recipe.kind !== "mircli-review") {
+    throw new Error("--projects only applies to portfolio reviews");
+  }
+
   // A probe reviews an arbitrary range without moving the daily pointer or
   // poisoning the seen-set, so calibrating on history stays side-effect free.
   const fromIndex = process.argv.indexOf("--from");
@@ -187,8 +195,12 @@ async function runRecipe(): Promise<void> {
   // Checked before the agent runs: finding out about a missing token after a
   // twenty-minute review means the whole run is wasted.
   const preview = process.argv.includes("--preview");
+  const webhook = process.argv.includes("--webhook");
+  if (webhook && (recipe.id !== "daily-diff-review" || recipe.kind !== "mircli-review")) {
+    throw new Error("--webhook only applies to daily-diff-review");
+  }
   if (preview && recipe.kind !== "weekly-summary") throw new Error("--preview only applies to weekly summaries");
-  if (recipe.deliver && !probe && !preview && !process.env.TELEGRAM_BOT_TOKEN) {
+  if (recipe.deliver && !probe && !preview && !webhook && !process.env.TELEGRAM_BOT_TOKEN) {
     throw new Error(
       `${recipe.id} delivers to Telegram but TELEGRAM_BOT_TOKEN is unset; ` +
         "run it through telecodex-recipe@.service, which loads .env",
@@ -261,6 +273,7 @@ async function runRecipe(): Promise<void> {
     }
     const outputRoot = path.join(SHADOW_DIR, "output", recipe.id);
     const result = await runReviewPortfolio(recipe, previous, {
+      projectNames,
       reviewChunk: (input) => reviewPortfolioChunk(
         template,
         recipe.model,
@@ -269,6 +282,7 @@ async function runRecipe(): Promise<void> {
       ),
     });
     let nextRunId = state.nextRunId ?? 1;
+    const webhookResults: GitlabReviewMarkerProject[] = [];
 
     for (const project of result.projects) {
       if (project.status === "failed") {
@@ -279,9 +293,10 @@ async function runRecipe(): Promise<void> {
         seen: projectStateFor(previous, project.name).seen ?? [],
         ignored,
       });
+      webhookResults.push(markerProject(project, triage.fresh.length));
       const html = renderRunHTML({ recipe: `${recipe.id}/${project.name}`, ...triage });
       await writeShadow(recipe, project.name, stamp, triage.fresh, html);
-      if (recipe.deliver && triage.shouldDeliver) {
+      if (recipe.deliver && triage.shouldDeliver && !webhook) {
         const runId = nextRunId++;
         reservePendingRun(STATE_PATH, runId, {
           recipe: recipe.id,
@@ -307,9 +322,13 @@ async function runRecipe(): Promise<void> {
     const reviewed = result.projects.filter((project) => project.status === "reviewed").length;
     const unchanged = result.projects.filter((project) => project.status === "unchanged").length;
     const failed = result.projects.filter((project) => project.status === "failed").length;
+    console.log(renderGitlabReviewResultMarker(webhookResults));
     console.log(
       `${recipe.id}: ${reviewed} reviewed, ${unchanged} unchanged, ${failed} failed`,
     );
+    if (projectNames && failed > 0) {
+      throw new Error(`${recipe.id}: ${failed} selected project review(s) failed; retry required`);
+    }
     return;
   }
 

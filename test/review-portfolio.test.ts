@@ -4,6 +4,7 @@ import {
   advancePortfolioState,
   chunkChangedFiles,
   projectStateFor,
+  parseReviewProjectSelection,
   runReviewPortfolio,
 } from "../src/review-portfolio.js";
 import type { Finding } from "../src/recipes.js";
@@ -15,6 +16,29 @@ const finding: Finding = {
   category: "security",
   description: "missing authorization",
 };
+
+describe("webhook project selection", () => {
+  it("parses a bounded explicit portfolio selection", () => {
+    expect(parseReviewProjectSelection(["--projects", '["mir-back","mir-admin"]']))
+      .toEqual(["mir-back", "mir-admin"]);
+    expect(parseReviewProjectSelection([])).toBeUndefined();
+  });
+
+  it.each([
+    [], ["../mir-back"], ["--option"], ["mir-back", "mir-back"],
+    ["/srv/mir-back"], [null], Array.from({ length: 101 }, (_, index) => `repo-${index}`),
+  ].map((names) => ({ names })))("rejects invalid repository names $names", ({ names }) => {
+    expect(() => parseReviewProjectSelection(["--projects", JSON.stringify(names)]))
+      .toThrow("review projects must be");
+  });
+
+  it("rejects missing, malformed and duplicate options", () => {
+    for (const args of [["--projects"], ["--projects", "not-json"],
+      ["--projects", '["mir-back"]', "--projects", '["mir-admin"]']]) {
+      expect(() => parseReviewProjectSelection(args)).toThrow("--projects needs");
+    }
+  });
+});
 
 describe("chunkChangedFiles", () => {
   it("keeps every changed file without truncation", () => {
@@ -66,6 +90,45 @@ describe("portfolio review state", () => {
 });
 
 describe("runReviewPortfolio", () => {
+  it("prepares only the projects selected by a webhook batch", async () => {
+    const prepare = vi.fn(async (project: { name: string; sourcePath: string }) => ({
+      ...project,
+      worktreePath: `/cache/${project.name}`,
+      headSha: "same-sha",
+      baseRef: "origin/main" as const,
+    }));
+    const dependencies = {
+      projectNames: ["mir-back"],
+      discover: async () => [
+        { name: "mir-back", sourcePath: "/srv/mircli/mir-back" },
+        { name: "infra-imgproxy", sourcePath: "/srv/mircli/infra-imgproxy" },
+      ],
+      prepare,
+      reviewChunk: async () => [],
+    };
+    const result = await runReviewPortfolio({
+      id: "review", kind: "mircli-review", cwd: "/srv/mircli",
+      worktreeRoot: "/cache", promptFile: "review.md",
+    }, { projects: { "mir-back": { lastSha: "same-sha" } } }, dependencies);
+    expect(result.projects.map((project) => project.name)).toEqual(["mir-back"]);
+    expect(prepare).toHaveBeenCalledOnce();
+  });
+
+  it("rejects unknown selected projects before preparing any checkout", async () => {
+    const prepare = vi.fn();
+    const dependencies = {
+      projectNames: ["unknown"],
+      discover: async () => [{ name: "mir-back", sourcePath: "/srv/mircli/mir-back" }],
+      prepare,
+      reviewChunk: async () => [],
+    };
+    await expect(runReviewPortfolio({
+      id: "review", kind: "mircli-review", cwd: "/srv/mircli",
+      worktreeRoot: "/cache", promptFile: "review.md",
+    }, {}, dependencies)).rejects.toThrow("unknown review project");
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
   it("falls back to a fresh baseline when the saved SHA is no longer an ancestor", async () => {
     const git = vi.fn(async (_cwd: string, args: string[]) => {
       if (args[0] === "merge-base") throw new Error("not an ancestor");

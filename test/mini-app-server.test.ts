@@ -10,6 +10,7 @@ import {
   type RunningMiniAppServer,
 } from "../src/mini-app-server.js";
 import type { JiraMiniAppController } from "../src/jira-mini-app.js";
+import type { GitlabReviewMiniAppController } from "../src/gitlab-review-mini-app.js";
 
 const BOT_TOKEN = "123456:telegram-test-token";
 const THREAD_ID = "019fef85-92e7-7841-a26a-dbb311b50e31";
@@ -141,6 +142,40 @@ describe("Mini App HTTP server", () => {
     expect(unauthorized.status).toBe(401);
     expect(authorized.status).toBe(200);
     expect(await authorized.json()).toEqual({ generatedAt: NOW_SECONDS * 1000, sessions: [], preferencesNamespace: "telecodex:tasks:v1:123:-100456" });
+  });
+
+  it("reports GitLab review as unavailable when its state path is not configured", async () => {
+    const { server } = await start();
+    const response = await fetch(`${server.url}/api/gitlab-reviews/${"a".repeat(32)}`, {
+      headers: { "x-telegram-init-data": signedInitData() },
+    });
+    expect(response.status).toBe(503);
+  });
+
+  it("authenticates GitLab review requests before validating or loading an offer", async () => {
+    const gitlabReview: Pick<GitlabReviewMiniAppController, "getReview"> = {
+      getReview: vi.fn(async () => ({ projectPath: "mircli/mir-frontend" })),
+    };
+    server = await startMiniAppServer({
+      host: "127.0.0.1", port: 0, staticDir, botToken: BOT_TOKEN, allowedUserIds: new Set([123]),
+      authMaxAgeSeconds: 300, nowSeconds: () => NOW_SECONDS, loadDashboard: async () => ({}),
+      ensureTopic: async () => ({ created: false, url: "https://t.me" }),
+      gitlabReview: gitlabReview as GitlabReviewMiniAppController,
+      logger: { info: vi.fn(), warn: vi.fn() },
+    });
+    const unknown = `${"a".repeat(32)}`;
+    expect((await fetch(`${server.url}/api/gitlab-reviews/${unknown}`)).status).toBe(401);
+    expect((await fetch(`${server.url}/api/gitlab-reviews/not-an-id`)).status).toBe(401);
+    expect(gitlabReview.getReview).not.toHaveBeenCalled();
+    const malformed = await fetch(`${server.url}/api/gitlab-reviews/not-an-id`, {
+      headers: { "x-telegram-init-data": signedInitData() },
+    });
+    expect(malformed.status).toBe(404);
+    const accepted = await fetch(`${server.url}/api/gitlab-reviews/${unknown}`, {
+      headers: { "x-telegram-init-data": signedInitData() },
+    });
+    expect(accepted.status).toBe(200);
+    expect(gitlabReview.getReview).toHaveBeenCalledExactlyOnceWith(unknown);
   });
 
   it("passes a bounded Dashboard view and page to the controller", async () => {

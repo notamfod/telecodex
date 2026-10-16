@@ -142,6 +142,8 @@ import {
   renderRecipeFindingDetailHTML,
 } from "./recipe-review-digest.js";
 import { buildFixPrompt, fingerprintFinding, fixTopicName, type Finding } from "./recipes.js";
+import { registerGitlabReviewHandlers } from "./bot-gitlab-review.js";
+import { registerMircliDeployHandlers } from "./bot-mircli-deploy.js";
 import { parseRecipes, RECIPE_CONFIG_PATH } from "./recipe-config.js";
 import {
   buildSentryAnalysisPrompt,
@@ -1747,6 +1749,9 @@ export function createBot(
       return;
     }
 
+    // Service notifications and automated messages must not enter user authorization.
+    if (ctx.message?.pinned_message || ctx.message?.from?.is_bot) return;
+
     const fromId = ctx.from?.id;
     const guardianCallback = ctx.callbackQuery?.data?.startsWith("guardian_restore:") ?? false;
     const guardianChatRejected = guardianCallback
@@ -2732,6 +2737,9 @@ export function createBot(
       await safeReply(ctx, escapeHTML(message), { fallbackText: message });
     }
   });
+
+  registerGitlabReviewHandlers(bot, config.telegramAllowedUserIdSet);
+  registerMircliDeployHandlers(bot, config);
 
   const recipeMutes = new RecipeMutes(RECIPE_MUTES_PATH);
 

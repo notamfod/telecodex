@@ -4,6 +4,12 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 
 import type { JiraMiniAppController } from "./jira-mini-app.js";
+import {
+  GitlabReviewMiniAppNotFoundError,
+  GitlabReviewMiniAppUnavailableError,
+  GitlabReviewMiniAppUpstreamError,
+  type GitlabReviewMiniAppController,
+} from "./gitlab-review-mini-app.js";
 import type { DashboardQuery, DashboardView } from "./dashboard-api.js";
 import { validateTelegramInitData } from "./mini-app-auth.js";
 import type {
@@ -138,6 +144,7 @@ export interface MiniAppServerOptions {
   probes?: MiniAppProbeProvider;
   probeTimeoutMs?: number;
   jira?: JiraMiniAppController;
+  gitlabReview?: GitlabReviewMiniAppController;
   nowSeconds?: () => number;
   logger?: Pick<Console, "info" | "warn">;
 }
@@ -321,6 +328,21 @@ async function handleRequest(
       sendJson(response, 200, await options.jira.ensureThread(jiraThreadMatch[1]));
       return;
     }
+  }
+  const gitlabReviewMatch = /^\/api\/gitlab-reviews\/([^/]+)$/.exec(url.pathname);
+  if (gitlabReviewMatch && request.method === "GET") {
+    authenticate(request, options);
+    if (!/^[a-f0-9]{32}$/.test(gitlabReviewMatch[1])) throw httpError(404, "GitLab review was not found");
+    if (!options.gitlabReview) throw httpError(503, "GitLab review is unavailable");
+    try {
+      sendJson(response, 200, await options.gitlabReview.getReview(gitlabReviewMatch[1]));
+    } catch (error) {
+      if (error instanceof GitlabReviewMiniAppNotFoundError) throw httpError(404, "GitLab review was not found");
+      if (error instanceof GitlabReviewMiniAppUnavailableError) throw httpError(503, "GitLab review is unavailable");
+      if (error instanceof GitlabReviewMiniAppUpstreamError) throw httpError(502, "GitLab review upstream is unavailable");
+      throw error;
+    }
+    return;
   }
   if (url.pathname.startsWith("/api/")) {
     sendJson(response, 404, { error: "Not found" });
@@ -525,10 +547,10 @@ function describe(error: unknown): string {
 function statusCode(error: unknown): number {
   if (typeof error !== "object" || error === null) return 500;
   const value = (error as { statusCode?: unknown }).statusCode;
-  return value === 400 || value === 401 || value === 413 || value === 503 ? value : 500;
+  return value === 400 || value === 401 || value === 404 || value === 413 || value === 502 || value === 503 ? value : 500;
 }
 
-function httpError(statusCodeValue: 400 | 413 | 503, message: string): Error {
+function httpError(statusCodeValue: 400 | 404 | 413 | 502 | 503, message: string): Error {
   const error = new Error(message) as Error & { statusCode: number };
   error.statusCode = statusCodeValue;
   return error;

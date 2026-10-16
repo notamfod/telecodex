@@ -52,6 +52,7 @@ export interface PortfolioReviewResult {
 type Git = (cwd: string, args: string[]) => Promise<string>;
 
 interface PortfolioDependencies {
+  projectNames?: readonly string[];
   discover?: (root: string) => Promise<ReviewProject[]>;
   prepare?: (
     project: ReviewProject,
@@ -137,7 +138,16 @@ export async function runReviewPortfolio(
   const git = dependencies.git ?? runGit;
   const results: PortfolioProjectResult[] = [];
 
-  for (const project of await discover(recipe.cwd)) {
+  const discovered = await discover(recipe.cwd);
+  const selected = dependencies.projectNames;
+  if (selected) {
+    validateReviewProjectNames(selected);
+    const known = new Set(discovered.map((project) => project.name));
+    for (const name of selected) {
+      if (!known.has(name)) throw new Error(`unknown review project: ${name}`);
+    }
+  }
+  for (const project of discovered.filter((project) => !selected || selected.includes(project.name))) {
     const previous = projectStateFor(state, project.name);
     let prepared: PreparedReviewProject | undefined;
     let baseSha = previous.lastSha;
@@ -233,4 +243,25 @@ export async function runReviewPortfolio(
   }
 
   return { projects: results };
+}
+
+export function validateReviewProjectNames(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100
+    || value.some((name) => typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(name))
+    || new Set(value).size !== value.length) {
+    throw new Error("review projects must be 1-100 unique repository names");
+  }
+  return value;
+}
+
+export function parseReviewProjectSelection(args: readonly string[]): string[] | undefined {
+  const index = args.indexOf("--projects");
+  if (index === -1) return undefined;
+  if (args.lastIndexOf("--projects") !== index || !args[index + 1]) {
+    throw new Error("--projects needs one JSON array of repository names");
+  }
+  let value: unknown;
+  try { value = JSON.parse(args[index + 1]); }
+  catch { throw new Error("--projects needs one JSON array of repository names"); }
+  return validateReviewProjectNames(value);
 }

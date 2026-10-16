@@ -1,0 +1,21 @@
+[Unit]
+Description=GitLab webhook queue for TeleCodex code reviews
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/Documents/Codex/2026-08-07-hermes/telecodex
+EnvironmentFile=/root/Documents/Codex/2026-08-07-hermes/telecodex/.env
+EnvironmentFile=/etc/telecodex/gitlab-review-webhook.env
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/node /root/.local/share/telecodex/gitlab-review-webhook/current/dist/gitlab-review-webhook-cli.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

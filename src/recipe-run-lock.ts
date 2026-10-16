@@ -9,15 +9,24 @@ import path from "node:path";
  * keeps that same description open, so the kernel releases the lock on normal
  * exit, exceptions, signals, and crashes without stale lock files.
  */
-export function acquireRecipeRunLock(lockPath: string): () => void {
+export function acquireRecipeRunLock(
+  lockPath: string,
+  options: { readonly nonBlocking?: boolean } = {},
+): () => void {
   mkdirSync(path.dirname(lockPath), { recursive: true });
   const descriptor = openSync(lockPath, "a", 0o600);
-  const result = spawnSync("/usr/bin/flock", ["--exclusive", "3"], {
+  const args = ["--exclusive"];
+  if (options.nonBlocking) args.push("--nonblock");
+  args.push("3");
+  const result = spawnSync("/usr/bin/flock", args, {
     encoding: "utf8",
     stdio: ["ignore", "ignore", "pipe", descriptor],
   });
   if (result.status !== 0 || result.error) {
     closeSync(descriptor);
+    if (options.nonBlocking && result.status === 1 && !result.error) {
+      throw new Error("recipe lock is busy");
+    }
     throw new Error(
       `failed to acquire recipe lock: ${result.error?.message ?? result.stderr.trim()}`,
     );

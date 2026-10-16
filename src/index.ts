@@ -21,6 +21,7 @@ import {
   checkTelegramApiAvailability,
   type RunningMiniAppServer,
 } from "./mini-app-server.js";
+import { GitlabReviewMiniAppController } from "./gitlab-review-mini-app.js";
 import { restartPollingAfterDelay } from "./polling-lifecycle.js";
 import { SessionGuardianIpcClient } from "./session-guardian-ipc-client.js";
 import { SessionRegistry } from "./session-registry.js";
@@ -347,6 +348,7 @@ try {
     if (!bot.dashboard) {
       throw new Error("Mini App dashboard controller is unavailable");
     }
+    const gitlabReviewStatePath = process.env.GITLAB_REVIEW_WEBHOOK_STATE_PATH?.trim();
     miniAppServer = await startConfiguredMiniApp({
       config: config.miniApp,
       botToken: config.telegramBotToken,
@@ -389,6 +391,12 @@ try {
         ],
       }),
       jira: bot.jiraMiniApp,
+      ...(gitlabReviewStatePath ? { gitlabReview: new GitlabReviewMiniAppController({
+        statePath: gitlabReviewStatePath,
+        gitlabUrl: config.gitlabUrl,
+        gitlabToken: config.gitlabToken,
+        projectIds: gitlabReviewProjectIds(process.env.GITLAB_REVIEW_WEBHOOK_PROJECT_IDS),
+      }) } : {}),
     });
     console.log(`Mini App launcher: ${config.miniApp.launchUrl}`);
   }
@@ -480,4 +488,17 @@ function requireReliabilityRuntime(): TelegramReliabilityRuntime {
 function requireSqliteJobStore(): SqliteTelegramJobStore {
   if (!sqliteJobStore) throw new Error("Telegram SQLite job store is not initialized");
   return sqliteJobStore;
+}
+
+function gitlabReviewProjectIds(value: string | undefined): Readonly<Record<string, number>> | undefined {
+  if (!value?.trim()) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const entries = Object.entries(parsed).filter(([projectPath, projectId]) => /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/.test(projectPath)
+      && Number.isSafeInteger(projectId) && projectId > 0);
+    return entries.length === Object.keys(parsed).length ? Object.fromEntries(entries) : {};
+  } catch {
+    return {};
+  }
 }

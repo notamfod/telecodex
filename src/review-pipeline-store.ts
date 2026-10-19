@@ -8,13 +8,13 @@ export interface PipelineSource { recipe: string; project: string; cwd: string; 
 export interface PipelineDraft { summary: string; priority: "Highest" | "High" | "Medium" | "Low"; problem: string; fix: string; benefit: string; acceptance: string[]; }
 export interface PipelineReport { verdict: "confirmed" | "disproved" | "uncertain"; reason: string; evidence: string[]; draft?: PipelineDraft; }
 export interface PipelineJob {
-  id: string; source: PipelineSource; status: "queued" | "working" | "awaiting" | "disproved" | "creating" | "created" | "continuing";
+  id: string; source: PipelineSource; status: "queued" | "working" | "awaiting" | "disproved" | "needs_context" | "creating" | "created" | "continuing";
   round: number; reports: PipelineReport[]; draft?: PipelineDraft; messageId?: number; chatId?: number; topicId?: number;
   issueKey?: string; issueUrl?: string; analysisTopicId?: number; nextAttemptAt: number;
 }
 
 type Row = { id: string; payload: string };
-const statuses = new Set<PipelineJob["status"]>(["queued", "working", "awaiting", "disproved", "creating", "created", "continuing"]);
+const statuses = new Set<PipelineJob["status"]>(["queued", "working", "awaiting", "disproved", "needs_context", "creating", "created", "continuing"]);
 const verdicts = new Set<PipelineReport["verdict"]>(["confirmed", "disproved", "uncertain"]);
 const priorities = new Set<PipelineDraft["priority"]>(["Highest", "High", "Medium", "Low"]);
 const maxText = 1024;
@@ -76,6 +76,16 @@ function validateJob(job: unknown): asserts job is PipelineJob {
 function decode(row: Row): PipelineJob { valid(typeof row.payload === "string" && row.payload.length <= 256 * 1024); const job: PipelineJob = JSON.parse(row.payload); validateJob(job); valid(job.id === row.id); return job; }
 function fingerprint(source: PipelineSource): string { return fingerprintFinding(source.finding); }
 function backoff(round: number): number { return Math.min(60_000 * 2 ** Math.min(round, 10), 3_600_000); }
+function hasNewEvidence(prior: readonly PipelineReport[], current: readonly PipelineReport[]): boolean {
+  const seen = new Set(prior.flatMap((report) => report.evidence));
+  return current.some((report) => report.evidence.some((reference) => !seen.has(reference)));
+}
+function needsContext(reports: readonly PipelineReport[]): boolean {
+  if (reports.length < 2) return false;
+  const pair = reports.slice(-2); const [analyst, verifier] = pair;
+  if (!analyst || !verifier || analyst.verdict === verifier.verdict && analyst.verdict !== "uncertain") return false;
+  return analyst.verdict === "uncertain" && verifier.verdict === "uncertain" || !hasNewEvidence(reports.slice(0, -2), pair);
+}
 
 export class ReviewPipelineStore {
   private readonly database: Database.Database;
@@ -84,11 +94,12 @@ export class ReviewPipelineStore {
     prepareReviewPipelineSqliteFile(databasePath);
     this.database = new Database(databasePath);
     try { this.database.pragma("journal_mode = WAL"); this.database.pragma("busy_timeout = 1000"); this.database.transaction(() => {
-      const version = this.database.pragma("user_version", { simple: true }); valid(version === 0 || version === 1);
-      if (version === 0) { const tables = this.database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(); valid(tables.length === 0); this.database.exec("CREATE TABLE review_pipeline_jobs (id TEXT PRIMARY KEY NOT NULL, project TEXT NOT NULL, fingerprint TEXT NOT NULL, head_sha TEXT NOT NULL, status TEXT NOT NULL, next_attempt_at INTEGER NOT NULL, payload TEXT NOT NULL)"); this.database.exec("CREATE INDEX review_pipeline_jobs_claim ON review_pipeline_jobs(status, next_attempt_at)"); this.database.exec("CREATE INDEX review_pipeline_jobs_dedup ON review_pipeline_jobs(project, fingerprint, status)"); this.database.pragma("user_version = 1"); }
+      const version = this.database.pragma("user_version", { simple: true }); valid(version === 0 || version === 1 || version === 2);
+      if (version === 0) { const tables = this.database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(); valid(tables.length === 0); this.database.exec("CREATE TABLE review_pipeline_jobs (id TEXT PRIMARY KEY NOT NULL, project TEXT NOT NULL, fingerprint TEXT NOT NULL, head_sha TEXT NOT NULL, status TEXT NOT NULL, next_attempt_at INTEGER NOT NULL, payload TEXT NOT NULL)"); this.database.exec("CREATE INDEX review_pipeline_jobs_claim ON review_pipeline_jobs(status, next_attempt_at)"); this.database.exec("CREATE INDEX review_pipeline_jobs_dedup ON review_pipeline_jobs(project, fingerprint, status)"); }
       const columns = this.database.pragma("table_info(review_pipeline_jobs)") as { name: string; type: string; notnull: number; pk: number }[];
       valid(columns.length === 7 && columns.every((column, index) => column.name === ["id", "project", "fingerprint", "head_sha", "status", "next_attempt_at", "payload"][index] && column.type === ["TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "INTEGER", "TEXT"][index] && column.notnull === 1 && column.pk === (index === 0 ? 1 : 0)));
       for (const row of this.database.prepare("SELECT id, payload FROM review_pipeline_jobs").all() as Row[]) decode(row);
+      if (version !== 2) this.database.pragma("user_version = 2");
     }).immediate(); } catch (error) { this.database.close(); throw error; }
   }
   close(): void { if (this.database.open) this.database.close(); }
@@ -111,8 +122,8 @@ export class ReviewPipelineStore {
     return this.database.transaction(() => {
       let resumed = 0;
       for (const job of this.listForSource(project, headSha)) {
-        if (job.status !== "queued" && job.status !== "disproved") continue;
-        const next = { ...job, status: "queued" as const, nextAttemptAt: 0 };
+        if (job.status !== "queued" && job.status !== "disproved" && job.status !== "needs_context") continue;
+        const next = job.status === "needs_context" ? { ...job, status: "queued" as const, reports: [], nextAttemptAt: 0 } : { ...job, status: "queued" as const, nextAttemptAt: 0 };
         validateJob(next); if (this.update(job, next)) resumed++;
       }
       return resumed;
@@ -134,11 +145,11 @@ export class ReviewPipelineStore {
   }).immediate(); }
   finishRound(id: string, analyst: PipelineReport, verifier: PipelineReport, now = Date.now()): PipelineJob {
     validateReport(analyst); validateReport(verifier); timestamp(now); return this.database.transaction(() => {
-      const job = this.requireWorking(id); const reports = [...job.reports, analyst, verifier].slice(-12); let next: PipelineJob;
+      const job = this.requireWorking(id); const allReports = [...job.reports, analyst, verifier]; const reports = allReports.slice(-12); const park = needsContext(allReports); let next: PipelineJob;
       const selectedDraft = verifier.draft ?? analyst.draft;
       if (analyst.verdict === "confirmed" && verifier.verdict === "confirmed" && selectedDraft) next = { ...job, reports, draft: selectedDraft, status: "awaiting", nextAttemptAt: now };
       else if (analyst.verdict === "disproved" && verifier.verdict === "disproved") next = { ...job, reports, status: "disproved", nextAttemptAt: now };
-      else next = { ...job, reports, status: "queued", nextAttemptAt: now + backoff(job.round) };
+      else next = { ...job, reports, status: park ? "needs_context" : "queued", nextAttemptAt: park ? now : now + backoff(job.round) };
       validateJob(next); valid(this.update(job, next)); return next;
     }).immediate();
   }
@@ -151,7 +162,12 @@ export class ReviewPipelineStore {
   analysisOpened(id: string, topicId: number): PipelineJob { positive(topicId); return this.database.transaction(() => { const job = this.get(id); valid(job?.status === "continuing"); const next = { ...job, analysisTopicId: topicId }; validateJob(next); valid(this.update(job, next)); return next; }).immediate(); }
   /** Call only after the caller has established that no external action was accepted. */
   releaseDecision(id: string): PipelineJob | undefined { return this.database.transaction(() => { const job = this.get(id); if (!job || job.status !== "creating" && job.status !== "continuing") return undefined; const next = { ...job, status: "awaiting" as const }; validateJob(next); return this.update(job, next) ? next : undefined; }).immediate(); }
-  recover(): void { this.database.transaction(() => { const rows = this.database.prepare("SELECT id, payload FROM review_pipeline_jobs WHERE status = 'working'").all() as Row[]; for (const row of rows) { const job = decode(row); const next = { ...job, status: "queued" as const, nextAttemptAt: 0 }; validateJob(next); valid(this.update(job, next)); } }).immediate(); }
+  recover(): void { this.database.transaction(() => {
+    const interrupted = this.database.prepare("SELECT id, payload FROM review_pipeline_jobs WHERE status = 'working'").all() as Row[];
+    for (const row of interrupted) { const job = decode(row); const next = { ...job, status: "queued" as const, nextAttemptAt: 0 }; validateJob(next); valid(this.update(job, next)); }
+    const legacy = this.database.prepare("SELECT id, payload FROM review_pipeline_jobs WHERE status = 'queued'").all() as Row[];
+    for (const row of legacy) { const job = decode(row); if (!needsContext(job.reports)) continue; const next = { ...job, status: "needs_context" as const }; validateJob(next); valid(this.update(job, next)); }
+  }).immediate(); }
   private requireWorking(id: string): PipelineJob { const job = this.get(id); valid(job?.status === "working"); return job; }
   private insert(job: PipelineJob): void { this.database.prepare("INSERT INTO review_pipeline_jobs(id, project, fingerprint, head_sha, status, next_attempt_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)").run(job.id, job.source.project, fingerprint(job.source), job.source.headSha, job.status, job.nextAttemptAt, JSON.stringify(job)); }
   private update(previous: PipelineJob, next: PipelineJob): boolean { const result = this.database.prepare("UPDATE review_pipeline_jobs SET status = ?, next_attempt_at = ?, payload = ? WHERE id = ? AND status = ? AND payload = ?").run(next.status, next.nextAttemptAt, JSON.stringify(next), previous.id, previous.status, JSON.stringify(previous)); return result.changes === 1; }

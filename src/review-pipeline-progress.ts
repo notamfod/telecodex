@@ -92,19 +92,22 @@ function renderPipelineProgress(batch: ProgressBatch, options: Options): { text:
     let status = reviewed ? "изменения проверены" : range?.phase === "reviewing"
       ? `проверка изменений${range.totalChunks ? `, часть ${range.chunk ?? 0}/${range.totalChunks}` : ""}`
       : range?.phase === "failed" ? "повтор проверки запланирован" : "ожидает проверки изменений";
-    if (done) status = jobs.length ? "проверка замечаний завершена" : "замечаний нет";
+    const paused = jobs.filter((job) => job.status === "needs_context").length;
+    if (done) status = paused ? `нужен контекст: ${paused}; автоповтор остановлен`
+      : jobs.length ? "проверка замечаний завершена" : "замечаний нет";
     else if (jobs.length) status += `; ${jobs.map((job) => jobStatus(job, options.progress)).join("; ")}`;
     rows.push(`• <b>${escapeHTML(name.slice(0, 42))}</b> <code>${event.after.slice(0, 8)}</code>: ${escapeHTML(status)}`);
   }
   const jobs = [...allJobs.values()];
   const drafts = jobs.filter((job) => job.messageId !== undefined).length;
   const disproved = jobs.filter((job) => job.status === "disproved").length;
+  const paused = jobs.filter((job) => job.status === "needs_context").length;
   const sessionId = options.sessionId?.(batch.id);
   const scheduled = batch.events.every((event) => event.projectPath.startsWith("recipes/"));
   const text = [
-    `<b>${finished ? "✅ Пайплайн завершён" : scheduled ? "🔄 Плановый пайплайн ревью" : "🔄 Пайплайн ревью"}</b> · ${scheduled ? "проектов" : "уведомлений"}: ${batch.events.length}`,
+    `<b>${finished ? paused ? "⏸ Нужен контекст" : "✅ Пайплайн завершён" : scheduled ? "🔄 Плановый пайплайн ревью" : "🔄 Пайплайн ревью"}</b> · ${scheduled ? "проектов" : "уведомлений"}: ${batch.events.length}`,
     `Изменения проверены: ${checked}/${batch.events.length}`,
-    `Замечаний: ${jobs.length} · черновиков: ${drafts} · отклонено: ${disproved}`,
+    `Замечаний: ${jobs.length} · черновиков: ${drafts} · отклонено: ${disproved}${paused ? ` · нужен контекст: ${paused}` : ""}`,
     "",
     ...rows,
     ...(sessionId ? ["", `Сессия Codex: <code>${escapeHTML(sessionId)}</code>`] : []),
@@ -117,7 +120,7 @@ function renderPipelineProgress(batch: ProgressBatch, options: Options): { text:
 }
 
 function settled(job: PipelineJob): boolean {
-  return job.status === "disproved" || job.messageId !== undefined
+  return job.status === "disproved" || job.status === "needs_context" || job.messageId !== undefined
     && ["awaiting", "creating", "created", "continuing"].includes(job.status);
 }
 
@@ -125,6 +128,7 @@ function jobStatus(job: PipelineJob, progress: ReviewPipelineProgressStore): str
   if (job.status === "working") return `${progress.agent(job.id) === "verifier" ? "проверяющий" : "аналитик"}, раунд ${job.round}`;
   if (job.status === "queued") return job.round ? `повторный анализ запланирован, раунд ${job.round + 1}` : "ожидает аналитика";
   if (job.status === "disproved") return "замечание не подтвердилось";
+  if (job.status === "needs_context") return "нужен контекст; автоповтор остановлен";
   if (job.status === "created") return `создана ${job.issueKey}`;
   if (job.status === "continuing") return "продолжение в отдельном топике";
   return job.messageId ? "черновик в Jira-топике" : "отправка черновика в Jira-топик";

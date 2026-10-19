@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, it } from "vitest";
 import { ReviewPipelineStore, type PipelineDraft, type PipelineReport, type PipelineSource } from "../src/review-pipeline-store.js";
 
@@ -17,6 +18,7 @@ const draft: PipelineDraft = {
 };
 const confirmed = (overrides: Partial<PipelineReport> = {}): PipelineReport => ({ verdict: "confirmed", reason: "reproduced", evidence: ["src/voice.ts:336"], draft, ...overrides });
 const disproved = (): PipelineReport => ({ verdict: "disproved", reason: "selection cancels recording", evidence: ["src/voice.ts:350"] });
+const uncertain = (evidence: string[] = []): PipelineReport => ({ verdict: "uncertain", reason: "needs more context", evidence });
 function open(): ReviewPipelineStore { const store = new ReviewPipelineStore(databasePath); stores.push(store); return store; }
 
 beforeEach(() => { directory = mkdtempSync(path.join(tmpdir(), "review-pipeline-")); databasePath = path.join(directory, "pipeline.sqlite"); stores = []; });
@@ -57,6 +59,56 @@ it("keeps disagreement queued until both validators confirm", () => {
   expect(store.finishRound(job.id, confirmed(), { ...disproved(), draft: undefined }, 20)).toMatchObject({ status: "queued", reports: [confirmed(), { ...disproved(), draft: undefined }] });
   expect(store.claim(20 + 120_000)?.round).toBe(2);
   expect(store.finishRound(job.id, confirmed(), confirmed(), 20 + 120_001)).toMatchObject({ status: "awaiting", draft });
+});
+
+it("parks mutually uncertain reports instead of claiming them again after restart", () => {
+  const store = open(); const job = store.enqueue(source()); store.claim(10);
+  expect(store.finishRound(job.id, uncertain(), uncertain(), 20)).toMatchObject({ status: "needs_context" });
+  expect(store.claim(1_000_000)).toBeUndefined();
+  store.close();
+  const restarted = open(); restarted.recover();
+  expect(restarted.get(job.id)).toMatchObject({ status: "needs_context" });
+  expect(restarted.claim(1_000_000)).toBeUndefined();
+});
+
+it("parks repeated disagreement without evidence that was not already reviewed", () => {
+  const store = open(); const job = store.enqueue(source());
+  store.claim(10); expect(store.finishRound(job.id, confirmed(), disproved(), 20)).toMatchObject({ status: "queued" });
+  store.claim(20 + 120_000); expect(store.finishRound(job.id, confirmed(), disproved(), 20 + 120_001)).toMatchObject({ status: "needs_context" });
+});
+
+it("continues disagreement when the completed pair contributes new evidence", () => {
+  const store = open(); const job = store.enqueue(source());
+  store.claim(10); store.finishRound(job.id, confirmed(), disproved(), 20);
+  store.claim(20 + 120_000);
+  expect(store.finishRound(job.id, confirmed({ evidence: ["src/voice.ts:360"] }), disproved(), 20 + 120_001)).toMatchObject({ status: "queued" });
+});
+
+it("keeps a parked revision deduplicated but opens a fresh job for a new SHA", () => {
+  const store = open(); const job = store.enqueue(source()); store.claim(); store.finishRound(job.id, uncertain(), uncertain());
+  expect(store.enqueue(source())).toMatchObject({ id: job.id, status: "needs_context" });
+  expect(store.enqueue(source("b".repeat(40))).id).not.toBe(job.id);
+});
+
+it("explicitly resumes needs-context jobs with no active reports", () => {
+  const store = open(); const job = store.enqueue(source()); store.claim(); store.finishRound(job.id, uncertain(), uncertain());
+  expect(store.resumeSource(job.source.project, job.source.headSha)).toBe(1);
+  expect(store.get(job.id)).toMatchObject({ status: "queued", nextAttemptAt: 0, reports: [] });
+  store.recover();
+  expect(store.claim()).toMatchObject({ id: job.id, round: 2 });
+});
+
+it("migrates v1 jobs and parks legacy queued inconclusive reports while rejecting future schemas", () => {
+  const legacy = new Database(databasePath);
+  legacy.exec("CREATE TABLE review_pipeline_jobs (id TEXT PRIMARY KEY NOT NULL, project TEXT NOT NULL, fingerprint TEXT NOT NULL, head_sha TEXT NOT NULL, status TEXT NOT NULL, next_attempt_at INTEGER NOT NULL, payload TEXT NOT NULL); CREATE INDEX review_pipeline_jobs_claim ON review_pipeline_jobs(status, next_attempt_at); CREATE INDEX review_pipeline_jobs_dedup ON review_pipeline_jobs(project, fingerprint, status); PRAGMA user_version = 1");
+  const legacyJob = { id: "f".repeat(24), source: source(), status: "queued", round: 71, reports: [uncertain(), uncertain()], nextAttemptAt: 0 };
+  legacy.prepare("INSERT INTO review_pipeline_jobs VALUES (?, ?, ?, ?, ?, ?, ?)").run(legacyJob.id, legacyJob.source.project, "legacy", legacyJob.source.headSha, legacyJob.status, legacyJob.nextAttemptAt, JSON.stringify(legacyJob));
+  legacy.close();
+  const store = open(); store.recover();
+  expect(store.get(legacyJob.id)).toMatchObject({ status: "needs_context", round: 71 });
+  store.close();
+  const migrated = new Database(databasePath); expect(migrated.pragma("user_version", { simple: true })).toBe(2); migrated.pragma("user_version = 3"); migrated.close();
+  expect(() => open()).toThrow("Invalid review pipeline data");
 });
 
 it("requires a concise valid draft for every confirmed report", () => {
@@ -116,10 +168,9 @@ it("rejects empty evidence and verbose acceptance criteria", () => {
 
 it("keeps a bounded maximum report history readable after repeated disagreement", () => {
   const store = open(); const job = store.enqueue(source());
-  const evidence = `${"a".repeat(510)}:1`;
-  const longReport = confirmed({ reason: "r".repeat(1000), evidence: [evidence] });
   const uncertain: PipelineReport = { verdict: "uncertain", reason: "u".repeat(1000), evidence: [] };
   for (let round = 0; round < 6; round++) {
+    const longReport = confirmed({ reason: "r".repeat(1000), evidence: [`src/${"a".repeat(500)}${round}.ts:1`] });
     expect(store.claim(10_000_000 + round * 10_000_000)?.id).toBe(job.id);
     expect(store.finishRound(job.id, longReport, uncertain, 10_000_001 + round * 10_000_000).reports).toHaveLength((round + 1) * 2);
   }

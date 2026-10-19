@@ -25,6 +25,22 @@ function setup(projectPath = "group/mir-back") {
   return { ...options, options, event, batch, close: () => { journal.close(); progress.close(); jobs.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
+it("records one missing-context outcome and then stays quiet", async () => {
+  const f = setup(); const runtime = new ReviewPipelineJournalRuntime(f.options);
+  try {
+    const finding = { severity: "medium" as const, file: "x.php", category: "api", description: "Missing server evidence" };
+    const job = f.jobs.enqueue({ recipe: "daily", project: "mir-back", cwd: "/repo", headSha: f.event.after, finding });
+    f.jobs.claim();const report = { verdict: "uncertain" as const, reason: "Need backend validation", evidence: ["x.php:1"] };
+    f.jobs.finishRound(job.id, report, report);
+    f.progress.markRange(f.event, { phase: "reviewed", result: { name: "mir-back", sourcePath: "/repo", status: "reviewed", headSha: f.event.after, findings: [finding] } });
+    await runtime.runOnce(); await runtime.runOnce(); await runtime.runOnce();
+    const text = f.client.append.mock.calls.map((call) => call[4]).join("\n");
+    expect(text).toContain("Автоматические повторы остановлены");
+    expect(text).toContain("Need backend validation");
+    expect(f.client.append).toHaveBeenCalledOnce();
+  } finally { await runtime.dispose(); f.close(); }
+});
+
 it("creates one named Codex journal for a scheduled batch with two findings", async () => {
   const f = setup("recipes/daily-diff-review/mir-back"); const runtime = new ReviewPipelineJournalRuntime(f.options);
   try {

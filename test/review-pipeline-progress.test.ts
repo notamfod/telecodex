@@ -6,6 +6,29 @@ import { ReviewPipelineProgressRuntime } from "../src/review-pipeline-progress.j
 import { ReviewPipelineProgressStore } from "../src/review-pipeline-progress-store.js";
 import { ReviewPipelineStore } from "../src/review-pipeline-store.js";
 
+it("shows missing context as a paused outcome without scheduling another analysis", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "tc-context-progress-"));
+  const progress = new ReviewPipelineProgressStore(path.join(dir, "progress.sqlite"));
+  const jobs = new ReviewPipelineStore(path.join(dir, "jobs.sqlite"));
+  const event = { projectPath: "group/mir-admin", after: "a".repeat(40) };
+  const finding = { severity: "medium" as const, file: "x.ts", category: "api", description: "Backend contract unknown" };
+  const job = jobs.enqueue({ recipe: "daily", project: "mir-admin", cwd: "/repo", headSha: event.after, finding });
+  jobs.claim(); const report = { verdict: "uncertain" as const, reason: "Need backend validation", evidence: ["x.ts:1"] };
+  jobs.finishRound(job.id, report, report);
+  const batch = progress.trackBatch([event], { chatId: -1001, messageThreadId: 7 });
+  progress.markRange(event, { phase: "reviewed", result: { name: "mir-admin", sourcePath: "/repo", status: "reviewed", headSha: event.after, findings: [finding] } });
+  const send = vi.fn(async () => 12); const edit = vi.fn();
+  const runtime = new ReviewPipelineProgressRuntime({ progress, jobs, send, edit });
+  try {
+    await runtime.runOnce(); await runtime.runOnce();
+    expect(progress.listBatches().find((b) => b.id === batch.id)?.finished).toBe(true);
+    expect(send.mock.calls[0]?.[1]).toContain("Нужен контекст");
+    expect(send.mock.calls[0]?.[1]).toContain("автоповтор остановлен");
+    expect(send.mock.calls[0]?.[1]).toContain("отклонено: 0");
+    expect(edit).not.toHaveBeenCalled();
+  } finally { await runtime.dispose(); progress.close(); jobs.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 it("keeps one visible batch card across restart and finishes only after review and draft delivery", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "tc-progress-"));
   const progress = new ReviewPipelineProgressStore(path.join(dir, "progress.sqlite"));

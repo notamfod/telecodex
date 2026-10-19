@@ -97,7 +97,13 @@ export class ReviewPipelineJournalRuntime {
               `Сохранённый отчёт ${role === "analyst" ? "аналитика" : "проверяющего"} (снимок после ${job.round} запусков): ${job.source.finding.file}\n${renderReport(report)}`);
           });
           this.event(batch, `status:${job.id}:${hash([job.status, job.round, job.messageId, job.issueKey, job.analysisTopicId])}`,
-            `Замечание ${job.id}: ${job.status}, раунд ${job.round}.`
+            (job.status === "needs_context"
+              ? `Замечание ${job.id}: нужен контекст. Автоматические повторы остановлены.\n`
+                + (job.reports.slice(-2).every((report) => report.verdict === "uncertain")
+                  ? "Оба агента не смогли установить вывод по доступным данным."
+                  : "Повторный раунд не добавил новых доказательств для общего вывода.")
+                + `\nПроверяющий: ${job.reports.at(-1)?.reason ?? "Недостаточно данных."}`
+              : `Замечание ${job.id}: ${job.status}, раунд ${job.round}.`)
             + (job.messageId ? ` Черновик: https://t.me/c/${String(job.chatId).replace(/^-100/, "")}/${job.messageId}` : "")
             + (job.issueUrl ? ` Jira: ${job.issueUrl}` : "")
             + (job.analysisTopicId ? ` Продолжение в топике ${job.analysisTopicId}.` : ""));

@@ -42,6 +42,13 @@ function createRepository(files: Record<string, string>): { directory: string; h
 }
 
 describe("pipeline agent output", () => {
+  it("normalizes safe model line ranges without weakening stored evidence validation", () => {
+    const report = { verdict: "disproved", reason: "Guard is present", evidence: ["src/view.tsx:207-214", "src/view.tsx:215"] };
+    expect(parsePipelineReport(JSON.stringify(report)).evidence).toEqual(["src/view.tsx:207", "src/view.tsx:215"]);
+    for (const evidence of ["src/view.tsx:214-207", "src/view.tsx:0-7", "../secret:1-7", "/etc/passwd:1-7", "src/view.tsx:1-99999999999999999999"]) {
+      expect(() => parsePipelineReport(JSON.stringify({ ...report, evidence: [evidence] }))).toThrow(/evidence/i);
+    }
+  });
   it("accepts bounded structured evidence and a concise draft", () => {
     expect(parsePipelineReport(JSON.stringify({
       verdict: "confirmed",

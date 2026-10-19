@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
@@ -43,5 +43,26 @@ it("opens analysis once for the exact approved card and rejects another message"
     store.close();
     if (previous === undefined) delete process.env.REVIEW_PIPELINE_DB; else process.env.REVIEW_PIPELINE_DB = previous;
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("reports a database-open failure to the user instead of leaving a silent create button", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "tc-card-open-"));
+  const previous = process.env.REVIEW_PIPELINE_DB;
+  const blocked = path.join(dir, "blocked"); writeFileSync(blocked, "not a directory");
+  process.env.REVIEW_PIPELINE_DB = path.join(blocked, "db.sqlite");
+  try {
+    let callback!: (ctx: Context) => Promise<void>;
+    registerReviewPipelineHandlers({ callbackQuery: (_pattern: RegExp, handler: typeof callback) => { callback = handler; } } as never,
+      { telegramAllowedUserIdSet: new Set([42]), jiraPanel: { chatId: -1001, topicId: 7 } } as never,
+      async () => 12);
+    const ctx = { from: { id: 42 }, chat: { id: -1001 }, callbackQuery: { data: `rpcreate:${"a".repeat(24)}`,
+      message: { message_id: 10, message_thread_id: 7 } }, answerCallbackQuery: vi.fn(async () => true),
+      reply: vi.fn(async () => ({})), editMessageText: vi.fn(async () => true) } as unknown as Context;
+    await expect(callback(ctx)).resolves.toBeUndefined();
+    expect(ctx.reply).toHaveBeenCalledWith(expect.stringContaining("не отправлялась"), { message_thread_id: 7 });
+  } finally {
+    if (previous === undefined) delete process.env.REVIEW_PIPELINE_DB; else process.env.REVIEW_PIPELINE_DB = previous;
+    rmSync(dir, { recursive: true, force: true });
   }
 });

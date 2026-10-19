@@ -8,12 +8,12 @@ import { ReviewPipelineProgressStore } from "../src/review-pipeline-progress-sto
 import { ReviewPipelineStore } from "../src/review-pipeline-store.js";
 
 const threadId = "01a144a8-f9be-7962-ae96-5e6af46f906a";
-function setup() {
+function setup(projectPath = "group/mir-back") {
   const dir = mkdtempSync(path.join(tmpdir(), "tc-journal-"));
   const journal = new ReviewPipelineJournalStore(path.join(dir, "journal.sqlite"));
   const progress = new ReviewPipelineProgressStore(path.join(dir, "progress.sqlite"));
   const jobs = new ReviewPipelineStore(path.join(dir, "jobs.sqlite"));
-  const event = { projectPath: "group/mir-back", after: "a".repeat(40) };
+  const event = { projectPath, after: "a".repeat(40) };
   const batch = progress.trackBatch([event], { chatId: -1001, messageThreadId: 7 });
   const client = {
     create: vi.fn(async (_title, _cwd, _model, onCreated) => { onCreated?.(threadId); return threadId; }),
@@ -24,6 +24,19 @@ function setup() {
   const options = { journal, progress, jobs, client, cwd: "/repos", model: "light-model" };
   return { ...options, options, event, batch, close: () => { journal.close(); progress.close(); jobs.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
+
+it("creates one named Codex journal for a scheduled batch with two findings", async () => {
+  const f = setup("recipes/daily-diff-review/mir-back"); const runtime = new ReviewPipelineJournalRuntime(f.options);
+  try {
+    const findings = ["race", "cancellation"].map((category) => ({ severity: "medium" as const, file: "x.php", category, description: category }));
+    for (const finding of findings) f.jobs.enqueue({ recipe: "daily", project: "mir-back", cwd: "/repo", headSha: f.event.after, finding });
+    f.progress.markRange(f.event, { phase: "reviewed", result: { name: "mir-back", sourcePath: "/repo", status: "reviewed", headSha: f.event.after, findings } });
+    await runtime.runOnce(); await runtime.runOnce();
+    expect(f.client.create).toHaveBeenCalledOnce();
+    expect(f.client.create.mock.calls[0]?.[0]).toContain("плановая проверка");
+    expect(f.client.append.mock.calls.map((call) => call[4]).join("\n")).toContain("cancellation");
+  } finally { await runtime.dispose(); f.close(); }
+});
 
 it("retains one batch session across restarts and records both independent agent reports", async () => {
   const f = setup(); const runtime = new ReviewPipelineJournalRuntime(f.options);

@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({ runReviewPortfolio: vi.fn(), deliverReviewDigest: vi.fn(), enqueue: vi.fn() }));
-vi.mock("../src/review-pipeline-enqueue.js", () => ({ enqueueReviewFindings: mocks.enqueue }));
+const mocks = vi.hoisted(() => ({ runReviewPortfolio: vi.fn(), deliverReviewDigest: vi.fn(), enqueue: vi.fn(), scheduled: vi.fn() }));
+vi.mock("../src/review-pipeline-enqueue.js", () => ({ enqueueReviewFindings: mocks.enqueue, enqueueScheduledReviewFindings: mocks.scheduled }));
 vi.mock("../src/recipe-review-delivery.js", () => ({ deliverReviewDigest: mocks.deliverReviewDigest }));
 vi.mock("../src/review-portfolio.js", async (original) => ({
   ...await original<typeof import("../src/review-portfolio.js")>(),
@@ -30,6 +30,7 @@ describe("webhook recipe runner", () => {
     mocks.runReviewPortfolio.mockReset();
     mocks.deliverReviewDigest.mockReset();
     mocks.enqueue.mockReset();
+    mocks.scheduled.mockReset();
   });
 
   it("reports partial failure to the durable queue after preserving successful progress", async () => {
@@ -114,6 +115,7 @@ describe("webhook recipe runner", () => {
     await vi.waitFor(() => expect(logs.some((line) => line.startsWith("TELECODEX_GITLAB_REVIEW_RESULT="))).toBe(true));
     expect(mocks.deliverReviewDigest).not.toHaveBeenCalled();
     expect(mocks.enqueue).not.toHaveBeenCalled();
+    expect(mocks.scheduled).not.toHaveBeenCalled();
     const marker = JSON.parse(logs.find((line) => line.startsWith("TELECODEX_GITLAB_REVIEW_RESULT="))!.split("=", 2)[1]);
     expect(marker.projects[0].details.items[0].description).toBe("Missing auth");
     const state = JSON.parse(readFileSync(path.join(directory, ".telecodex", "recipes.json"), "utf8"));
@@ -141,8 +143,9 @@ describe("webhook recipe runner", () => {
     try {
       await import("../src/recipe-run.js");
       await vi.waitFor(() => expect(logs.some((line) => line.includes("1 reviewed"))).toBe(true));
-      expect(mocks.enqueue).toHaveBeenCalledWith({ recipe: "daily-diff-review", project: "mir-back",
-        cwd: "/cache/mir-back", headSha: "b".repeat(40) }, [finding]);
+      expect(mocks.scheduled).toHaveBeenCalledWith([{ source: { recipe: "daily-diff-review", project: "mir-back",
+        cwd: "/cache/mir-back", headSha: "b".repeat(40) }, findings: [finding], baseSha: undefined }],
+        { chatId: -1001, messageThreadId: 7 });
       expect(mocks.deliverReviewDigest).toHaveBeenCalledOnce();
     } finally {
       if (oldToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN; else process.env.TELEGRAM_BOT_TOKEN = oldToken;

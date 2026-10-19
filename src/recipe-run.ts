@@ -47,7 +47,7 @@ import {
 import { prepareReviewWorktree } from "./review-worktree.js";
 import { markerProject, renderGitlabReviewResultMarker } from "./gitlab-review-result-marker.js";
 import type { GitlabReviewMarkerProject } from "./gitlab-review-result-marker.js";
-import { enqueueReviewFindings } from "./review-pipeline-enqueue.js";
+import { enqueueScheduledReviewFindings } from "./review-pipeline-enqueue.js";
 import { writeShadow } from "./recipe-shadow.js";
 import { runRequestedPipeline } from "./review-pipeline-events.js";
 
@@ -247,6 +247,14 @@ async function runRecipe(): Promise<void> {
     let nextRunId = state.nextRunId ?? 1;
     const webhookResults: GitlabReviewMarkerProject[] = [];
 
+    if (!webhook && recipe.deliver) {
+      enqueueScheduledReviewFindings(result.projects.filter((project) => project.status !== "failed").map((project) => ({
+        source: { recipe: recipe.id, project: project.name, cwd: project.worktreePath ?? project.sourcePath, headSha: project.headSha },
+        baseSha: project.baseSha,
+        findings: triageFindings(project.findings, { seen: projectStateFor(previous, project.name).seen ?? [], ignored }).fresh,
+      })), recipe.deliver);
+    }
+
     for (const project of result.projects) {
       if (project.status === "failed") {
         console.error(`${recipe.id}/${project.name}: ${project.error}`);
@@ -256,10 +264,6 @@ async function runRecipe(): Promise<void> {
         seen: projectStateFor(previous, project.name).seen ?? [],
         ignored,
       });
-      if (!webhook && recipe.deliver && triage.fresh.length) {
-        enqueueReviewFindings({ recipe: recipe.id, project: project.name,
-          cwd: project.worktreePath ?? project.sourcePath, headSha: project.headSha }, triage.fresh);
-      }
       webhookResults.push(markerProject(project, triage.fresh.length));
       const html = renderRunHTML({ recipe: `${recipe.id}/${project.name}`, ...triage });
       await writeShadow(recipe, project.name, stamp, triage.fresh, html, SHADOW_DIR);
@@ -409,7 +413,7 @@ async function runRecipe(): Promise<void> {
     ignored,
   });
   if (!probe && recipe.kind !== "deps" && recipe.deliver && triage.fresh.length && head) {
-    enqueueReviewFindings({ recipe: recipe.id, project, cwd: reviewCwd, headSha: head }, triage.fresh);
+    enqueueScheduledReviewFindings([{ source: { recipe: recipe.id, project, cwd: reviewCwd, headSha: head }, findings: triage.fresh }], recipe.deliver);
   }
   const html = renderRunHTML({ recipe: recipe.id, ...triage });
 

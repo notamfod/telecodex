@@ -1,8 +1,8 @@
 import { randomBytes } from "node:crypto";
-import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { fingerprintFinding, type Finding } from "./recipes.js";
+import { prepareReviewPipelineSqliteFile } from "./review-pipeline-sqlite-file.js";
 
 export interface PipelineSource { recipe: string; project: string; cwd: string; headSha: string; finding: Finding; }
 export interface PipelineDraft { summary: string; priority: "Highest" | "High" | "Medium" | "Low"; problem: string; fix: string; benefit: string; acceptance: string[]; }
@@ -81,8 +81,7 @@ export class ReviewPipelineStore {
   private readonly database: Database.Database;
   constructor(databasePath: string) {
     valid(typeof databasePath === "string" && databasePath.length > 0 && databasePath !== ":memory:");
-    mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 }); const fd = openSync(databasePath, "a", 0o600);
-    try { chmodSync(databasePath, 0o600); } finally { closeSync(fd); }
+    prepareReviewPipelineSqliteFile(databasePath);
     this.database = new Database(databasePath);
     try { this.database.pragma("journal_mode = WAL"); this.database.pragma("busy_timeout = 1000"); this.database.transaction(() => {
       const version = this.database.pragma("user_version", { simple: true }); valid(version === 0 || version === 1);

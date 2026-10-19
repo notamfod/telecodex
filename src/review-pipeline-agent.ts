@@ -59,8 +59,9 @@ export function parsePipelineReport(raw: string): PipelineReport {
   if (!Object.keys(value).every((key) => ["verdict", "reason", "evidence", "draft"].includes(key))) {
     throw new Error("invalid pipeline report: unexpected field");
   }
-  if (!Array.isArray(value.evidence) || (value.verdict !== "uncertain" && value.evidence.length === 0)
-    || value.evidence.length > MAX_EVIDENCE || !value.evidence.every(isSourceRef)) {
+  const evidence = Array.isArray(value.evidence) ? value.evidence.map(normalizeSourceRef) : undefined;
+  if (!evidence || (value.verdict !== "uncertain" && evidence.length === 0)
+    || evidence.length > MAX_EVIDENCE || !evidence.every(isSourceRef)) {
     throw new Error("invalid pipeline report: evidence must contain bounded file:line references");
   }
   if (value.verdict === "confirmed" && value.draft === undefined) {
@@ -75,7 +76,7 @@ export function parsePipelineReport(raw: string): PipelineReport {
   return {
     verdict: value.verdict,
     reason: value.reason.trim(),
-    evidence: [...value.evidence],
+    evidence: [...evidence],
     ...(value.draft === undefined ? {} : { draft: normalizeDraft(value.draft) }),
   };
 }
@@ -135,6 +136,7 @@ function pipelinePrompt(
       ? `Analyst claim to challenge independently: ${analystClaim}`
       : "Independently determine whether the finding is real.",
     "Return JSON only: {\"verdict\":\"confirmed|disproved|uncertain\",\"reason\":\"<=1000 chars\",\"evidence\":[\"relative/file:line\"]}.",
+    "Evidence references should use a single positive starting line, not line ranges; include at most 8 references.",
     `For confirmed verdict also include draft: {summary,priority:Highest|High|Medium|Low,problem,fix,benefit,acceptance:[1..3 strings]}. Write the draft in Russian, concisely: title starts ${draftPrefix(job.source.project)}, then problem, approximate fix and why, plus 1-3 acceptance criteria. Do not claim tests were run.`,
     "Do not force agreement with another agent. If evidence differs, state the independently supported verdict.",
   ].join("\n");
@@ -207,6 +209,16 @@ function boundedString(value: unknown, limit = MAX_TEXT_LENGTH): value is string
 function isSourceRef(value: unknown): value is string {
   return typeof value === "string" && value.length <= 512 && SOURCE_REF.test(value)
     && !value.split(":")[0]!.split("/").includes("..");
+}
+
+function normalizeSourceRef(value: unknown): unknown {
+  if (typeof value !== "string" || value.length > 512) return value;
+  const range = /^(.*):([1-9][0-9]*)-([1-9][0-9]*)$/.exec(value);
+  if (!range) return value;
+  const start = Number(range[2]); const end = Number(range[3]);
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end < start) return value;
+  const reference = `${range[1]}:${start}`;
+  return isSourceRef(reference) ? reference : value;
 }
 
 function isDraft(value: unknown): value is PipelineDraft {

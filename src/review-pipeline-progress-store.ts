@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { PortfolioProjectResult } from "./review-portfolio.js";
+import { prepareReviewPipelineSqliteFile } from "./review-pipeline-sqlite-file.js";
 
 const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const PROJECT = /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/;
@@ -76,8 +76,7 @@ function decodeRange(row: Row, event: ProgressEvent): ProgressRange { valid(row.
 export class ReviewPipelineProgressStore {
   private readonly database: Database.Database;
   constructor(file: string) {
-    absolute(file); mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); const fd = openSync(file, "a", 0o600);
-    try { chmodSync(file, 0o600); } finally { closeSync(fd); }
+    absolute(file); prepareReviewPipelineSqliteFile(file);
     this.database = new Database(file);
     try { this.database.pragma("journal_mode = WAL"); this.database.pragma("busy_timeout = 1000"); this.database.transaction(() => {
       const version = this.database.pragma("user_version", { simple: true }); valid(version === 0 || version === 1);

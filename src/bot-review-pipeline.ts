@@ -37,8 +37,9 @@ export function registerReviewPipelineHandlers(
     if (active.has(match[2])) { await ctx.answerCallbackQuery({ text: "Решение уже обрабатывается" }); return; }
     await ctx.answerCallbackQuery({ text: match[1] === "rpcreate" ? "Создаю задачу..." : "Продолжаю анализ..." });
     const operation = (async () => {
-      const store = new ReviewPipelineStore(reviewPipelineDbPath());
+      let store: ReviewPipelineStore | undefined;
       try {
+        store = new ReviewPipelineStore(reviewPipelineDbPath());
         const actions = new ReviewPipelineActions({ store,
           ...(config.jiraComment ? { jira: new JiraIssueCreateClient(config.jiraComment) } : {}),
           openAnalysis: (job) => openAnalysis(ctx, job) });
@@ -60,10 +61,11 @@ export function registerReviewPipelineHandlers(
           await ctx.reply(text, { message_thread_id: panel.topicId });
         }
       } catch {
-        await ctx.reply("Не удалось завершить действие. Решение сохранено, можно повторить проверку.", {
+        await ctx.reply(store ? "Не удалось завершить действие. Решение сохранено, можно повторить проверку."
+          : "Не удалось открыть состояние пайплайна. Задача не отправлялась в Jira. Попробуйте ещё раз позже.", {
           message_thread_id: panel.topicId,
         });
-      } finally { store.close(); }
+      } finally { store?.close(); }
     })();
     active.set(match[2], operation);
     try { await operation; } finally { active.delete(match[2]); }

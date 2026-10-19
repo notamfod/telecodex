@@ -54,7 +54,8 @@ export class ReviewPipelineJournalRuntime {
       `${label(role)}, раунд ${job.round}. ${job.source.project} ${job.source.headSha}\n${job.source.finding.file}\n${renderReport(report)}`));
   }
   private ensure(batch: ProgressBatch): void {
-    this.options.journal.ensureSession(batch.id, `Ревью Mircli · ${batch.events.length} уведомлений · ${batch.id.slice(0, 8)}`, this.options.cwd);
+    const scheduled = batch.events.every((event) => event.projectPath.startsWith("recipes/"));
+    this.options.journal.ensureSession(batch.id, `Ревью Mircli · ${scheduled ? "плановая проверка" : `${batch.events.length} уведомлений`} · ${batch.id.slice(0, 8)}`, this.options.cwd);
   }
   private event(batch: ProgressBatch, key: string, text: string): void {
     this.ensure(batch);

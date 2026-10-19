@@ -1,6 +1,6 @@
-import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { prepareReviewPipelineSqliteFile } from "./review-pipeline-sqlite-file.js";
 
 const BATCH_ID = /^[0-9a-f]{24}$/;
 const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -45,8 +45,7 @@ function decodeEvent(row: EventRow): JournalEvent { valid(Number.isSafeInteger(r
 export class ReviewPipelineJournalStore {
   private readonly database: Database.Database;
   constructor(file: string) {
-    cwd(file); mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); const fd = openSync(file, "a", 0o600);
-    try { chmodSync(file, 0o600); } finally { closeSync(fd); }
+    cwd(file); prepareReviewPipelineSqliteFile(file);
     this.database = new Database(file);
     try { this.database.pragma("journal_mode = WAL"); this.database.pragma("busy_timeout = 1000"); this.database.transaction(() => {
       const version = this.database.pragma("user_version", { simple: true }); valid(version === 0 || version === 1);

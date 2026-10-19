@@ -100,8 +100,9 @@ function renderPipelineProgress(batch: ProgressBatch, options: Options): { text:
   const drafts = jobs.filter((job) => job.messageId !== undefined).length;
   const disproved = jobs.filter((job) => job.status === "disproved").length;
   const sessionId = options.sessionId?.(batch.id);
+  const scheduled = batch.events.every((event) => event.projectPath.startsWith("recipes/"));
   const text = [
-    `<b>${finished ? "✅ Пайплайн завершён" : "🔄 Пайплайн ревью"}</b> · уведомлений: ${batch.events.length}`,
+    `<b>${finished ? "✅ Пайплайн завершён" : scheduled ? "🔄 Плановый пайплайн ревью" : "🔄 Пайплайн ревью"}</b> · ${scheduled ? "проектов" : "уведомлений"}: ${batch.events.length}`,
     `Изменения проверены: ${checked}/${batch.events.length}`,
     `Замечаний: ${jobs.length} · черновиков: ${drafts} · отклонено: ${disproved}`,
     "",

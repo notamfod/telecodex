@@ -99,7 +99,7 @@ function renderPipelineProgress(batch: ProgressBatch, options: Options): { text:
     rows.push(`• <b>${escapeHTML(name.slice(0, 42))}</b> <code>${event.after.slice(0, 8)}</code>: ${escapeHTML(status)}`);
   }
   const jobs = [...allJobs.values()];
-  const drafts = jobs.filter((job) => job.messageId !== undefined).length;
+  const drafts = jobs.filter((job) => job.draft !== undefined && job.messageId !== undefined).length;
   const disproved = jobs.filter((job) => job.status === "disproved").length;
   const paused = jobs.filter((job) => job.status === "needs_context").length;
   const sessionId = options.sessionId?.(batch.id);
@@ -120,8 +120,8 @@ function renderPipelineProgress(batch: ProgressBatch, options: Options): { text:
 }
 
 function settled(job: PipelineJob): boolean {
-  return job.status === "disproved" || job.status === "needs_context" || job.messageId !== undefined
-    && ["awaiting", "creating", "created", "continuing"].includes(job.status);
+  return job.status === "disproved" || job.messageId !== undefined
+    && ["awaiting", "needs_context", "creating", "created", "continuing"].includes(job.status);
 }
 
 function jobStatus(job: PipelineJob, progress: ReviewPipelineProgressStore): string {

@@ -6,7 +6,7 @@ import { ReviewPipelineActions } from "./review-pipeline-actions.js";
 import { reviewPipelineDbPath, reviewPipelineProgressDbPath } from "./review-pipeline-path.js";
 import { ReviewPipelineRuntime } from "./review-pipeline-runtime.js";
 import { pipelineDraftKeyboard, renderPipelineDraft } from "./review-pipeline-render.js";
-import { ReviewPipelineStore, type PipelineJob } from "./review-pipeline-store.js";
+import { getConfirmedAssessment, ReviewPipelineStore, type PipelineJob } from "./review-pipeline-store.js";
 import { acquireRecipeRunLock } from "./recipe-run-lock.js";
 import { topicUrl } from "./projects.js";
 import { ReviewPipelineProgressStore } from "./review-pipeline-progress-store.js";
@@ -57,6 +57,8 @@ export function registerReviewPipelineHandlers(
         } else {
           const text = result.outcome === "unknown"
             ? "Результат создания пока не подтверждён. Повторное нажатие проверит Jira и не создаст дубль."
+            : result.outcome === "needs_review"
+            ? "Тип задачи, компонент и функциональные метки ещё не подтверждены. Нажмите «Продолжить анализ» для повторной проверки."
             : "Черновик уже обработан или создание Jira не настроено.";
           await ctx.reply(text, { message_thread_id: panel.topicId });
         }
@@ -75,6 +77,10 @@ export function registerReviewPipelineHandlers(
 export function startReviewPipelineWorker(config: TeleCodexConfig, api: Api): { dispose(): Promise<void> } | undefined {
   const panel = config.jiraPanel;
   if (!panel) return undefined;
+  if (!config.jiraComment) {
+    console.warn("Review pipeline disabled: configure JIRA_COMMENT_SERVER, JIRA_COMMENT_LOGIN, and JIRA_COMMENT_TOKEN to classify Jira functional labels.");
+    return undefined;
+  }
   const file = reviewPipelineDbPath();
   const release = acquireRecipeRunLock(`${file}.worker.lock`, { nonBlocking: true });
   let store: ReviewPipelineStore;
@@ -123,7 +129,7 @@ export function startReviewPipelineWorker(config: TeleCodexConfig, api: Api): { 
     deliver: async (job) => {
       const message = await api.sendMessage(panel.chatId, renderPipelineDraft(job), {
         message_thread_id: panel.topicId, parse_mode: "HTML", link_preview_options: { is_disabled: true },
-        reply_markup: pipelineDraftKeyboard(job.id),
+        reply_markup: pipelineDraftKeyboard(job.id, !!getConfirmedAssessment(job)),
       }, AbortSignal.timeout(15_000) as never);
       return { chatId: panel.chatId, topicId: panel.topicId, messageId: message.message_id };
     },

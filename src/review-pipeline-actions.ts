@@ -1,12 +1,12 @@
 import { JiraIssueCreateUnknownError } from "./jira-issue-create.js";
-import { ReviewPipelineStore, type PipelineJob } from "./review-pipeline-store.js";
+import { getConfirmedAssessment, ReviewPipelineStore, type PipelineJob } from "./review-pipeline-store.js";
 
 interface DecisionTarget { chatId: number; topicId: number; messageId: number; }
 interface JiraPort {
   findByLabel(label: string, job: PipelineJob): Promise<{ key: string; url: string } | undefined>;
   create(job: PipelineJob, label: string): Promise<{ key: string; url: string }>;
 }
-type Outcome = { outcome: "created" | "continuing" | "unknown" | "unavailable"; job?: PipelineJob };
+type Outcome = { outcome: "created" | "continuing" | "unknown" | "unavailable" | "needs_review"; job?: PipelineJob };
 
 export class ReviewPipelineActions {
   constructor(private readonly options: {
@@ -24,13 +24,14 @@ export class ReviewPipelineActions {
     if (job.status === "created") return { outcome: "created", job };
     if (job.status === "continuing" && job.analysisTopicId) return { outcome: "continuing", job };
     if (decision === "continue") {
-      if (job.status === "awaiting") job = store.claimDecision(id, decision, target.chatId, target.topicId, target.messageId);
+      if (job.status === "awaiting" || job.status === "needs_context") job = store.claimDecision(id, decision, target.chatId, target.topicId, target.messageId);
       if (!job || job.status !== "continuing") return { outcome: "unavailable" };
       const topicId = await this.options.openAnalysis(job);
       return { outcome: "continuing", job: store.analysisOpened(id, topicId) };
     }
     if (!jira) return { outcome: "unavailable" };
     const fresh = job.status === "awaiting";
+    if (fresh && !getConfirmedAssessment(job)) return { outcome: "needs_review", job };
     if (fresh) job = store.claimDecision(id, decision, target.chatId, target.topicId, target.messageId);
     if (!job || job.status !== "creating") return { outcome: "unavailable" };
     const label = `telecodex-review-${id}`;

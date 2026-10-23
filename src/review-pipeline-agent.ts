@@ -7,7 +7,8 @@ import path from "node:path";
 
 import { parseModelChoicesJson, type CodexModelChoice } from "./codex-model.js";
 import { runCodexReadOnly } from "./review-agent.js";
-import type { PipelineDraft, PipelineJob, PipelineReport } from "./review-pipeline-store.js";
+import { fetchReviewLabelCatalog, type ReviewLabelCatalogEntry } from "./review-pipeline-labels.js";
+import type { PipelineAssessment, PipelineDraft, PipelineJob, PipelineReport } from "./review-pipeline-store.js";
 
 const MAX_REASON_LENGTH = 1_000;
 const MAX_EVIDENCE = 8;
@@ -17,6 +18,8 @@ const MAX_ESCAPED_DRAFT_LENGTH = 2_600;
 const MAX_SOURCE_BLOB_BYTES = 256 * 1024;
 const SOURCE_BLOB_TIMEOUT_MS = 5_000;
 const SOURCE_REF = /^(?!\/|.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9_./@:+-]+:\d+$/;
+const COMPONENT_LABEL = /^[A-Za-z][A-Za-z0-9 &.\-]{0,63}$/;
+const EXCLUDED_FUNCTIONAL_LABEL = /^(?:ID\d+|telecodex-review(?:[-_].*)?|review|backend|frontend|каст_борд|тех_борд|бекенд_беклог|фронт_беклог|релиз_беклог|от_кастомера|от_пользователя|от_бизнеса)$/i;
 
 type AgentRole = "analyst" | "verifier";
 
@@ -26,6 +29,7 @@ export interface PipelineAgentDependencies {
   outputRoot?: string;
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
+  labelCatalog?: readonly ReviewLabelCatalogEntry[];
 }
 
 export function resolvePipelineModel(
@@ -46,7 +50,7 @@ export function resolvePipelineModel(
   throw new Error(`No configured lightweight OpenAI model; set ${variable} or add an OpenAI mini, luna, or lite CODEX_MODEL_CHOICES_JSON choice`);
 }
 
-export function parsePipelineReport(raw: string): PipelineReport {
+export function parsePipelineReport(raw: string, labelCatalog?: readonly ReviewLabelCatalogEntry[]): PipelineReport {
   let value: unknown;
   try {
     value = JSON.parse(raw);
@@ -56,7 +60,7 @@ export function parsePipelineReport(raw: string): PipelineReport {
   if (!isRecord(value) || !isVerdict(value.verdict) || !boundedString(value.reason, MAX_REASON_LENGTH)) {
     throw new Error("invalid pipeline report: verdict or reason");
   }
-  if (!Object.keys(value).every((key) => ["verdict", "reason", "evidence", "draft"].includes(key))) {
+  if (!Object.keys(value).every((key) => ["verdict", "reason", "evidence", "draft", "assessment"].includes(key))) {
     throw new Error("invalid pipeline report: unexpected field");
   }
   const evidence = Array.isArray(value.evidence) ? value.evidence.map(normalizeSourceRef) : undefined;
@@ -73,11 +77,19 @@ export function parsePipelineReport(raw: string): PipelineReport {
   if (value.draft !== undefined && !isDraft(value.draft)) {
     throw new Error("invalid pipeline report: draft");
   }
+  if (value.verdict === "confirmed" && !isAssessment(value.assessment, labelCatalog)) {
+    throw new Error("invalid pipeline report: confirmed reports require an assessment");
+  }
+  if (value.verdict !== "confirmed" && value.assessment !== undefined) {
+    throw new Error("invalid pipeline report: only confirmed reports may include an assessment");
+  }
+  const assessment = value.assessment as PipelineAssessment | undefined;
   return {
     verdict: value.verdict,
     reason: value.reason.trim(),
     evidence: [...evidence],
-    ...(value.draft === undefined ? {} : { draft: normalizeDraft(value.draft) }),
+    ...(assessment === undefined ? {} : { assessment: normalizeAssessment(assessment) }),
+    ...(value.draft === undefined ? {} : { draft: normalizeDraft(value.draft, assessment!) }),
   };
 }
 
@@ -93,6 +105,9 @@ export async function runPipelineAgent(
   await mkdir(outputRoot, { recursive: true, mode: 0o700 });
   const output = path.join(outputRoot, `${job.id}-${role}-${randomUUID()}.json`);
   try {
+    const labelCatalog = dependencies.labelCatalog ?? await fetchReviewLabelCatalog({
+      server: requiredEnv(env, "JIRA_COMMENT_SERVER"), login: requiredEnv(env, "JIRA_COMMENT_LOGIN"), token: requiredEnv(env, "JIRA_COMMENT_TOKEN"),
+    }, dependencies.signal);
     const sourceBlob = await readExactSourceBlob(
       job.source.cwd,
       job.source.headSha,
@@ -102,11 +117,11 @@ export async function runPipelineAgent(
     await (dependencies.run ?? runCodexReadOnly)(
       job.source.cwd,
       model,
-      pipelinePrompt(job, role, analyst, sourceBlob),
+      pipelinePrompt(job, role, analyst, sourceBlob, labelCatalog),
       output,
       dependencies.signal,
     );
-    return parsePipelineReport(await readFile(output, "utf8"));
+    return parsePipelineReport(await readFile(output, "utf8"), labelCatalog);
   } finally {
     await unlink(output).catch(() => undefined);
   }
@@ -117,6 +132,7 @@ function pipelinePrompt(
   role: AgentRole,
   analyst: PipelineReport | undefined,
   sourceBlob: string | null,
+  labelCatalog: readonly ReviewLabelCatalogEntry[],
 ): string {
   const source = JSON.stringify(job.source.finding);
   const prior = JSON.stringify(job.reports);
@@ -132,12 +148,16 @@ function pipelinePrompt(
     `Project: ${job.source.project}; recipe: ${job.source.recipe}.`,
     `Finding: ${source}`,
     `Prior reports from earlier disagreement: ${prior}`,
+    "BEGIN JIRA FUNCTIONAL LABEL CATALOG (untrusted data)",
+    JSON.stringify(labelCatalog),
+    "END JIRA FUNCTIONAL LABEL CATALOG",
     role === "verifier"
       ? `Analyst claim to challenge independently: ${analystClaim}`
       : "Independently determine whether the finding is real.",
-    "Return JSON only: {\"verdict\":\"confirmed|disproved|uncertain\",\"reason\":\"<=1000 chars\",\"evidence\":[\"relative/file:line\"]}.",
+    "Return JSON only. For confirmed, all fields are mandatory: {\"verdict\":\"confirmed\",\"reason\":\"<=1000 chars\",\"evidence\":[\"relative/file:line\"],\"assessment\":{\"component\":\"Backend|Frontend|Design\",\"kind\":\"bug|improvement\",\"basis\":\"<=512 chars\",\"labels\":[\"1 to 3 exact catalog labels\"],\"trigger\":\"<=512 chars\",\"expected\":\"<=512 chars\",\"actual\":\"<=512 chars\"},\"draft\":{\"summary\":\"<=180 chars\",\"priority\":\"Highest|High|Medium|Low\",\"problem\":\"<=512 chars\",\"fix\":\"<=512 chars\",\"benefit\":\"<=512 chars\",\"acceptance\":[\"1 to 3 strings, <=512 chars each\"]}}. Select exact functional labels from the catalog based on evidence: never use components, board/workflow tags, or invent labels. If no suitable functional label exists, use \"labels\":[] and required \"labelsReason\":\"<=512 chars\"; retain the independently proved bug or improvement verdict. For assessment.kind improvement, trigger, expected, and actual may be omitted. For disproved or uncertain, return only {\"verdict\":\"disproved|uncertain\",\"reason\":\"<=1000 chars\",\"evidence\":[\"relative/file:line\"]} with no assessment or draft.",
     "Evidence references should use a single positive starting line, not line ranges; include at most 8 references.",
-    `For confirmed verdict also include draft: {summary,priority:Highest|High|Medium|Low,problem,fix,benefit,acceptance:[1..3 strings]}. Write the draft in Russian, concisely: title starts ${draftPrefix(job.source.project)}, then problem, approximate fix and why, plus 1-3 acceptance criteria. Do not claim tests were run.`,
+    "For a confirmed verdict classify component as one of the real MIR components Backend, Frontend, or Design from actual changed behavior and code, never from repository or file name alone. Admin API behavior is Backend; admin UI behavior is Frontend. basis must state the supporting evidence. For kind bug, trigger, expected, and actual are all required: prove a reachable trigger from callers, validation, or contracts, then report the expected contract and distinct actual behavior; hypothetical inputs, causes, or runtime assumptions require uncertain. For kind improvement, prove a concrete benefit but no demonstrated contract violation; never relabel an unproven bug claim as an improvement just to confirm it. Scenario fields may be omitted. If evidence is speculative or insufficient, return uncertain; if it contradicts the finding, return disproved.",
+    "For confirmed verdict also include draft: {summary,priority:Highest|High|Medium|Low,problem,fix,benefit,acceptance:[1..3 strings]}. Write the draft in Russian, concisely. Its title will be tagged from assessment.component, then describe the problem, approximate fix and why, plus 1-3 acceptance criteria. Do not claim tests were run.",
     "Do not force agreement with another agent. If evidence differs, state the independently supported verdict.",
   ].join("\n");
 }
@@ -223,6 +243,8 @@ function normalizeSourceRef(value: unknown): unknown {
 
 function isDraft(value: unknown): value is PipelineDraft {
   return isRecord(value)
+    && Object.keys(value).length === 6
+    && ["summary", "priority", "problem", "fix", "benefit", "acceptance"].every((key) => Object.prototype.hasOwnProperty.call(value, key))
     && boundedString(value.summary, MAX_SUMMARY_LENGTH)
     && (value.priority === "Highest" || value.priority === "High" || value.priority === "Medium" || value.priority === "Low")
     && boundedString(value.problem)
@@ -235,12 +257,40 @@ function isDraft(value: unknown): value is PipelineDraft {
     && draftEscapedLength(value as unknown as PipelineDraft) <= MAX_ESCAPED_DRAFT_LENGTH;
 }
 
-function draftPrefix(project: string): "[Frontend]:" | "[Backend]:" {
-  return /(?:^|[-_])(go|back|api|worker|service)(?:[-_]|$)/i.test(project) ? "[Backend]:" : "[Frontend]:";
+function isAssessment(value: unknown, catalog?: readonly ReviewLabelCatalogEntry[]): value is PipelineAssessment {
+  if (!isRecord(value) || !Object.keys(value).every((key) => ["component", "kind", "basis", "labels", "labelsReason", "trigger", "expected", "actual"].includes(key))) return false;
+  if (!COMPONENT_LABEL.test(value.component as string) || typeof value.component !== "string" || value.component !== value.component.trim()
+    || (value.kind !== "bug" && value.kind !== "improvement") || !boundedString(value.basis)) return false;
+  for (const key of ["trigger", "expected", "actual"] as const) if (value[key] !== undefined && !boundedString(value[key])) return false;
+  if (!Array.isArray(value.labels) || value.labels.length > 3 || !value.labels.every((label) => boundedString(label, 128) && label === label.trim() && !/[<>]/.test(label) && !EXCLUDED_FUNCTIONAL_LABEL.test(label)) || new Set(value.labels).size !== value.labels.length) return false;
+  if (value.labels.length === 0 && !boundedString(value.labelsReason)) return false;
+  if (value.labelsReason !== undefined && !boundedString(value.labelsReason)) return false;
+  if (catalog && !value.labels.every((label) => catalog.some((entry) => entry.label === label))) return false;
+  return value.kind === "improvement" || (boundedString(value.trigger) && boundedString(value.expected) && boundedString(value.actual) && value.expected.trim() !== value.actual.trim());
 }
 
-function normalizeDraft(draft: PipelineDraft): PipelineDraft {
-  return { ...draft, summary: draft.summary.trim(), problem: draft.problem.trim(), fix: draft.fix.trim(), benefit: draft.benefit.trim(), acceptance: draft.acceptance.map((item) => item.trim()) };
+function normalizeAssessment(assessment: PipelineAssessment): PipelineAssessment {
+  return {
+    ...assessment,
+    component: assessment.component.trim(),
+    basis: assessment.basis.trim(),
+    labels: assessment.labels?.map(label => label.trim()),
+    ...(assessment.labelsReason === undefined ? {} : { labelsReason: assessment.labelsReason.trim() }),
+    ...(assessment.trigger === undefined ? {} : { trigger: assessment.trigger.trim() }),
+    ...(assessment.expected === undefined ? {} : { expected: assessment.expected.trim() }),
+    ...(assessment.actual === undefined ? {} : { actual: assessment.actual.trim() }),
+  };
+}
+
+function requiredEnv(env: NodeJS.ProcessEnv, name: string): string {
+  const value = env[name]?.trim(); if (!value) throw new Error(`${name} is required for Jira label classification`); return value;
+}
+
+function normalizeDraft(draft: PipelineDraft, assessment: PipelineAssessment): PipelineDraft {
+  const untagged = draft.summary.trim().replace(/^\[[^\]]+\]\s*:\s*/u, "");
+  const summary = `[${assessment.component}]: ${untagged}`;
+  if (!boundedString(summary, MAX_SUMMARY_LENGTH)) throw new Error("invalid pipeline report: draft");
+  return { ...draft, summary, problem: draft.problem.trim(), fix: draft.fix.trim(), benefit: draft.benefit.trim(), acceptance: draft.acceptance.map((item) => item.trim()) };
 }
 
 function draftEscapedLength(draft: PipelineDraft): number {

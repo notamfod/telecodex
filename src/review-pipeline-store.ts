@@ -6,7 +6,8 @@ import { prepareReviewPipelineSqliteFile } from "./review-pipeline-sqlite-file.j
 
 export interface PipelineSource { recipe: string; project: string; cwd: string; headSha: string; finding: Finding; }
 export interface PipelineDraft { summary: string; priority: "Highest" | "High" | "Medium" | "Low"; problem: string; fix: string; benefit: string; acceptance: string[]; }
-export interface PipelineReport { verdict: "confirmed" | "disproved" | "uncertain"; reason: string; evidence: string[]; draft?: PipelineDraft; }
+export interface PipelineAssessment { component: string; kind: "bug" | "improvement"; basis: string; labels?: string[]; labelsReason?: string; trigger?: string; expected?: string; actual?: string; }
+export interface PipelineReport { verdict: "confirmed" | "disproved" | "uncertain"; reason: string; evidence: string[]; draft?: PipelineDraft; assessment?: PipelineAssessment; }
 export interface PipelineJob {
   id: string; source: PipelineSource; status: "queued" | "working" | "awaiting" | "disproved" | "needs_context" | "creating" | "created" | "continuing";
   round: number; reports: PipelineReport[]; draft?: PipelineDraft; messageId?: number; chatId?: number; topicId?: number;
@@ -19,6 +20,8 @@ const verdicts = new Set<PipelineReport["verdict"]>(["confirmed", "disproved", "
 const priorities = new Set<PipelineDraft["priority"]>(["Highest", "High", "Medium", "Low"]);
 const maxText = 1024;
 const sourceRef = /^(?!\/|.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9_./@:+-]+:\d+$/;
+const componentLabel = /^[A-Za-z][A-Za-z0-9 &.\-]{0,63}$/;
+const excludedFunctionalLabel = /^(?:ID\d+|telecodex-review(?:[-_].*)?|review|backend|frontend|каст_борд|тех_борд|бекенд_беклог|фронт_беклог|релиз_беклог|от_кастомера|от_пользователя|от_бизнеса)$/i;
 
 function valid(condition: unknown): asserts condition { if (!condition) throw new Error("Invalid review pipeline data"); }
 function text(value: unknown, limit = maxText): asserts value is string { valid(typeof value === "string" && value.trim().length > 0 && value.length <= limit && !/[\u0000-\u001f\u007f-\u009f]/u.test(value)); }
@@ -56,12 +59,32 @@ function validateDraft(draft: unknown): asserts draft is PipelineDraft {
   const draftText = [item.summary, item.problem, item.fix, item.benefit, ...item.acceptance] as unknown as string[];
   valid(draftText.reduce((size, value) => size + value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").length, 0) <= 2600);
 }
+export function validatePipelineAssessment(assessment: unknown): asserts assessment is PipelineAssessment {
+  valid(assessment !== null && typeof assessment === "object" && !Array.isArray(assessment)); const item = assessment as Record<string, unknown>;
+  keys(item, ["component", "kind", "basis", "labels", "labelsReason", "trigger", "expected", "actual"], ["component", "kind", "basis"]);
+  valid(typeof item.component === "string" && item.component === item.component.trim() && componentLabel.test(item.component));
+  valid(item.kind === "bug" || item.kind === "improvement"); text(item.basis, 512);
+  if (item.labels !== undefined) {
+    valid(Array.isArray(item.labels) && item.labels.length <= 3);
+    const labels = item.labels as unknown[]; for (const label of labels) valid(typeof label === "string" && label === label.trim() && !/[<>]/.test(label) && !excludedFunctionalLabel.test(label)), text(label, 128);
+    valid(new Set(labels.map(label => (label as string).trim())).size === labels.length);
+    if (labels.length === 0) text(item.labelsReason, 512);
+  }
+  if (item.labelsReason !== undefined) text(item.labelsReason, 512);
+  for (const field of ["trigger", "expected", "actual"]) if (item[field] !== undefined) text(item[field], 512);
+  if (item.kind === "bug") {
+    text(item.trigger, 512); text(item.expected, 512); text(item.actual, 512);
+    valid(item.expected.trim() !== item.actual.trim());
+  }
+}
 function validateReport(report: unknown): asserts report is PipelineReport {
   valid(report !== null && typeof report === "object" && !Array.isArray(report)); const item = report as Record<string, unknown>;
-  keys(item, ["verdict", "reason", "evidence", "draft"], ["verdict", "reason", "evidence"]);
+  keys(item, ["verdict", "reason", "evidence", "draft", "assessment"], ["verdict", "reason", "evidence"]);
   valid(verdicts.has(item.verdict as PipelineReport["verdict"])); text(item.reason, 1000); valid(Array.isArray(item.evidence) && item.evidence.length <= 8 && (item.verdict === "uncertain" || item.evidence.length > 0));
   for (const evidence of item.evidence) valid(typeof evidence === "string" && evidence.length <= 512 && sourceRef.test(evidence)); if (item.draft !== undefined) validateDraft(item.draft);
   valid(item.verdict === "confirmed" ? item.draft !== undefined : item.draft === undefined);
+  valid(item.verdict === "confirmed" || item.assessment === undefined);
+  if (item.assessment !== undefined) validatePipelineAssessment(item.assessment);
 }
 function validateJob(job: unknown): asserts job is PipelineJob {
   valid(job !== null && typeof job === "object" && !Array.isArray(job)); const item = job as Record<string, unknown>;
@@ -70,7 +93,7 @@ function validateJob(job: unknown): asserts job is PipelineJob {
   valid(Array.isArray(item.reports) && item.reports.length <= 12); for (const report of item.reports) validateReport(report);
   if (item.draft !== undefined) validateDraft(item.draft); for (const field of ["messageId", "topicId", "analysisTopicId"]) optionalPositive(item[field]);
   if (item.chatId !== undefined) valid(typeof item.chatId === "number" && Number.isSafeInteger(item.chatId) && item.chatId !== 0); if (item.issueKey !== undefined) text(item.issueKey, 128); if (item.issueUrl !== undefined) { text(item.issueUrl, 2048); valid(/^https:\/\//.test(item.issueUrl)); }
-  if (["awaiting", "creating", "continuing", "created"].includes(item.status as string)) validateDraft(item.draft);
+  if (["awaiting", "creating", "created"].includes(item.status as string)) validateDraft(item.draft);
   if (["creating", "continuing", "created"].includes(item.status as string)) { positive(item.messageId); positive(item.topicId); valid(typeof item.chatId === "number" && Number.isSafeInteger(item.chatId) && item.chatId !== 0); }
 }
 function decode(row: Row): PipelineJob { valid(typeof row.payload === "string" && row.payload.length <= 256 * 1024); const job: PipelineJob = JSON.parse(row.payload); validateJob(job); valid(job.id === row.id); return job; }
@@ -85,6 +108,21 @@ function needsContext(reports: readonly PipelineReport[]): boolean {
   const pair = reports.slice(-2); const [analyst, verifier] = pair;
   if (!analyst || !verifier || analyst.verdict === verifier.verdict && analyst.verdict !== "uncertain") return false;
   return analyst.verdict === "uncertain" && verifier.verdict === "uncertain" || !hasNewEvidence(reports.slice(0, -2), pair);
+}
+
+/** Returns the verifier classification only after an independently confirmed, matching pair. */
+export function getConfirmedAssessment(job: Pick<PipelineJob, "reports">): PipelineAssessment | undefined {
+  if (!Array.isArray(job?.reports)) return undefined;
+  const [analyst, verifier] = job.reports.slice(-2);
+  if (!analyst || !verifier || analyst.verdict !== "confirmed" || verifier.verdict !== "confirmed") return undefined;
+  if (!analyst.assessment || !verifier.assessment) return undefined;
+  try { validatePipelineAssessment(analyst.assessment); validatePipelineAssessment(verifier.assessment); } catch { return undefined; }
+  if (analyst.assessment.kind !== verifier.assessment.kind || analyst.assessment.component.trim() !== verifier.assessment.component.trim()) return undefined;
+  if (!Object.hasOwn(analyst.assessment, "labels") || !Object.hasOwn(verifier.assessment, "labels") || !analyst.assessment.labels || !verifier.assessment.labels) return undefined;
+  const analystLabels = new Set(analyst.assessment.labels.map(label => label.trim()));
+  const verifierLabels = new Set(verifier.assessment.labels.map(label => label.trim()));
+  if (analystLabels.size !== verifierLabels.size || [...analystLabels].some(label => !verifierLabels.has(label))) return undefined;
+  return verifier.assessment;
 }
 
 export class ReviewPipelineStore {
@@ -123,7 +161,9 @@ export class ReviewPipelineStore {
       let resumed = 0;
       for (const job of this.listForSource(project, headSha)) {
         if (job.status !== "queued" && job.status !== "disproved" && job.status !== "needs_context") continue;
-        const next = job.status === "needs_context" ? { ...job, status: "queued" as const, reports: [], nextAttemptAt: 0 } : { ...job, status: "queued" as const, nextAttemptAt: 0 };
+        const next = job.status === "needs_context"
+          ? { ...job, status: "queued" as const, reports: [], nextAttemptAt: 0, chatId: undefined, topicId: undefined, messageId: undefined, analysisTopicId: undefined }
+          : { ...job, status: "queued" as const, nextAttemptAt: 0 };
         validateJob(next); if (this.update(job, next)) resumed++;
       }
       return resumed;
@@ -145,23 +185,29 @@ export class ReviewPipelineStore {
   }).immediate(); }
   finishRound(id: string, analyst: PipelineReport, verifier: PipelineReport, now = Date.now()): PipelineJob {
     validateReport(analyst); validateReport(verifier); timestamp(now); return this.database.transaction(() => {
-      const job = this.requireWorking(id); const allReports = [...job.reports, analyst, verifier]; const reports = allReports.slice(-12); const park = needsContext(allReports); let next: PipelineJob;
-      const selectedDraft = verifier.draft ?? analyst.draft;
-      if (analyst.verdict === "confirmed" && verifier.verdict === "confirmed" && selectedDraft) next = { ...job, reports, draft: selectedDraft, status: "awaiting", nextAttemptAt: now };
-      else if (analyst.verdict === "disproved" && verifier.verdict === "disproved") next = { ...job, reports, status: "disproved", nextAttemptAt: now };
-      else next = { ...job, reports, status: park ? "needs_context" : "queued", nextAttemptAt: park ? now : now + backoff(job.round) };
+      const job = this.requireWorking(id);
+      const next = this.evaluateReports(job, analyst, verifier, now, false);
       validateJob(next); valid(this.update(job, next)); return next;
     }).immediate();
   }
+  /** Reassesses one delivered draft while retaining its Telegram identity and guarding accepted decisions. */
+  reassessAwaiting(id: string, analyst: PipelineReport, verifier: PipelineReport, expectedMessageId: number, now = Date.now()): PipelineJob | undefined {
+    validateReport(analyst); validateReport(verifier); positive(expectedMessageId); timestamp(now); return this.database.transaction(() => {
+      const job = this.get(id);
+      if (!job || job.status !== "awaiting" || job.messageId !== expectedMessageId || job.chatId === undefined || job.topicId === undefined) return undefined;
+      const next = this.evaluateReports(job, analyst, verifier, now, true);
+      validateJob(next); return this.update(job, next) ? next : undefined;
+    }).immediate();
+  }
   failure(id: string, now = Date.now()): PipelineJob { timestamp(now); return this.database.transaction(() => { const job = this.requireWorking(id); const next = { ...job, status: "queued" as const, nextAttemptAt: now + backoff(job.round) }; validateJob(next); valid(this.update(job, next)); return next; }).immediate(); }
-  awaitingDelivery(): PipelineJob[] { return (this.database.prepare("SELECT id, payload FROM review_pipeline_jobs WHERE status = 'awaiting' AND json_extract(payload, '$.messageId') IS NULL ORDER BY rowid").all() as Row[]).map(decode); }
+  awaitingDelivery(): PipelineJob[] { return (this.database.prepare("SELECT id, payload FROM review_pipeline_jobs WHERE status IN ('awaiting', 'needs_context') AND json_extract(payload, '$.messageId') IS NULL ORDER BY rowid").all() as Row[]).map(decode); }
   unfinishedDecisions(): PipelineJob[] { return (this.database.prepare("SELECT id, payload FROM review_pipeline_jobs WHERE status IN ('creating', 'continuing') ORDER BY rowid").all() as Row[]).map(decode); }
-  markDelivered(id: string, chatId: number, topicId: number, messageId: number): PipelineJob { positive(topicId); positive(messageId); valid(Number.isSafeInteger(chatId) && chatId !== 0); return this.database.transaction(() => { const job = this.get(id); valid(job?.status === "awaiting" && job.messageId === undefined); const next = { ...job, chatId, topicId, messageId }; validateJob(next); valid(this.update(job, next)); return next; }).immediate(); }
-  claimDecision(id: string, decision: "create" | "continue", chatId: number, topicId: number, messageId: number): PipelineJob | undefined { valid(decision === "create" || decision === "continue"); return this.database.transaction(() => { const job = this.get(id); if (!job || job.status !== "awaiting" || job.chatId !== chatId || job.topicId !== topicId || job.messageId !== messageId) return undefined; const next = { ...job, status: decision === "create" ? "creating" as const : "continuing" as const }; validateJob(next); return this.update(job, next) ? next : undefined; }).immediate(); }
+  markDelivered(id: string, chatId: number, topicId: number, messageId: number): PipelineJob { positive(topicId); positive(messageId); valid(Number.isSafeInteger(chatId) && chatId !== 0); return this.database.transaction(() => { const job = this.get(id); valid((job?.status === "awaiting" || job?.status === "needs_context") && job.messageId === undefined); const next = { ...job, chatId, topicId, messageId }; validateJob(next); valid(this.update(job, next)); return next; }).immediate(); }
+  claimDecision(id: string, decision: "create" | "continue", chatId: number, topicId: number, messageId: number): PipelineJob | undefined { valid(decision === "create" || decision === "continue"); return this.database.transaction(() => { const job = this.get(id); const canContinue = decision === "continue" && (job?.status === "awaiting" || job?.status === "needs_context"); const canCreate = decision === "create" && job?.status === "awaiting"; if (!job || !canContinue && !canCreate || job.chatId !== chatId || job.topicId !== topicId || job.messageId !== messageId) return undefined; const next = { ...job, status: decision === "create" ? "creating" as const : "continuing" as const }; validateJob(next); return this.update(job, next) ? next : undefined; }).immediate(); }
   created(id: string, issueKey: string, issueUrl: string): PipelineJob { text(issueKey, 128); text(issueUrl, 2048); valid(/^https:\/\//.test(issueUrl)); return this.database.transaction(() => { const job = this.get(id); valid(job?.status === "creating"); const next = { ...job, status: "created" as const, issueKey, issueUrl }; validateJob(next); valid(this.update(job, next)); return next; }).immediate(); }
   analysisOpened(id: string, topicId: number): PipelineJob { positive(topicId); return this.database.transaction(() => { const job = this.get(id); valid(job?.status === "continuing"); const next = { ...job, analysisTopicId: topicId }; validateJob(next); valid(this.update(job, next)); return next; }).immediate(); }
   /** Call only after the caller has established that no external action was accepted. */
-  releaseDecision(id: string): PipelineJob | undefined { return this.database.transaction(() => { const job = this.get(id); if (!job || job.status !== "creating" && job.status !== "continuing") return undefined; const next = { ...job, status: "awaiting" as const }; validateJob(next); return this.update(job, next) ? next : undefined; }).immediate(); }
+  releaseDecision(id: string): PipelineJob | undefined { return this.database.transaction(() => { const job = this.get(id); if (!job || job.status !== "creating" && job.status !== "continuing") return undefined; const status = job.status === "continuing" && job.draft === undefined ? "needs_context" as const : "awaiting" as const; const next = { ...job, status }; validateJob(next); return this.update(job, next) ? next : undefined; }).immediate(); }
   recover(): void { this.database.transaction(() => {
     const interrupted = this.database.prepare("SELECT id, payload FROM review_pipeline_jobs WHERE status = 'working'").all() as Row[];
     for (const row of interrupted) { const job = decode(row); const next = { ...job, status: "queued" as const, nextAttemptAt: 0 }; validateJob(next); valid(this.update(job, next)); }
@@ -169,6 +215,20 @@ export class ReviewPipelineStore {
     for (const row of legacy) { const job = decode(row); if (!needsContext(job.reports)) continue; const next = { ...job, status: "needs_context" as const }; validateJob(next); valid(this.update(job, next)); }
   }).immediate(); }
   private requireWorking(id: string): PipelineJob { const job = this.get(id); valid(job?.status === "working"); return job; }
+  private evaluateReports(job: PipelineJob, analyst: PipelineReport, verifier: PipelineReport, now: number, delivered: boolean): PipelineJob {
+    const allReports = [...job.reports, analyst, verifier]; const reports = allReports.slice(-12);
+    const assessment = getConfirmedAssessment({ reports });
+    const selectedDraft = verifier.draft ?? analyst.draft;
+    if (analyst.verdict === "confirmed" && verifier.verdict === "confirmed" && assessment && selectedDraft) {
+      return { ...job, reports, draft: selectedDraft, status: "awaiting", nextAttemptAt: now };
+    }
+    if (analyst.verdict === "disproved" && verifier.verdict === "disproved") {
+      return { ...job, reports, draft: undefined, status: "disproved", nextAttemptAt: now };
+    }
+    const incompatibleConfirmedPair = analyst.verdict === "confirmed" && verifier.verdict === "confirmed" && !assessment;
+    const park = delivered || incompatibleConfirmedPair || needsContext(allReports);
+    return { ...job, reports, draft: undefined, status: park ? "needs_context" : "queued", nextAttemptAt: park ? now : now + backoff(job.round) };
+  }
   private insert(job: PipelineJob): void { this.database.prepare("INSERT INTO review_pipeline_jobs(id, project, fingerprint, head_sha, status, next_attempt_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)").run(job.id, job.source.project, fingerprint(job.source), job.source.headSha, job.status, job.nextAttemptAt, JSON.stringify(job)); }
   private update(previous: PipelineJob, next: PipelineJob): boolean { const result = this.database.prepare("UPDATE review_pipeline_jobs SET status = ?, next_attempt_at = ?, payload = ? WHERE id = ? AND status = ? AND payload = ?").run(next.status, next.nextAttemptAt, JSON.stringify(next), previous.id, previous.status, JSON.stringify(previous)); return result.changes === 1; }
 }

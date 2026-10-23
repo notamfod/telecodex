@@ -1,5 +1,5 @@
-import { pipelineDraftText } from "./review-pipeline-render.js";
-import type { PipelineJob } from "./review-pipeline-store.js";
+import { pipelineDraftSummary, pipelineDraftText } from "./review-pipeline-render.js";
+import { getConfirmedAssessment, type PipelineAssessment, type PipelineJob } from "./review-pipeline-store.js";
 
 const REQUEST_TIMEOUT_MS = 15_000;
 const SAFE_LABEL = /^telecodex-review-[A-Za-z0-9_-]{1,96}$/;
@@ -51,13 +51,16 @@ export class JiraIssueCreateClient {
   async create(job: PipelineJob, label: string): Promise<{ key: string; url: string }> {
     this.validate(label);
     if (!job.draft) throw new Error("Jira issue creation requires a pipeline draft");
+    const assessment = getConfirmedAssessment(job);
+    if (!assessment) throw new Error("Jira issue creation requires an agreed assessment");
     const description = pipelineDraftText(job);
-    const issueTypeId = await this.resolveMirBugIssueTypeId();
+    const { issueTypeId, componentId } = await this.resolveMirMetadata(assessment);
     let result: { response: Response; body: unknown };
     try {
       result = await this.requestJson("/rest/api/2/issue", { method: "POST", body: JSON.stringify({
         fields: { project: { key: "MIR" }, issuetype: { id: issueTypeId }, priority: { name: job.draft.priority },
-          summary: job.draft.summary, description, labels: [REVIEW_LABEL] },
+          summary: pipelineDraftSummary(job), description,
+          components: [{ id: componentId }], labels: [REVIEW_LABEL, ...assessment.labels!] },
         properties: [{ key: REVIEW_PROPERTY, value: { id: label } }],
       }) });
     } catch (error) {
@@ -109,20 +112,25 @@ export class JiraIssueCreateClient {
     if (!SAFE_LABEL.test(label)) throw new Error("Invalid Jira review label");
   }
 
-  private async resolveMirBugIssueTypeId(): Promise<string> {
+  private async resolveMirMetadata(assessment: PipelineAssessment): Promise<{ issueTypeId: string; componentId: string }> {
     const { response, body } = await this.requestJson("/rest/api/2/project/MIR", { method: "GET" }, false);
     if (!response.ok) throw new Error(`Jira issue metadata lookup failed: ${response.status}`);
     if (!isRecord(body) || body.key !== "MIR" || !Array.isArray(body.issueTypes)) {
       throw new Error("Jira issue metadata lookup returned an invalid response");
     }
+    const names = assessment.kind === "bug" ? ["Bug", "Ошибка"] : ["Task", "Задача"];
     const matches = body.issueTypes.filter((issueType): issueType is Record<string, unknown> => {
       if (!isRecord(issueType)) return false;
-      return (issueType.name === "Bug" || issueType.name === "Ошибка")
+      return names.includes(issueType.name as string)
         && issueType.subtask === false && typeof issueType.id === "string"
         && /^[1-9][0-9]{0,18}$/.test(issueType.id);
     });
-    if (matches.length !== 1) throw new Error("Jira issue metadata did not resolve one Bug type");
-    return matches[0]!.id as string;
+    if (matches.length !== 1) throw new Error(`Jira issue metadata did not resolve one ${names[0]} type`);
+    const components = Array.isArray(body.components) ? body.components.filter((component) =>
+      isRecord(component) && component.name === assessment.component
+      && typeof component.id === "string" && /^[1-9][0-9]{0,18}$/.test(component.id)) : [];
+    if (components.length !== 1) throw new Error("Jira metadata did not resolve one reviewed component");
+    return { issueTypeId: matches[0]!.id as string, componentId: components[0]!.id as string };
   }
 
   private async requestJson(

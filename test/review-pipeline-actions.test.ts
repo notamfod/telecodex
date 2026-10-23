@@ -6,6 +6,18 @@ import { ReviewPipelineStore } from "../src/review-pipeline-store.js";
 import { ReviewPipelineActions } from "../src/review-pipeline-actions.js";
 import { JiraIssueCreateUnknownError } from "../src/jira-issue-create.js";
 
+it("keeps legacy unclassified cards awaiting review without touching Jira", async () => {
+  const legacy = { id: "a".repeat(24), status: "awaiting", chatId: -1001, topicId: 7, messageId: 10, reports: [] };
+  const store = { get: vi.fn(() => legacy), claimDecision: vi.fn() } as unknown as ReviewPipelineStore;
+  const jira = { findByLabel: vi.fn(), create: vi.fn() };
+  const actions = new ReviewPipelineActions({ store, jira, openAnalysis: vi.fn() });
+  expect(await actions.decide(legacy.id, "create", { chatId: -1001, topicId: 7, messageId: 10 }))
+    .toMatchObject({ outcome: "needs_review" });
+  expect(store.claimDecision).not.toHaveBeenCalled();
+  expect(jira.findByLabel).not.toHaveBeenCalled();
+  expect(jira.create).not.toHaveBeenCalled();
+});
+
 it("never repeats an ambiguous Jira POST; later clicks reconcile the saved label", async () => {
   const directory = mkdtempSync(path.join(tmpdir(), "tc-actions-"));
   const store = new ReviewPipelineStore(path.join(directory, "db.sqlite"));
@@ -13,7 +25,7 @@ it("never repeats an ambiguous Jira POST; later clicks reconcile the saved label
     const job = store.enqueue({ recipe: "daily", project: "mir-back", cwd: "/repo", headSha: "a".repeat(40),
       finding: { severity: "medium", file: "x.ts", category: "race", description: "race" } });
     store.claim();
-    const report = { verdict: "confirmed" as const, reason: "late answer", evidence: ["x.ts:1"], draft: {
+    const report = { verdict: "confirmed" as const, assessment: { component: "Backend", labels: ["поиск"], kind: "bug" as const, basis: "Cancellation contract is violated.", trigger: "Cancel an active request.", expected: "Work stops.", actual: "Work continues." }, reason: "late answer", evidence: ["x.ts:1"], draft: {
       summary: "[Backend]: Прекращать опрос", priority: "Medium" as const, problem: "Опрос продолжается",
       fix: "Проверить активность", benefit: "Нет фоновых запросов", acceptance: ["Запросы прекращаются"],
     } };

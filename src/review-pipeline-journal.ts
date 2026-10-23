@@ -163,6 +163,7 @@ function hash(value: unknown): string { return createHash("sha256").update(JSON.
 function label(role: Role): string { return role === "analyst" ? "Аналитик" : "Проверяющий"; }
 function renderReport(report: PipelineReport): string {
   return `Вывод: ${report.verdict}\n${report.reason}\nДоказательства: ${report.evidence.join(", ")}`
+    + (report.assessment ? `\nКлассификация: ${JSON.stringify(report.assessment)}` : "")
     + (report.draft ? `\nПредложение задачи: ${JSON.stringify(report.draft)}` : "");
 }
 function notSent(error: unknown): boolean {

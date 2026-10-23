@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, it } from "vitest";
-import { ReviewPipelineStore, type PipelineDraft, type PipelineReport, type PipelineSource } from "../src/review-pipeline-store.js";
+import { getConfirmedAssessment, ReviewPipelineStore, type PipelineAssessment, type PipelineDraft, type PipelineReport, type PipelineSource } from "../src/review-pipeline-store.js";
 
 let directory: string;
 let databasePath: string;
@@ -16,7 +16,8 @@ const source = (headSha = "a".repeat(40), description = "recording continues aft
 const draft: PipelineDraft = {
   summary: "stop stale recording after selection", priority: "Medium", problem: "stale selection keeps recording", fix: "cancel the recording before replacing choices", benefit: "prevents unintended uploads", acceptance: ["a stale selection stops recording"],
 };
-const confirmed = (overrides: Partial<PipelineReport> = {}): PipelineReport => ({ verdict: "confirmed", reason: "reproduced", evidence: ["src/voice.ts:336"], draft, ...overrides });
+const assessment: PipelineAssessment = { component: "Frontend", kind: "bug", basis: "The stale callback remains reachable.", labels: ["поиск"], trigger: "Choose an item while recording.", expected: "Selection stops recording.", actual: "Recording continues after selection." };
+const confirmed = (overrides: Partial<PipelineReport> = {}): PipelineReport => ({ verdict: "confirmed", reason: "reproduced", evidence: ["src/voice.ts:336"], draft, assessment, ...overrides });
 const disproved = (): PipelineReport => ({ verdict: "disproved", reason: "selection cancels recording", evidence: ["src/voice.ts:350"] });
 const uncertain = (evidence: string[] = []): PipelineReport => ({ verdict: "uncertain", reason: "needs more context", evidence });
 function open(): ReviewPipelineStore { const store = new ReviewPipelineStore(databasePath); stores.push(store); return store; }
@@ -90,12 +91,22 @@ it("keeps a parked revision deduplicated but opens a fresh job for a new SHA", (
   expect(store.enqueue(source("b".repeat(40))).id).not.toBe(job.id);
 });
 
-it("explicitly resumes needs-context jobs with no active reports", () => {
+it("explicitly resumes delivered needs-context jobs for a fresh result card", () => {
   const store = open(); const job = store.enqueue(source()); store.claim(); store.finishRound(job.id, uncertain(), uncertain());
+  store.markDelivered(job.id, -10012, 31, 41);
+  store.claimDecision(job.id, "continue", -10012, 31, 41);
+  store.analysisOpened(job.id, 99);
+  store.releaseDecision(job.id);
   expect(store.resumeSource(job.source.project, job.source.headSha)).toBe(1);
   expect(store.get(job.id)).toMatchObject({ status: "queued", nextAttemptAt: 0, reports: [] });
+  expect(store.get(job.id)).not.toHaveProperty("chatId");
+  expect(store.get(job.id)).not.toHaveProperty("topicId");
+  expect(store.get(job.id)).not.toHaveProperty("messageId");
+  expect(store.get(job.id)).not.toHaveProperty("analysisTopicId");
   store.recover();
   expect(store.claim()).toMatchObject({ id: job.id, round: 2 });
+  expect(store.finishRound(job.id, confirmed(), confirmed())).toMatchObject({ status: "awaiting" });
+  expect(store.awaitingDelivery().map(item => item.id)).toEqual([job.id]);
 });
 
 it("migrates v1 jobs and parks legacy queued inconclusive reports while rejecting future schemas", () => {
@@ -115,6 +126,56 @@ it("requires a concise valid draft for every confirmed report", () => {
   const store = open(); const job = store.enqueue(source()); store.claim();
   expect(() => store.finishRound(job.id, confirmed(), confirmed({ draft: undefined }))).toThrow("Invalid review pipeline data");
   expect(() => store.finishRound(job.id, confirmed(), confirmed({ draft: { ...draft, summary: "x".repeat(181) } }))).toThrow("Invalid review pipeline data");
+});
+
+it("keeps legacy confirmed reports readable but never approves them without assessments", () => {
+  const store = open(); const job = store.enqueue(source()); store.claim();
+  const legacy = confirmed({ assessment: undefined });
+  expect(store.finishRound(job.id, legacy, legacy)).toMatchObject({ status: "needs_context", draft: undefined });
+  expect(getConfirmedAssessment({ reports: [legacy, legacy] })).toBeUndefined();
+});
+
+it("requires two matching independent classifications before awaiting delivery", () => {
+  const store = open(); const job = store.enqueue(source()); store.claim();
+  const verifier = confirmed({ assessment: { ...assessment, component: "Backend" } });
+  expect(store.finishRound(job.id, confirmed(), verifier)).toMatchObject({ status: "needs_context", draft: undefined });
+  expect(getConfirmedAssessment({ reports: [confirmed(), verifier] })).toBeUndefined();
+  expect(getConfirmedAssessment({ reports: [confirmed(), { ...confirmed(), assessment: { component: "?", kind: "bug", basis: "x", trigger: "t", expected: "e", actual: "a" } }] } as unknown as { reports: PipelineReport[] })).toBeUndefined();
+});
+
+it("agrees labels as an unordered set and rejects legacy or mismatched sets", () => {
+  const a = confirmed({ assessment: { ...assessment, labels: ["поиск", "Фасеты"] } });
+  const b = confirmed({ assessment: { ...assessment, labels: ["Фасеты", "поиск"] } });
+  expect(getConfirmedAssessment({ reports: [a, b] })).toMatchObject({ labels: ["Фасеты", "поиск"] });
+  expect(getConfirmedAssessment({ reports: [a, confirmed({ assessment: { ...assessment, labels: ["поиск"] } })] })).toBeUndefined();
+  expect(getConfirmedAssessment({ reports: [a, confirmed({ assessment: { ...assessment, labels: undefined } })] })).toBeUndefined();
+});
+
+it("reassesses only the current delivered awaiting draft and retains its message identity", () => {
+  const store = open(); const job = store.enqueue(source()); store.claim(); store.finishRound(job.id, confirmed(), confirmed());
+  store.markDelivered(job.id, -10012, 31, 41);
+  expect(store.reassessAwaiting(job.id, confirmed(), confirmed(), 42)).toBeUndefined();
+  const refreshed = store.reassessAwaiting(job.id, confirmed(), confirmed({ draft: { ...draft, fix: "cancel it before selection" } }), 41, 99);
+  expect(refreshed).toMatchObject({ status: "awaiting", chatId: -10012, topicId: 31, messageId: 41, nextAttemptAt: 99 });
+  expect(store.claimDecision(job.id, "create", -10012, 31, 41)?.status).toBe("creating");
+  expect(store.reassessAwaiting(job.id, confirmed(), confirmed(), 41)).toBeUndefined();
+});
+
+it("clears a delivered stale draft when re-review disproves or cannot classify it", () => {
+  const store = open(); const job = store.enqueue(source()); store.claim(); store.finishRound(job.id, confirmed(), confirmed());
+  store.markDelivered(job.id, -10012, 31, 41);
+  expect(store.reassessAwaiting(job.id, disproved(), disproved(), 41)).toMatchObject({ status: "disproved", draft: undefined, messageId: 41 });
+});
+
+it("allows only continuation from a delivered needs-context re-review", () => {
+  const store = open(); const job = store.enqueue(source()); store.claim(); store.finishRound(job.id, confirmed(), confirmed());
+  store.markDelivered(job.id, -10012, 31, 41);
+  expect(store.reassessAwaiting(job.id, uncertain(), uncertain(), 41)).toMatchObject({ status: "needs_context", draft: undefined, messageId: 41 });
+  expect(store.claimDecision(job.id, "create", -10012, 31, 41)).toBeUndefined();
+  expect(store.claimDecision(job.id, "continue", -10012, 31, 42)).toBeUndefined();
+  expect(store.claimDecision(job.id, "continue", -10012, 31, 41)).toMatchObject({ status: "continuing" });
+  expect(store.analysisOpened(job.id, 99)).toMatchObject({ status: "continuing", analysisTopicId: 99 });
+  expect(store.releaseDecision(job.id)).toMatchObject({ status: "needs_context", messageId: 41 });
 });
 
 it("uses the verifier's corrected draft after both agents confirm", () => {

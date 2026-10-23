@@ -6,7 +6,7 @@ import { ReviewPipelineProgressRuntime } from "../src/review-pipeline-progress.j
 import { ReviewPipelineProgressStore } from "../src/review-pipeline-progress-store.js";
 import { ReviewPipelineStore } from "../src/review-pipeline-store.js";
 
-it("shows missing context as a paused outcome without scheduling another analysis", async () => {
+it("finishes missing context only after its continuation card is delivered", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "tc-context-progress-"));
   const progress = new ReviewPipelineProgressStore(path.join(dir, "progress.sqlite"));
   const jobs = new ReviewPipelineStore(path.join(dir, "jobs.sqlite"));
@@ -20,12 +20,15 @@ it("shows missing context as a paused outcome without scheduling another analysi
   const send = vi.fn(async () => 12); const edit = vi.fn();
   const runtime = new ReviewPipelineProgressRuntime({ progress, jobs, send, edit });
   try {
-    await runtime.runOnce(); await runtime.runOnce();
+    await runtime.runOnce();
+    expect(progress.listBatches().find((b) => b.id === batch.id)?.finished).toBe(false);
+    jobs.markDelivered(job.id, -1001, 9, 18);
+    await runtime.runOnce();
     expect(progress.listBatches().find((b) => b.id === batch.id)?.finished).toBe(true);
-    expect(send.mock.calls[0]?.[1]).toContain("Нужен контекст");
-    expect(send.mock.calls[0]?.[1]).toContain("автоповтор остановлен");
-    expect(send.mock.calls[0]?.[1]).toContain("отклонено: 0");
-    expect(edit).not.toHaveBeenCalled();
+    expect(edit.mock.calls.at(-1)?.[1]).toContain("Нужен контекст");
+    expect(edit.mock.calls.at(-1)?.[1]).toContain("автоповтор остановлен");
+    expect(edit.mock.calls.at(-1)?.[1]).toContain("черновиков: 0");
+    expect(edit.mock.calls.at(-1)?.[1]).toContain("отклонено: 0");
   } finally { await runtime.dispose(); progress.close(); jobs.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -55,7 +58,7 @@ it("keeps one visible batch card across restart and finishes only after review a
     await runtime.runOnce();
     expect(edit.mock.calls.at(-1)?.[1]).toContain("проверяющий");
     expect(progress.listBatches()[0]?.finished).toBe(false);
-    const report = { verdict: "confirmed" as const, reason: "confirmed", evidence: ["x.php:2"], draft: {
+    const report = { verdict: "confirmed" as const, assessment: { component: "Backend", labels: ["поиск"], kind: "bug" as const, basis: "Cancellation contract is violated.", trigger: "Cancel an active request.", expected: "Work stops.", actual: "Work continues." }, reason: "confirmed", evidence: ["x.php:2"], draft: {
       summary: "Stop late replies", priority: "Medium" as const, problem: "Late reply", fix: "Cancel", benefit: "No work", acceptance: ["No late work"],
     } };
     jobs.finishRound(job.id, report, report);
